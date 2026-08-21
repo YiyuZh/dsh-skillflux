@@ -34,6 +34,15 @@ function overlap(left: Set<string>, right: Set<string>): number {
   return count
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+}
+
+function containsNamePhrase(query: string, phrase: string): boolean {
+  if (phrase.length === 0) return false
+  return new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegExp(phrase)}(?=$|[^\\p{L}\\p{N}])`, 'u').test(query)
+}
+
 export function routeScore(
   query: string,
   candidate: { readonly name: string; readonly description: string; readonly whenToUse?: string },
@@ -41,7 +50,7 @@ export function routeScore(
   const normalizedQuery = normalizeText(query)
   const exactName = normalizeText(candidate.name)
   const skillPhrase = normalizeText(candidate.name.replaceAll('-', ' '))
-  let score = normalizedQuery.includes(exactName) || normalizedQuery.includes(skillPhrase) ? 100 : 0
+  let score = containsNamePhrase(normalizedQuery, exactName) || containsNamePhrase(normalizedQuery, skillPhrase) ? 100 : 0
   const queryTokens = tokenize(query)
   score += overlap(queryTokens, tokenize(candidate.name.replaceAll('-', ' '))) * 20
   if (candidate.whenToUse !== undefined) score += overlap(queryTokens, tokenize(candidate.whenToUse)) * 8

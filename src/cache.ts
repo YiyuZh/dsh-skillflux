@@ -93,7 +93,19 @@ export interface CacheManagerOptions {
   readonly maxFiles: number
   readonly maxBytes: number
   readonly installTimeoutMs: number
+  readonly runInstaller?: SkillInstaller
 }
+
+export interface SkillInstallerInvocation {
+  readonly executable: string
+  readonly args: readonly string[]
+  readonly cwd: string
+  readonly timeoutMs: number
+  readonly signal?: AbortSignal
+  readonly env: NodeJS.ProcessEnv
+}
+
+export type SkillInstaller = (invocation: SkillInstallerInvocation) => Promise<void>
 
 export class SkillCache {
   readonly root: string
@@ -166,13 +178,24 @@ export class SkillCache {
         SKILLS_EXTRACT_MAX_FILES: '5000',
       }
       const execute = async (env: NodeJS.ProcessEnv): Promise<void> => {
-        await execFileAsync(process.execPath, args, {
-          cwd: workspace,
-          timeout: this.options.installTimeoutMs,
-          maxBuffer: 2 * 1024 * 1024,
-          signal,
-          env,
-        })
+        if (this.options.runInstaller !== undefined) {
+          await this.options.runInstaller({
+            executable: process.execPath,
+            args,
+            cwd: workspace,
+            timeoutMs: this.options.installTimeoutMs,
+            ...(signal === undefined ? {} : { signal }),
+            env,
+          })
+        } else {
+          await execFileAsync(process.execPath, args, {
+            cwd: workspace,
+            timeout: this.options.installTimeoutMs,
+            maxBuffer: 2 * 1024 * 1024,
+            signal,
+            env,
+          })
+        }
       }
       try {
         await execute(baseEnvironment)
@@ -220,10 +243,26 @@ export class SkillCache {
   }
 
   async clean(selector: string, active: ReadonlySet<string> = new Set()): Promise<{ removed: string[]; skipped: string[] }> {
-    const entries = selector === 'all'
-      ? await this.list()
-      : [await this.get(selector)].filter((entry): entry is CacheEntry => entry !== undefined)
-    if (selector !== 'all' && entries.length === 0) throw new Error(`unknown cache id "${selector}"`)
+    if (selector === 'all') {
+      await mkdir(this.entriesRoot, { recursive: true })
+      const directories = (await readdir(this.entriesRoot, { withFileTypes: true }))
+        .filter(entry => entry.isDirectory() && CACHE_ID.test(entry.name))
+        .map(entry => ({ id: entry.name, directory: join(this.entriesRoot, entry.name) }))
+      const removed: string[] = []
+      const skipped: string[] = []
+      for (const entry of directories) {
+        if (active.has(entry.id)) {
+          skipped.push(entry.id)
+          continue
+        }
+        assertWithin(this.entriesRoot, entry.directory)
+        await rm(entry.directory, { recursive: true, force: true })
+        removed.push(entry.id)
+      }
+      return { removed, skipped }
+    }
+    const entries = [await this.get(selector)].filter((entry): entry is CacheEntry => entry !== undefined)
+    if (entries.length === 0) throw new Error(`unknown cache id "${selector}"`)
     const removed: string[] = []
     const skipped: string[] = []
     for (const entry of entries) {

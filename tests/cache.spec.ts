@@ -1,10 +1,10 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { isLoopbackProxyFailure, SkillCache } from '../src/cache.js'
 import { inspectSkillDirectory } from '../src/skill-file.js'
-import type { CacheManifest } from '../src/types.js'
+import type { CacheManifest, RemoteCandidate } from '../src/types.js'
 
 const roots: string[] = []
 
@@ -66,5 +66,60 @@ describe('persistent cache', () => {
     expect(await readFile(join(fixture.directory, 'SKILL.md'), 'utf8')).toContain('Use the demo')
     expect(await cache.clean(fixture.id)).toEqual({ removed: [fixture.id], skipped: [] })
     expect(await cache.get(fixture.id)).toBeUndefined()
+  })
+
+  it('removes corrupt cache directories with clean all', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-cache-corrupt-'))
+    roots.push(root)
+    const id = 'c'.repeat(24)
+    const directory = join(root, 'entries', id)
+    await mkdir(directory, { recursive: true })
+    await writeFile(join(directory, '.skillflux.json'), '{not-json}\n')
+    const cache = new SkillCache({ root, maxFiles: 10, maxBytes: 10_000, installTimeoutMs: 1_000 })
+    expect(await cache.list()).toEqual([])
+    expect(await cache.clean('all')).toEqual({ removed: [id], skipped: [] })
+    await expect(access(directory)).rejects.toThrow()
+  })
+
+  it('uses the pinned installer contract and retries a loopback proxy failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-cache-install-'))
+    roots.push(root)
+    const candidate: RemoteCandidate = {
+      id: 'remote-demo',
+      origin: 'remote',
+      name: 'demo',
+      description: 'Demo remote skill',
+      source: 'owner/repo',
+      ref: 'd'.repeat(40),
+      score: 1,
+      skillId: 'demo',
+      installs: 42,
+    }
+    const invocations: Array<{ args: readonly string[]; cwd: string; timeoutMs: number }> = []
+    const cache = new SkillCache({
+      root,
+      maxFiles: 10,
+      maxBytes: 10_000,
+      installTimeoutMs: 1_234,
+      runInstaller: async invocation => {
+        invocations.push({ args: invocation.args, cwd: invocation.cwd, timeoutMs: invocation.timeoutMs })
+        if (invocations.length === 1) throw { stderr: 'Failed to connect to localhost port 7890: refused' }
+        const downloaded = join(invocation.cwd, '.agents', 'skills', 'demo')
+        await mkdir(downloaded, { recursive: true })
+        await writeFile(join(downloaded, 'SKILL.md'), '---\nname: demo\ndescription: Demo remote skill\n---\nUse the remote demo.\n')
+      },
+    })
+    const installed = await cache.install(candidate)
+    expect(invocations).toHaveLength(2)
+    expect(invocations[1]?.args.slice(1)).toEqual([
+      'add',
+      `https://codeload.github.com/owner/repo/tar.gz/${candidate.ref}`,
+      '--skill', 'demo', '--agent', 'codex', '--yes', '--copy',
+    ])
+    expect(invocations[1]?.timeoutMs).toBe(1_234)
+    expect(installed.manifest).toMatchObject({
+      source: 'owner/repo', ref: candidate.ref, skillId: 'demo', name: 'demo',
+    })
+    expect((await cache.load(installed)).content).toContain('Use the remote demo')
   })
 })

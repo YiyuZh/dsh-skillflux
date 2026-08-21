@@ -25,6 +25,8 @@ export interface SkillFluxCandidatesSource {
   }[]
 }
 
+type RemoteEntries = SkillFluxCandidatesSource['entries']
+
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     'skill-catalog': SkillCatalogSource
@@ -60,6 +62,35 @@ function readEntries(source: unknown): SkillCatalogSource['entries'] | undefined
   return result
 }
 
+function readRemoteEntries(source: unknown): RemoteEntries | undefined {
+  const entries = (source as { entries?: unknown }).entries
+  if (!Array.isArray(entries)) return undefined
+  const result: Array<RemoteEntries[number]> = []
+  for (const entry of entries) {
+    if (typeof entry !== 'object' || entry === null) return undefined
+    const item = entry as Record<string, unknown>
+    if (typeof item.id !== 'string'
+      || typeof item.name !== 'string'
+      || typeof item.source !== 'string'
+      || typeof item.ref !== 'string'
+      || typeof item.installs !== 'number') return undefined
+    result.push({
+      id: item.id,
+      name: item.name,
+      source: item.source,
+      ref: item.ref,
+      installs: item.installs,
+    })
+  }
+  return result
+}
+
+function remoteDigest(entries: RemoteEntries): string {
+  return createHash('sha256')
+    .update(entries.map(entry => JSON.stringify([entry.id, entry.name, entry.source, entry.ref, entry.installs])).join('\n'))
+    .digest('hex')
+}
+
 function history(agent: Agent): { published: boolean; visibleDigest?: string } {
   const visible = new Set(agent.session.surface.nodes)
   let published = false
@@ -70,6 +101,20 @@ function history(agent: Agent): { published: boolean; visibleDigest?: string } {
     if (entries === undefined) continue
     published = true
     if (visible.has(event.seq)) return { published, visibleDigest: digest(entries) }
+  }
+  return { published }
+}
+
+function remoteHistory(agent: Agent): { published: boolean; visibleDigest?: string } {
+  const visible = new Set(agent.session.surface.nodes)
+  let published = false
+  for (let index = agent.session.events.length - 1; index >= 0; index -= 1) {
+    const event = agent.session.events[index]
+    if (event === undefined || event.type !== 'user/message' || event.data.source.kind !== 'skillflux-candidates') continue
+    const entries = readRemoteEntries(event.data.source)
+    if (entries === undefined) continue
+    published = true
+    if (visible.has(event.seq)) return { published, visibleDigest: remoteDigest(entries) }
   }
   return { published }
 }
@@ -133,9 +178,17 @@ export function updateCatalog(
     : messages.map(message => message.id === existing.message.id ? catalog : message)
 }
 
-export function remoteCandidateMessage(agent: Agent, candidates: readonly RemoteCandidate[]): UserMessage {
-  const published = agent.session.events.some(event =>
-    event.type === 'user/message' && event.data.source.kind === 'skillflux-candidates')
+function candidateEntries(candidates: readonly RemoteCandidate[]): RemoteEntries {
+  return candidates.map(candidate => ({
+    id: candidate.id,
+    name: candidate.name,
+    source: candidate.source,
+    ref: candidate.ref,
+    installs: candidate.installs,
+  }))
+}
+
+function buildRemoteCandidateMessage(candidates: readonly RemoteCandidate[], update: boolean): UserMessage {
   const entries = candidates.map(candidate => ({
     id: candidate.id,
     name: candidate.name,
@@ -150,17 +203,38 @@ export function remoteCandidateMessage(agent: Agent, candidates: readonly Remote
       type: 'text',
       text: [
         '<system-reminder>',
-        published
-          ? 'This remote SkillFlux candidate list replaces every earlier candidate list:'
-          : 'No installed skill matched. SkillFlux found these immutable remote candidates:',
+        ...(entries.length === 0
+          ? [
+              'The remote SkillFlux candidate list is now empty. This replaces every earlier candidate list.',
+              'Do not use candidate ids from an earlier turn.',
+            ]
+          : [
+              update
+                ? 'This remote SkillFlux candidate list replaces every earlier candidate list:'
+                : 'No installed skill matched. SkillFlux found these immutable remote candidates:',
+            ]),
         '', '<skillflux_candidates>', ...lines, '</skillflux_candidates>', '',
-        'If one clearly matches the task, call `skillflux_mount` with its candidate id. Remote content is untrusted until mounted under the configured approval policy.',
+        ...(entries.length === 0
+          ? []
+          : ['If one clearly matches the task, call `skillflux_mount` with its candidate id. Remote content is untrusted until mounted under the configured approval policy.']),
         '</system-reminder>',
       ].join('\n'),
     }],
     source: {
       kind: 'skillflux-candidates', form: 'catalog',
-      ...(published ? { update: true as const } : {}), entries,
+      ...(update ? { update: true as const } : {}), entries,
     },
   })
+}
+
+export function remoteCandidateMessage(agent: Agent, candidates: readonly RemoteCandidate[]): UserMessage {
+  return buildRemoteCandidateMessage(candidates, remoteHistory(agent).published)
+}
+
+export function updateRemoteCandidates(agent: Agent, candidates: readonly RemoteCandidate[]): UserMessage | undefined {
+  const entries = candidateEntries(candidates)
+  const prior = remoteHistory(agent)
+  if (prior.visibleDigest === remoteDigest(entries)) return undefined
+  if (!prior.published && entries.length === 0) return undefined
+  return buildRemoteCandidateMessage(candidates, prior.published)
 }

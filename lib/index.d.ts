@@ -132,7 +132,17 @@ interface CacheManagerOptions {
   readonly maxFiles: number;
   readonly maxBytes: number;
   readonly installTimeoutMs: number;
+  readonly runInstaller?: SkillInstaller;
 }
+interface SkillInstallerInvocation {
+  readonly executable: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
+  readonly env: NodeJS.ProcessEnv;
+}
+type SkillInstaller = (invocation: SkillInstallerInvocation) => Promise<void>;
 declare class SkillCache {
   private readonly options;
   readonly root: string;
@@ -199,6 +209,8 @@ declare class SkillFluxService extends Service {
   private executeCommand;
   private routeTurn;
   private mountCandidate;
+  private assertCapacity;
+  private beginTurn;
   private state;
   private cleanupState;
   private cleanupSession;

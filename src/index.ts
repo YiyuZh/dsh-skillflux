@@ -15,7 +15,7 @@ import {
 } from '@deepseek-ai/dsh-skill'
 import { defineTool, type PreToolDecision, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { SkillCache } from './cache.js'
-import { remoteCandidateMessage, updateCatalog } from './catalog.js'
+import { updateCatalog, updateRemoteCandidates } from './catalog.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { cacheCandidates, registryCandidates, selectCandidates, tokenize } from './router.js'
 import type {
@@ -252,15 +252,26 @@ export class SkillFluxService extends Service {
       const decision = await next()
       if (decision.kind === 'reject' || step !== 1) return decision
       const task = directTask(messages)
-      if (task === undefined) return decision
+      if (task === undefined) {
+        this.beginTurn(agent, turn)
+        const hint = updateRemoteCandidates(agent, [])
+        return hint === undefined ? decision : { kind: 'enter', messages: [...decision.messages, hint] }
+      }
       try {
-        const hint = await this.routeTurn(agent, task, turn, signal)
+        const explicit = new Set<string>()
+        for (const skillName of invokedSkillNames(messages)) {
+          const definition = await ctx.skills.get(skillName, skillLookup(agent, signal))
+          signal.throwIfAborted()
+          if (definition !== undefined && isUserInvocable(definition)) explicit.add(skillName)
+        }
+        const hint = await this.routeTurn(agent, task, turn, explicit, signal)
         return hint === undefined
           ? decision
           : { kind: 'enter', messages: [...decision.messages, hint] }
       } catch (error: unknown) {
         ctx.logger.warn(`SkillFlux routing failed open: ${errorMessage(error)}`)
-        return decision
+        const hint = updateRemoteCandidates(agent, [])
+        return hint === undefined ? decision : { kind: 'enter', messages: [...decision.messages, hint] }
       }
     })
 
@@ -441,6 +452,7 @@ export class SkillFluxService extends Service {
         const mounted = await this.mount(agent, args.candidateId, exec.signal)
         return skillResult(mounted.definition)
       },
+      isConcurrencySafe: () => false,
       presentCall: args => ({ card: 'generic', title: 'Mount skill', kind: 'edit', rawInput: args.candidateId }),
     })
   }
@@ -533,56 +545,82 @@ export class SkillFluxService extends Service {
     return { kind: 'error', text: 'Usage: /skillflux status | cache list | cache clean <cache-id|all>' }
   }
 
-  private async routeTurn(agent: Agent, task: string, turn: number, signal: AbortSignal): Promise<UserMessage | undefined> {
-    const state = this.state(agent)
-    if (state.turn !== turn) {
-      this.cleanupState(state, false)
-      state.turn = turn
-      state.candidates.clear()
-    }
+  private async routeTurn(
+    agent: Agent,
+    task: string,
+    turn: number,
+    explicit: ReadonlySet<string>,
+    signal: AbortSignal,
+  ): Promise<UserMessage | undefined> {
+    const state = this.beginTurn(agent, turn)
     const snapshot = await this.runtimeCtx.skills.snapshot(skillLookup(agent, signal))
-    if (!snapshot.complete) return undefined
-    const local = dedupeByName([
+    if (!snapshot.complete) return updateRemoteCandidates(agent, [])
+    const localPool = [
       ...registryCandidates(snapshot.skills.filter(isModelInvocable)),
       ...cacheCandidates(await this.cache.list()),
-    ])
+    ].filter(candidate => !explicit.has(candidate.name))
+    const fallbacksByName = new Map<string, SkillFluxCandidate[]>()
+    for (const candidate of localPool) {
+      const fallbacks = fallbacksByName.get(candidate.name) ?? []
+      fallbacks.push(candidate)
+      fallbacksByName.set(candidate.name, fallbacks)
+    }
+    const local = dedupeByName(localPool)
     const selected = selectCandidates(task, local, {
-      limit: this.config.maxActiveSkills,
+      // Keep ranked fallbacks available: a corrupt top candidate must not
+      // consume one of the bounded active slots for the entire turn.
+      limit: local.length,
       minScore: this.config.minRouteScore,
       routes: this.config.routes,
     })
     for (const candidate of selected) {
-      state.candidates.set(candidate.id, candidate)
-      await this.mountCandidate(state, candidate, signal)
+      if (state.active.size >= this.config.maxActiveSkills) break
+      for (const fallback of fallbacksByName.get(candidate.name) ?? []) {
+        try {
+          await this.mountCandidate(state, fallback, signal)
+          break
+        } catch (error: unknown) {
+          this.runtimeCtx.logger.warn(
+            `SkillFlux skipped candidate ${fallback.name} from ${fallback.source}: ${errorMessage(error)}`,
+          )
+        }
+      }
     }
-    if (state.active.size > 0 || this.config.remoteDiscovery !== 'automatic') return undefined
+    if (state.active.size > 0 || this.config.remoteDiscovery !== 'automatic') {
+      return updateRemoteCandidates(agent, [])
+    }
     let remote: RemoteCandidate[]
     try {
       remote = await this.remote.search(automaticDiscoveryQuery(task), signal)
     } catch (error: unknown) {
       this.runtimeCtx.logger.warn(`SkillFlux remote discovery skipped: ${errorMessage(error)}`)
-      return undefined
+      return updateRemoteCandidates(agent, [])
     }
     for (const candidate of remote) state.candidates.set(candidate.id, candidate)
-    if (remote.length === 0) return undefined
+    if (remote.length === 0) return updateRemoteCandidates(agent, [])
     if (this.config.approvalPolicy === 'automatic') {
       try {
         await this.mountCandidate(state, remote[0]!, signal)
-        return undefined
+        state.candidates.clear()
+        return updateRemoteCandidates(agent, [])
       } catch (error: unknown) {
         this.runtimeCtx.logger.warn(`SkillFlux automatic remote mount failed: ${errorMessage(error)}`)
       }
     }
-    return remoteCandidateMessage(agent, remote)
+    return updateRemoteCandidates(agent, remote)
   }
 
   private async mountCandidate(state: AgentState, candidate: SkillFluxCandidate, signal?: AbortSignal): Promise<MountedSkill> {
     const current = state.active.get(candidate.name)
     if (current !== undefined) return current
+    this.assertCapacity(state, candidate.name)
     const lookup = skillLookup(state.agent, signal)
     if (candidate.origin === 'registry') {
       const definition = await this.runtimeCtx.skills.get(candidate.name, lookup)
       if (definition === undefined) throw new Error(`skill "${candidate.name}" is no longer available`)
+      const raced = state.active.get(definition.name)
+      if (raced !== undefined) return raced
+      this.assertCapacity(state, definition.name)
       const mounted: MountedSkill = { name: candidate.name, origin: 'registry', source: candidate.source, definition }
       state.active.set(candidate.name, mounted)
       return mounted
@@ -592,6 +630,9 @@ export class SkillFluxService extends Service {
     if (existingSummary !== undefined) {
       const definition = await this.runtimeCtx.skills.get(candidate.name, lookup)
       if (definition === undefined) throw new Error(`skill "${candidate.name}" disappeared during mount`)
+      const raced = state.active.get(definition.name)
+      if (raced !== undefined) return raced
+      this.assertCapacity(state, definition.name)
       const mounted: MountedSkill = {
         name: candidate.name,
         origin: 'registry',
@@ -611,6 +652,9 @@ export class SkillFluxService extends Service {
       entry = await this.cache.install(candidate, signal)
     }
     const definition = await this.cache.load(entry)
+    const raced = state.active.get(definition.name)
+    if (raced !== undefined) return raced
+    this.assertCapacity(state, definition.name)
     const dispose = state.agent.ctx.skills.register({
       name: definition.name,
       description: definition.description,
@@ -643,6 +687,23 @@ export class SkillFluxService extends Service {
     return mounted
   }
 
+  private assertCapacity(state: AgentState, name: string): void {
+    if (state.active.has(name)) return
+    if (state.active.size >= this.config.maxActiveSkills) {
+      throw new Error(`cannot mount skill "${name}": the ${this.config.maxActiveSkills}-skill turn limit is reached`)
+    }
+  }
+
+  private beginTurn(agent: Agent, turn: number): AgentState {
+    const state = this.state(agent)
+    if (state.turn !== turn) {
+      this.cleanupState(state, false)
+      state.turn = turn
+      state.candidates.clear()
+    }
+    return state
+  }
+
   private state(agent: Agent): AgentState {
     let state = this.stateByAgent.get(agent)
     if (state === undefined) {
@@ -664,11 +725,16 @@ export class SkillFluxService extends Service {
     if (forget) {
       state.candidates.clear()
       this.states.delete(state)
+      this.stateByAgent.delete(state.agent)
     }
   }
 
   private cleanupSession(session: Session): void {
-    for (const state of this.states) if (state.agent.session === session) this.cleanupState(state, false)
+    for (const state of this.states) {
+      if (state.agent.session !== session) continue
+      this.cleanupState(state, false)
+      state.candidates.clear()
+    }
   }
 
   private disposeSession(session: Session): void {

@@ -31,6 +31,13 @@ describe('router', () => {
     expect(exact).toBeGreaterThanOrEqual(100)
   })
 
+  it('matches short skill names only at word boundaries', () => {
+    expect(routeScore('This is ongoing work', candidate('go', 'Unrelated capability'))).toBe(0)
+    expect(routeScore('Prepare a quarterly report', candidate('art', 'Unrelated capability'))).toBe(0)
+    expect(routeScore('Use go for this module', candidate('go', 'Unrelated capability'))).toBeGreaterThanOrEqual(100)
+    expect(routeScore('Use pdf reader', candidate('pdf-reader', 'Unrelated capability'))).toBeGreaterThanOrEqual(100)
+  })
+
   it('applies ordered rules before lexical scoring and enforces the limit', () => {
     const candidates = [
       candidate('pdf-reader', 'Read PDF files'),
