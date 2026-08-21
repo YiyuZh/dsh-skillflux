@@ -1,0 +1,5 @@
+# Replace only the model-facing skill consumer. The official skill registry and
+# filesystem providers remain mounted and continue to own discovery/loading.
+- insert:
+    - id: tool-skill
+      name: dsh-skillflux
