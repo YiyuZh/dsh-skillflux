@@ -24,5 +24,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Typecheck, lint, test, and build
         run: pnpm check
+      - name: Run routing evaluation corpus
+        run: pnpm eval
       - name: Verify package contents
         run: pnpm pack --dry-run

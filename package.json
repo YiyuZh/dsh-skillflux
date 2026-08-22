@@ -24,6 +24,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src tests",
     "test": "vitest run",
+    "eval": "vitest run tests/eval.spec.ts --reporter=verbose",
     "test:coverage": "vitest run --coverage",
     "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm build",
     "pack:check": "pnpm pack --dry-run"

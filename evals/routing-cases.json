@@ -1,0 +1,582 @@
+{
+  "version": 1,
+  "description": "Deterministic routing benchmark for the dsh-skillflux MVP.",
+  "defaults": {
+    "limit": 3,
+    "minScore": 8
+  },
+  "candidates": [
+    {
+      "key": "pdf-registry",
+      "origin": "registry",
+      "name": "pdf-reader",
+      "description": "Read PDF files and extract text",
+      "whenToUse": "Open analyze and summarize PDF documents",
+      "source": "project-skills"
+    },
+    {
+      "key": "pdf-cache",
+      "origin": "cache",
+      "name": "pdf-reader",
+      "description": "Read PDF files and extract text",
+      "whenToUse": "Open analyze and summarize PDF documents",
+      "source": "community/pdf-reader",
+      "installs": 900
+    },
+    {
+      "key": "document-parser",
+      "origin": "cache",
+      "name": "document-parser",
+      "description": "Parse structured documents into text",
+      "whenToUse": "Extract tables and metadata from documents",
+      "source": "community/document-parser",
+      "installs": 700
+    },
+    {
+      "key": "markdown-converter",
+      "origin": "cache",
+      "name": "markdown-converter",
+      "description": "Convert documents and HTML to Markdown",
+      "whenToUse": "Convert PDF or HTML into Markdown",
+      "source": "community/markdown-converter",
+      "installs": 800
+    },
+    {
+      "key": "spreadsheet-analyzer",
+      "origin": "registry",
+      "name": "spreadsheet-analyzer",
+      "description": "Analyze CSV and spreadsheet data",
+      "whenToUse": "Calculate statistics from Excel CSV and spreadsheet files",
+      "source": "project-skills"
+    },
+    {
+      "key": "react-specialist",
+      "origin": "cache",
+      "name": "react-specialist",
+      "description": "Build and review React frontend applications",
+      "whenToUse": "React components hooks and frontend architecture",
+      "source": "community/react-specialist",
+      "installs": 1100
+    },
+    {
+      "key": "git-workflow",
+      "origin": "registry",
+      "name": "git-workflow",
+      "description": "Manage Git branches commits and pull requests",
+      "whenToUse": "Version control merge rebase and repository tasks",
+      "source": "project-skills"
+    },
+    {
+      "key": "image-generator",
+      "origin": "remote",
+      "name": "image-generator",
+      "description": "Generate images from text prompts",
+      "source": "community/image-generator",
+      "installs": 2100
+    },
+    {
+      "key": "security-auditor",
+      "origin": "cache",
+      "name": "security-auditor",
+      "description": "Review source code for security vulnerabilities",
+      "whenToUse": "Threat modeling secrets and dependency risk",
+      "source": "community/security-auditor",
+      "installs": 1500
+    },
+    {
+      "key": "api-tester",
+      "origin": "registry",
+      "name": "api-tester",
+      "description": "Test HTTP APIs and validate responses",
+      "whenToUse": "REST GraphQL endpoints and integration tests",
+      "source": "project-skills"
+    },
+    {
+      "key": "chinese-document-reader",
+      "origin": "registry",
+      "name": "chinese-document-reader",
+      "description": "读取并总结中文文档",
+      "whenToUse": "分析中文 PDF 报告与合同",
+      "source": "project-skills"
+    },
+    {
+      "key": "deploy-helper",
+      "origin": "cache",
+      "name": "deploy-helper",
+      "description": "Deploy web applications to cloud platforms",
+      "whenToUse": "Release production builds and configure hosting",
+      "source": "community/deploy-helper",
+      "installs": 600
+    },
+    {
+      "key": "word-counter",
+      "origin": "cache",
+      "name": "word-counter",
+      "description": "Count words lines and characters in text",
+      "whenToUse": "Text statistics and word count",
+      "source": "community/word-counter",
+      "installs": 400
+    },
+    {
+      "key": "go-helper",
+      "origin": "cache",
+      "name": "go",
+      "description": "Compile Go programs",
+      "source": "community/go",
+      "installs": 500
+    },
+    {
+      "key": "art-helper",
+      "origin": "cache",
+      "name": "art",
+      "description": "Create art assets",
+      "source": "community/art",
+      "installs": 500
+    },
+    {
+      "key": "table-extractor",
+      "origin": "cache",
+      "name": "table-extractor",
+      "description": "Document extraction utility",
+      "whenToUse": "Extract tables from PDF documents",
+      "source": "community/table-extractor",
+      "installs": 300
+    },
+    {
+      "key": "metadata-extractor",
+      "origin": "cache",
+      "name": "metadata-extractor",
+      "description": "Document extraction utility",
+      "whenToUse": "Extract metadata from PDF documents",
+      "source": "community/metadata-extractor",
+      "installs": 300
+    },
+    {
+      "key": "popular-log-tool",
+      "origin": "cache",
+      "name": "popular-log-tool",
+      "description": "Analyze application logs",
+      "source": "community/popular-log-tool",
+      "installs": 5000
+    },
+    {
+      "key": "niche-log-tool",
+      "origin": "cache",
+      "name": "niche-log-tool",
+      "description": "Analyze application logs",
+      "source": "community/niche-log-tool",
+      "installs": 100
+    },
+    {
+      "key": "local-pdf-tool",
+      "origin": "registry",
+      "name": "local-pdf-tool",
+      "description": "Read PDF files",
+      "source": "project-skills"
+    },
+    {
+      "key": "cached-pdf-tool",
+      "origin": "cache",
+      "name": "cached-pdf-tool",
+      "description": "Read PDF files",
+      "source": "community/cached-pdf-tool",
+      "installs": 5000
+    },
+    {
+      "key": "cache-json-tool",
+      "origin": "cache",
+      "name": "json-helper",
+      "description": "Format JSON data",
+      "source": "community/json-helper",
+      "installs": 200
+    },
+    {
+      "key": "remote-json-tool",
+      "origin": "remote",
+      "name": "json-tool",
+      "description": "Format JSON data",
+      "source": "remote/json-tool",
+      "installs": 2000
+    },
+    {
+      "key": "alpha-log-tool",
+      "origin": "cache",
+      "name": "alpha-tool",
+      "description": "Inspect service logs",
+      "source": "zeta/repository",
+      "installs": 100
+    },
+    {
+      "key": "beta-log-tool",
+      "origin": "cache",
+      "name": "beta-tool",
+      "description": "Inspect service logs",
+      "source": "alpha/repository",
+      "installs": 100
+    },
+    {
+      "key": "popular-pdf-cache",
+      "origin": "cache",
+      "name": "shared-pdf-reader",
+      "description": "Read PDF files",
+      "source": "community/popular-pdf",
+      "installs": 5000
+    },
+    {
+      "key": "niche-pdf-cache",
+      "origin": "cache",
+      "name": "shared-pdf-reader",
+      "description": "Read PDF files",
+      "source": "community/niche-pdf",
+      "installs": 50
+    },
+    {
+      "key": "description-only-statistics",
+      "origin": "cache",
+      "name": "data-helper",
+      "description": "Statistics",
+      "source": "community/data-helper",
+      "installs": 50
+    },
+    {
+      "key": "when-to-use-statistics",
+      "origin": "cache",
+      "name": "data-specialist",
+      "description": "Data utility",
+      "whenToUse": "Statistics",
+      "source": "community/data-specialist",
+      "installs": 50
+    }
+  ],
+  "cases": [
+    {
+      "id": "english-exact-name",
+      "category": "english",
+      "task": "Use pdf-reader for this file",
+      "pool": ["pdf-registry", "document-parser"],
+      "limit": 1,
+      "expected": ["pdf-registry"]
+    },
+    {
+      "id": "english-space-name",
+      "category": "english",
+      "task": "Use pdf reader to extract text",
+      "pool": ["pdf-registry", "document-parser"],
+      "limit": 1,
+      "expected": ["pdf-registry"]
+    },
+    {
+      "id": "english-spreadsheet",
+      "category": "english",
+      "task": "Analyze an Excel workbook and calculate statistics",
+      "pool": ["spreadsheet-analyzer", "document-parser", "word-counter"],
+      "limit": 1,
+      "expected": ["spreadsheet-analyzer"]
+    },
+    {
+      "id": "english-react",
+      "category": "english",
+      "task": "Review these React hooks and frontend components",
+      "pool": ["react-specialist", "security-auditor", "api-tester"],
+      "limit": 1,
+      "expected": ["react-specialist"]
+    },
+    {
+      "id": "english-git",
+      "category": "english",
+      "task": "Rebase my Git branch and prepare a pull request",
+      "pool": ["git-workflow", "deploy-helper", "security-auditor"],
+      "limit": 1,
+      "expected": ["git-workflow"]
+    },
+    {
+      "id": "english-image",
+      "category": "english",
+      "task": "Generate an image from this text prompt",
+      "pool": ["image-generator", "react-specialist", "markdown-converter"],
+      "limit": 1,
+      "expected": ["image-generator"]
+    },
+    {
+      "id": "english-security",
+      "category": "english",
+      "task": "Audit this source code for security vulnerabilities",
+      "pool": ["security-auditor", "api-tester", "git-workflow"],
+      "limit": 1,
+      "expected": ["security-auditor"]
+    },
+    {
+      "id": "english-api",
+      "category": "english",
+      "task": "Test these REST API endpoints and validate responses",
+      "pool": ["api-tester", "security-auditor", "react-specialist"],
+      "limit": 1,
+      "expected": ["api-tester"]
+    },
+    {
+      "id": "english-word-count",
+      "category": "english",
+      "task": "Count the words and lines in this text",
+      "pool": ["word-counter", "document-parser", "spreadsheet-analyzer"],
+      "limit": 1,
+      "expected": ["word-counter"]
+    },
+    {
+      "id": "english-deploy",
+      "category": "english",
+      "task": "Deploy this web application to a cloud hosting platform",
+      "pool": ["deploy-helper", "react-specialist", "git-workflow"],
+      "limit": 1,
+      "expected": ["deploy-helper"]
+    },
+    {
+      "id": "chinese-pdf-report",
+      "category": "chinese",
+      "task": "帮我分析这份中文 PDF 报告",
+      "pool": ["chinese-document-reader", "pdf-registry", "document-parser"],
+      "limit": 1,
+      "expected": ["chinese-document-reader"]
+    },
+    {
+      "id": "chinese-contract",
+      "category": "chinese",
+      "task": "读取并总结这份中文合同",
+      "pool": ["chinese-document-reader", "pdf-registry", "word-counter"],
+      "limit": 1,
+      "expected": ["chinese-document-reader"]
+    },
+    {
+      "id": "unicode-normalization",
+      "category": "normalization",
+      "task": "ＵＳＥ ＰＤＦ－ＲＥＡＤＥＲ",
+      "pool": ["pdf-registry", "document-parser"],
+      "limit": 1,
+      "expected": ["pdf-registry"]
+    },
+    {
+      "id": "case-normalization",
+      "category": "normalization",
+      "task": "Run PDF-READER now",
+      "pool": ["pdf-registry", "document-parser"],
+      "limit": 1,
+      "expected": ["pdf-registry"]
+    },
+    {
+      "id": "short-name-go-boundary",
+      "category": "negative",
+      "task": "This is ongoing work",
+      "pool": ["go-helper"],
+      "expected": []
+    },
+    {
+      "id": "short-name-art-boundary",
+      "category": "negative",
+      "task": "Prepare a quarterly report",
+      "pool": ["art-helper"],
+      "expected": []
+    },
+    {
+      "id": "unrelated-flight",
+      "category": "negative",
+      "task": "Book a flight for tomorrow",
+      "pool": ["pdf-registry", "react-specialist", "api-tester"],
+      "expected": []
+    },
+    {
+      "id": "stop-words-only",
+      "category": "negative",
+      "task": "Please help me with this",
+      "pool": ["pdf-registry", "word-counter", "deploy-helper"],
+      "expected": []
+    },
+    {
+      "id": "ordered-match-all-rule",
+      "category": "rules",
+      "task": "Convert this PDF",
+      "pool": ["pdf-registry", "document-parser", "markdown-converter"],
+      "limit": 2,
+      "routes": [
+        {
+          "matchAll": ["convert", "pdf"],
+          "skills": ["markdown-converter"]
+        }
+      ],
+      "expected": ["markdown-converter", "pdf-registry"],
+      "expectedForced": ["markdown-converter"]
+    },
+    {
+      "id": "multiple-rule-order",
+      "category": "rules",
+      "task": "Analyze document data",
+      "pool": ["spreadsheet-analyzer", "document-parser", "pdf-registry"],
+      "limit": 2,
+      "routes": [
+        {
+          "matchAny": ["data"],
+          "skills": ["spreadsheet-analyzer"]
+        },
+        {
+          "matchAny": ["document"],
+          "skills": ["document-parser"]
+        }
+      ],
+      "expected": ["spreadsheet-analyzer", "document-parser"],
+      "expectedForced": ["spreadsheet-analyzer", "document-parser"]
+    },
+    {
+      "id": "rule-deduplication",
+      "category": "rules",
+      "task": "Convert this PDF to Markdown",
+      "pool": ["markdown-converter", "pdf-registry"],
+      "limit": 2,
+      "routes": [
+        {
+          "matchAny": ["convert"],
+          "skills": ["markdown-converter"]
+        },
+        {
+          "matchAny": ["markdown"],
+          "skills": ["markdown-converter", "pdf-reader"]
+        }
+      ],
+      "expected": ["markdown-converter", "pdf-registry"],
+      "expectedForced": ["markdown-converter", "pdf-registry"]
+    },
+    {
+      "id": "three-skill-cap",
+      "category": "capacity",
+      "task": "Analyze and convert this PDF document to Markdown",
+      "pool": ["markdown-converter", "pdf-registry", "document-parser", "word-counter"],
+      "limit": 3,
+      "expected": ["markdown-converter", "pdf-registry", "document-parser"]
+    },
+    {
+      "id": "one-skill-cap-with-rule",
+      "category": "capacity",
+      "task": "Convert and analyze this PDF",
+      "pool": ["markdown-converter", "pdf-registry", "document-parser"],
+      "limit": 1,
+      "routes": [
+        {
+          "matchAny": ["convert"],
+          "skills": ["markdown-converter", "pdf-reader"]
+        }
+      ],
+      "expected": ["markdown-converter"],
+      "expectedForced": ["markdown-converter"]
+    },
+    {
+      "id": "threshold-rejects-eleven",
+      "category": "threshold",
+      "task": "Statistics",
+      "pool": ["spreadsheet-analyzer"],
+      "minScore": 12,
+      "expected": []
+    },
+    {
+      "id": "threshold-accepts-eleven",
+      "category": "threshold",
+      "task": "Statistics",
+      "pool": ["spreadsheet-analyzer"],
+      "minScore": 8,
+      "expected": ["spreadsheet-analyzer"]
+    },
+    {
+      "id": "when-to-use-discrimination",
+      "category": "ranking",
+      "task": "Extract tables from this PDF document",
+      "pool": ["table-extractor", "metadata-extractor"],
+      "limit": 1,
+      "expected": ["table-extractor"]
+    },
+    {
+      "id": "cache-install-tiebreak",
+      "category": "ranking",
+      "task": "Analyze application logs",
+      "pool": ["niche-log-tool", "popular-log-tool"],
+      "limit": 1,
+      "expected": ["popular-log-tool"]
+    },
+    {
+      "id": "registry-origin-tiebreak",
+      "category": "ranking",
+      "task": "Read PDF files",
+      "pool": ["cached-pdf-tool", "local-pdf-tool"],
+      "limit": 1,
+      "expected": ["local-pdf-tool"]
+    },
+    {
+      "id": "cache-before-remote-tiebreak",
+      "category": "ranking",
+      "task": "Format JSON data",
+      "pool": ["remote-json-tool", "cache-json-tool"],
+      "limit": 1,
+      "expected": ["cache-json-tool"]
+    },
+    {
+      "id": "stable-source-tiebreak",
+      "category": "ranking",
+      "task": "Inspect service logs",
+      "pool": ["alpha-log-tool", "beta-log-tool"],
+      "limit": 1,
+      "expected": ["beta-log-tool"]
+    },
+    {
+      "id": "missing-rule-skill-falls-back",
+      "category": "rules",
+      "task": "Read this PDF",
+      "pool": ["pdf-registry", "document-parser"],
+      "limit": 1,
+      "routes": [
+        {
+          "matchAny": ["pdf"],
+          "skills": ["not-installed"]
+        }
+      ],
+      "expected": ["pdf-registry"]
+    },
+    {
+      "id": "chinese-match-any-rule",
+      "category": "rules",
+      "task": "检查这个依赖是否存在安全漏洞",
+      "pool": ["security-auditor", "api-tester"],
+      "limit": 1,
+      "routes": [
+        {
+          "matchAny": ["漏洞", "安全"],
+          "skills": ["security-auditor"]
+        }
+      ],
+      "expected": ["security-auditor"],
+      "expectedForced": ["security-auditor"]
+    },
+    {
+      "id": "same-name-origin-deduplication",
+      "category": "deduplication",
+      "task": "Use pdf-reader",
+      "pool": ["pdf-cache", "pdf-registry"],
+      "expected": ["pdf-registry"]
+    },
+    {
+      "id": "same-name-install-tiebreak",
+      "category": "deduplication",
+      "task": "Read PDF files",
+      "pool": ["niche-pdf-cache", "popular-pdf-cache"],
+      "expected": ["popular-pdf-cache"]
+    },
+    {
+      "id": "description-only-below-default",
+      "category": "threshold",
+      "task": "Statistics",
+      "pool": ["description-only-statistics"],
+      "expected": []
+    },
+    {
+      "id": "when-to-use-at-default",
+      "category": "threshold",
+      "task": "Statistics",
+      "pool": ["when-to-use-statistics"],
+      "expected": ["when-to-use-statistics"]
+    }
+  ]
+}

@@ -131,15 +131,43 @@ Skills are instructions supplied to an agent and can still be malicious. Approva
 - Unmounting cannot remove text already committed to session history; it prevents stale skills from remaining in later catalogs.
 - New upstream commits create new immutable cache entries. Old entries remain until explicitly cleaned.
 
+## Evaluation
+
+Run the deterministic routing corpus without an API key or network access:
+
+```bash
+corepack pnpm eval
+```
+
+The versioned corpus contains 36 English, Chinese, normalization, rule,
+threshold, capacity, ranking, and deduplication cases. The baseline for this
+commit is:
+
+| Metric | Result |
+| --- | ---: |
+| Exact ordered match | 100.0% |
+| Top-1 accuracy on positive cases | 100.0% |
+| Negative-task rejection | 100.0% |
+| Selector-limit compliance | 100.0% |
+
+These results verify the deterministic MVP routing contract against the
+checked-in corpus. They don't measure third-party Skill quality or the final answer from
+an online model. See the
+[evaluation corpus guide](evals/README.md) for the case format, coverage, and
+limitations.
+
 ## Development
 
 ```bash
 corepack pnpm install
 corepack pnpm check
+corepack pnpm eval
 corepack pnpm pack --dry-run
 ```
 
-The test suite covers routing, DSH catalog virtualization, explicit invocation compatibility, remote response validation, cache integrity, and cleanup behavior. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
+The test suite covers routing, DSH catalog virtualization, explicit invocation
+compatibility, remote response validation, cache integrity, and cleanup
+behavior. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
 
 ## License
 

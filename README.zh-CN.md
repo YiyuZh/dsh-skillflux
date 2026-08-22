@@ -141,11 +141,34 @@ Skill 本质上仍是交给 Agent 的外部指令，审批并不等于内容安�
 - 卸载无法删除已经写入 session history 的文本，但会阻止旧 Skill 继续出现在后续目录。
 - 上游出现新 commit 时会形成新的不可变缓存；旧版本需要用户主动清理。
 
+## 测评
+
+确定性路由测评不需要 API Key 或网络：
+
+```bash
+corepack pnpm eval
+```
+
+版本化测评集包含 36 个场景，覆盖英文、中文、文本归一化、规则优先级、阈值、
+容量限制、同分排序和同名去重。本提交的基线结果为：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 完整顺序匹配率 | 100.0% |
+| 正例 Top-1 准确率 | 100.0% |
+| 无关任务拒绝率 | 100.0% |
+| Selector 容量限制合规率 | 100.0% |
+
+这些结果只验证当前 MVP Router 在仓库测评集上的确定性行为，不代表第三方 Skill
+质量或在线模型最终回答质量。测评格式、覆盖范围和限制见
+[测评集说明](evals/README.md)。
+
 ## 开发与测试
 
 ```bash
 corepack pnpm install
 corepack pnpm check
+corepack pnpm eval
 corepack pnpm pack --dry-run
 ```
 
