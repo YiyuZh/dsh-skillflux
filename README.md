@@ -1,60 +1,120 @@
 # dsh-skillflux
 
-Dynamic Skill Runtime Manager for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
+Dynamic Skill Runtime Manager for
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
-`dsh-skillflux` keeps the full Skill pool outside the model-facing catalog, selects only the skills relevant to the current turn, mounts cached or remote skills when needed, and unmounts them when the turn ends.
+SkillFlux keeps the full Skill pool outside the model-facing catalog. For each
+task, it selects a small set of relevant Skills, mounts them for the current
+turn, and releases the mounts when the turn ends.
 
-> Status: MVP for DeepSeek Harness `0.1.1-rc.2`. Harness is still a developer preview, so compatibility is pinned to the current RC line.
+> **Status:** MVP for DeepSeek Harness `0.1.1-rc.2`. Harness is still a
+> developer preview, so this project follows the current RC API.
 
 [中文文档](README.zh-CN.md)
 
-## Why
+## Why SkillFlux
 
-Installing more skills should not make every later request carry a larger catalog. SkillFlux treats skills like dynamically loaded modules:
+A growing Skill library should not make every request carry a growing catalog.
+Large catalogs consume context and make Skill selection less predictable.
 
-```text
-User task
-  -> deterministic router
-  -> local registry + persistent cache + skills.sh
-  -> mount at most 1-3 skills
-  -> agent executes
-  -> unmount at turn/end
-  -> keep downloaded files until the user cleans them
-```
+SkillFlux acts as a runtime layer between the Agent and its Skill pool. The
+automatic catalog contains no more than `maxActiveSkills` selected Skills
+(three by default), while the official DSH Skill Registry remains the source
+of truth. Explicit `/skill-name` invocations remain available separately.
 
-SkillFlux reuses the official `ctx.skills` registry. It replaces only the default model-facing `tool-skill` consumer so the original filesystem providers, precedence rules, scoped registrations, and explicit `/skill-name` invocation continue to work.
+## Quick start
 
-## Features
+You need Node.js `22.20.0` or later and a DeepSeek Harness profile on the
+`0.1.1-rc.2` package line.
 
-- Rule-first routing plus deterministic lexical scoring for English and Chinese tasks.
-- A model catalog capped by `maxActiveSkills` instead of the size of the installed pool.
-- Local registry, persistent cache, and [skills.sh](https://skills.sh/) discovery.
-- Immutable remote candidates resolved to a GitHub commit SHA.
-- Turn-scoped `ctx.skills.register()` mounts with exact disposers.
-- Persistent, content-hashed cache under `$DSH_HOME/cache/skillflux`.
-- Three remote approval policies: every install, once per repository/session, or automatic.
-- Native tools: `skill`, `skillflux_search`, and `skillflux_mount`.
-- Native command: `/skillflux` for status and cache management.
+1. Install SkillFlux into the profile you use:
 
-## Install
+   ```bash
+   dsh plugin --profile web add github:YiyuZh/dsh-skillflux
+   ```
 
-Built artifacts are committed, so GitHub installation does not need a `prepare` script:
+   Replace `web` with another profile name, such as `headless`, when needed.
 
-```bash
-dsh plugin --profile web add github:YiyuZh/dsh-skillflux
-```
+2. Restart that Harness profile.
 
-For reproducible deployment, pin the plugin commit:
+3. Verify the runtime from a DSH conversation:
+
+   ```text
+   /skillflux status
+   ```
+
+For a reproducible deployment, pin a commit:
 
 ```bash
 dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 ```
 
-The bundle patch disables the profile row with `id: tool-skill` and mounts SkillFlux under its own `skillflux` loader id. It does not replace the official `skill` registry or `skill-filesystem` provider. Restart the Harness profile after installation.
+The repository includes built `lib/` artifacts, so GitHub installation doesn't
+run a `prepare` script. The bundle patch disables the official `tool-skill`
+consumer and mounts SkillFlux under the unique `skillflux` loader ID. It keeps
+the official `skill` Registry and `skill-filesystem` provider active.
+
+## How it works
+
+```text
+User task
+  -> deterministic Skill router
+  -> local Registry + persistent cache + skills.sh
+  -> select and mount up to the configured limit (3 by default)
+  -> Agent calls a mounted Skill
+  -> unmount at turn/end
+  -> keep downloaded files until explicit cleanup
+```
+
+A mount is scoped to the receiving Agent. Unmounting removes the runtime
+registration from future catalogs; it doesn't delete cached files or text
+already stored in session history.
+
+## MVP capabilities
+
+- Route by ordered rules, then deterministic English and Chinese lexical scores.
+- Limit the model-facing catalog with `maxActiveSkills`.
+- Discover candidates from the DSH Registry, the SkillFlux cache, and
+  [skills.sh](https://skills.sh/).
+- Resolve remote candidates to immutable GitHub commit SHAs.
+- Register cached Skills through the current Agent's `ctx.skills` scope.
+- Verify cached content with a SHA-256 manifest before every load.
+- Support per-remote-mount, per-repository/session, and automatic approval
+  policies.
+- Expose model tools for loading, searching, and mounting Skills.
+- Expose `/skillflux` commands for runtime status and cache cleanup.
+
+## Routing behavior
+
+SkillFlux routes a task in this order:
+
+1. Preserve an explicit user invocation such as `/pdf-reader` and exclude that
+   name from automatic routing.
+2. Group model-invocable Registry and cached candidates by Skill name. Registry
+   entries represent a name first, while same-name cache entries remain
+   available as fallbacks.
+3. Apply matching `routes` in configuration order.
+4. Score the remaining name representatives with deterministic lexical
+   matching and reject scores below `minRouteScore`.
+5. Mount the selected names until `maxActiveSkills` is reached. If a candidate
+   can't load, try its same-name fallbacks in candidate-pool order.
+
+The MVP lexical score is:
+
+| Match | Score |
+| --- | ---: |
+| Complete Skill name or its space-separated form | +100 |
+| Each matching name token | +20 |
+| Each matching `whenToUse` token | +8 |
+| Each matching description token | +3 |
+
+For equal scores, Registry candidates rank before cached candidates, and cached
+candidates rank before remote candidates. Cache ties prefer higher install
+counts and then a stable source/name order.
 
 ## Configuration
 
-Defaults:
+SkillFlux accepts these plugin options:
 
 ```yaml
 maxActiveSkills: 3
@@ -70,37 +130,42 @@ installTimeoutMs: 300000
 routes: []
 ```
 
-Example ordered routing rule:
+Add ordered rules when a known task must prefer specific Skills:
 
 ```yaml
 routes:
   - matchAll: [pdf, analyze]
     skills: [pdf-reader, document-parser]
   - matchAny: [react, frontend]
-    skills: [react-skill]
+    skills: [react-specialist]
 ```
 
-Rules run before lexical scoring. A rule can use `matchAll`, `matchAny`, or both. Results are deduplicated and capped by `maxActiveSkills`.
+A rule can contain `matchAll`, `matchAny`, or both. Rule results keep their
+declared order, skip unavailable Skills, and still respect
+`maxActiveSkills`.
 
 ### Approval policies
 
 | Policy | Behavior |
 | --- | --- |
-| `always` | Every remote mount goes through the native DSH one-shot approval flow. This is the default. |
-| `session` | The first successful install from a repository requires approval; that repository is trusted only for the current session. |
-| `automatic` | The highest-ranked remote candidate may be downloaded and mounted without approval. Use only in a trusted environment. |
+| `always` | Request native DSH approval for every remote mount. This is the default. |
+| `session` | Request approval for the first successful install from a repository, then trust that repository for the current session. |
+| `automatic` | Download and mount the highest-ranked remote candidate without approval. Use only in a trusted environment. |
 
-If the approval service is unavailable or rejects the request, the install fails closed.
+If approval is unavailable, rejected, or canceled, the remote mount fails
+closed.
 
-## Tools and commands
+## Model tools and user commands
 
 The model can use:
 
-- `skill({ name })` — load a skill already mounted for this turn.
-- `skillflux_search({ query, remote? })` — search installed, cached, and immutable remote candidates.
-- `skillflux_mount({ candidateId })` — mount only a candidate produced by the current SkillFlux discovery state.
+- `skill({ name })` to load instructions for a Skill already mounted this turn.
+- `skillflux_search({ query, remote? })` to search installed, cached, and
+  immutable remote candidates.
+- `skillflux_mount({ candidateId })` to mount a candidate from the current
+  SkillFlux discovery state.
 
-Users can run:
+You can use:
 
 ```text
 /skillflux status
@@ -109,41 +174,43 @@ Users can run:
 /skillflux cache clean all
 ```
 
-Active cache entries are skipped during cleanup. At `turn/end`, SkillFlux unregisters runtime skills but keeps downloaded files for later reuse.
+Cleanup skips cache entries that are still mounted. At `turn/end`, SkillFlux
+unregisters runtime mounts but retains downloaded files for later reuse.
 
-## Security model
+## Security and trust
 
-- Remote discovery accepts only public GitHub `owner/repository` results from skills.sh.
-- Each result is resolved through GitHub to a 40-character commit SHA before a candidate ID is minted.
-- Installation downloads the immutable GitHub codeload archive for that SHA through the pinned `skills@1.5.23` CLI.
-- Transport extraction is capped at 5,000 files; the selected skill is separately capped at 1,000 files and 10 MiB by default.
-- Paths, symlinks, frontmatter, file counts, byte counts, and a SHA-256 content manifest are checked before mounting.
-- Skill scripts are cached as resources but are never executed by SkillFlux.
-- Automatic discovery sends a bounded token query, not the full user message. Secret-like tokens are removed.
-- `GITHUB_TOKEN` or `GH_TOKEN` is optional and is read only for GitHub API rate limits; it is never persisted.
+- Remote discovery accepts only public GitHub `owner/repository` results from
+  skills.sh.
+- Each remote result is resolved to a 40-character commit SHA before SkillFlux
+  creates its candidate ID.
+- Installation downloads that immutable GitHub codeload archive through the
+  pinned `skills@1.5.23` CLI.
+- Transport extraction is capped at 5,000 files. The selected Skill is
+  separately capped at 1,000 files and 10 MiB by default.
+- SkillFlux checks paths, symlinks, frontmatter, file counts, byte counts, and a
+  SHA-256 content manifest before mounting.
+- SkillFlux caches scripts as resources but never executes them.
+- Automatic discovery sends a bounded keyword query instead of the complete
+  user message.
+- `GITHUB_TOKEN` or `GH_TOKEN` is optional and used only for GitHub API rate
+  limits; SkillFlux doesn't persist it.
 
-Skills are instructions supplied to an agent and can still be malicious. Approval is a trust decision, not a sandbox. Keep DSH permissions and tool approvals enabled.
-
-## Known MVP limits
-
-- No embedding or LLM router; selection is rule and lexical based.
-- Only public GitHub skills discovered through skills.sh are remotely installable.
-- Unmounting cannot remove text already committed to session history; it prevents stale skills from remaining in later catalogs.
-- New upstream commits create new immutable cache entries. Old entries remain until explicitly cleaned.
+Skills are external instructions and can be malicious. Approval is a trust
+decision, not a sandbox. Keep DSH permissions, sandboxing, and tool approvals
+enabled.
 
 ## Evaluation
 
-Run the deterministic routing corpus without an API key or network access:
+Run the versioned routing corpus without an API key or network access:
 
 ```bash
 corepack pnpm eval
 ```
 
-The versioned corpus contains 36 English, Chinese, normalization, rule,
-threshold, capacity, ranking, and deduplication cases. The baseline for this
-commit is:
+The corpus contains 36 English, Chinese, normalization, rule, threshold,
+capacity, ranking, and deduplication cases.
 
-| Metric | Result |
+| Metric | Current baseline |
 | --- | ---: |
 | Exact ordered match | 100.0% |
 | Top-1 accuracy on positive cases | 100.0% |
@@ -151,10 +218,18 @@ commit is:
 | Selector-limit compliance | 100.0% |
 
 These results verify the deterministic MVP routing contract against the
-checked-in corpus. They don't measure third-party Skill quality or the final answer from
-an online model. See the
-[evaluation corpus guide](evals/README.md) for the case format, coverage, and
-limitations.
+checked-in corpus. They don't measure third-party Skill quality or the final
+answer from an online model. Read the
+[evaluation corpus guide](evals/README.md) for the case format and limitations.
+
+## Known MVP limits
+
+- Selection uses rules and lexical scoring, not embeddings or an LLM router.
+- Remote installation supports only public GitHub Skills discovered through
+  skills.sh.
+- Unmounting can't remove text already committed to session history.
+- A new upstream commit creates a new immutable cache entry. Old entries remain
+  until explicit cleanup.
 
 ## Development
 
@@ -165,9 +240,9 @@ corepack pnpm eval
 corepack pnpm pack --dry-run
 ```
 
-The test suite covers routing, DSH catalog virtualization, explicit invocation
-compatibility, remote response validation, cache integrity, and cleanup
-behavior. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
+The test suite covers routing, DSH catalog virtualization, explicit invocation,
+remote response validation, cache integrity, lifecycle cleanup, and the bundle
+patch. Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
 
 ## License
 
