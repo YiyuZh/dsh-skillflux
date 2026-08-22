@@ -4,7 +4,7 @@ Dynamic Skill Runtime Manager for [DeepSeek Harness](https://github.com/deepseek
 
 `dsh-skillflux` keeps the full Skill pool outside the model-facing catalog, selects only the skills relevant to the current turn, mounts cached or remote skills when needed, and unmounts them when the turn ends.
 
-> Status: MVP for DeepSeek Harness `0.1.1-rc.1`. Harness is still a developer preview, so compatibility is pinned to the current RC line.
+> Status: MVP for DeepSeek Harness `0.1.1-rc.2`. Harness is still a developer preview, so compatibility is pinned to the current RC line.
 
 [中文文档](README.zh-CN.md)
 
@@ -50,7 +50,7 @@ For reproducible deployment, pin the plugin commit:
 dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 ```
 
-The bundle patch replaces the profile row with `id: tool-skill`; it does not replace the official `skill` or `skill-filesystem` services. Restart the Harness profile after installation.
+The bundle patch disables the profile row with `id: tool-skill` and mounts SkillFlux under its own `skillflux` loader id. It does not replace the official `skill` registry or `skill-filesystem` provider. Restart the Harness profile after installation.
 
 ## Configuration
 

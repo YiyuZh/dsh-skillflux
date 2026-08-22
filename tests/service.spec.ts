@@ -157,6 +157,82 @@ describe('SkillFlux service', () => {
     expect(decision.messages.some(message => message.source.kind === 'skill-catalog')).toBe(false)
   })
 
+  it('does not let a user-only registry skill shadow a model-invocable cached skill', async () => {
+    const context = await setup({ routes: [] })
+    context.skills.register({
+      name: 'pdf-reader',
+      description: 'Only invoked explicitly',
+      invocation: { modelInvocable: false, userInvocable: true },
+      source: 'runtime',
+      content: 'Manual-only instructions.',
+    })
+    const cached: CacheEntry = {
+      directory: '/cache/pdf-reader',
+      manifest: {
+        version: 1,
+        cacheId: 'a'.repeat(24),
+        source: 'cached/repo',
+        ref: 'b'.repeat(40),
+        skillId: 'pdf-reader',
+        name: 'pdf-reader',
+        description: 'Read and analyze PDF documents',
+        installedAt: '2026-08-22T00:00:00.000Z',
+        fileCount: 1,
+        totalBytes: 10,
+        contentHash: 'c'.repeat(64),
+      },
+    }
+    const cache = (context.skillFlux as unknown as {
+      cache: {
+        list: () => Promise<CacheEntry[]>
+        get: (id: string) => Promise<CacheEntry | undefined>
+        load: (item: CacheEntry) => Promise<SkillDefinition>
+      }
+    }).cache
+    cache.list = async () => [cached]
+    cache.get = async id => id === cached.manifest.cacheId ? cached : undefined
+    cache.load = async item => ({
+      name: 'pdf-reader',
+      description: 'Read and analyze PDF documents',
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'runtime',
+      provider: 'skillflux-cache',
+      resourceBase: { kind: 'directory', path: item.directory },
+      path: `${item.directory}/SKILL.md`,
+      content: 'Cached PDF instructions.',
+    })
+
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Read this PDF document' }],
+      source: { kind: 'user' },
+    })
+    const decision = await propose(context, agent, [user])
+    expect(decision.kind).toBe('enter')
+    if (decision.kind !== 'enter') return
+    expect(context.skillFlux.mounted(agent)).toMatchObject([
+      { name: 'pdf-reader', origin: 'cache', source: 'cached/repo' },
+    ])
+    const catalog = decision.messages.find(message => message.source.kind === 'skill-catalog')
+    expect(catalog).toBeDefined()
+    if (catalog === undefined) return
+    expect((catalog.source as { entries?: unknown }).entries).toEqual([
+      { name: 'pdf-reader', description: 'Read and analyze PDF documents' },
+    ])
+
+    const explicit = createUserMessage({
+      content: [{ type: 'text', text: 'Use /pdf-reader now' }],
+      source: { kind: 'user' },
+    })
+    const explicitDecision = await propose(context, fakeAgent(context), [explicit], 2)
+    expect(explicitDecision.kind).toBe('enter')
+    if (explicitDecision.kind !== 'enter') return
+    const invocation = explicitDecision.messages.find(message => message.source.kind === 'skill-invocation')
+    expect(invocation).toBeDefined()
+    if (invocation === undefined) return
+    expect((invocation.content[0] as { text?: string }).text).toContain('Manual-only instructions.')
+  })
+
   it('still routes a model-only skill when slash syntax cannot invoke it directly', async () => {
     const context = await setup({ routes: [] })
     context.skills.register({

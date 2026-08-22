@@ -627,7 +627,7 @@ export class SkillFluxService extends Service {
     }
 
     const existingSummary = (await this.runtimeCtx.skills.list(lookup)).find(summary => summary.name === candidate.name)
-    if (existingSummary !== undefined) {
+    if (existingSummary !== undefined && isModelInvocable(existingSummary)) {
       const definition = await this.runtimeCtx.skills.get(candidate.name, lookup)
       if (definition === undefined) throw new Error(`skill "${candidate.name}" disappeared during mount`)
       const raced = state.active.get(definition.name)

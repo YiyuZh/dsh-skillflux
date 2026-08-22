@@ -8,7 +8,7 @@ Include the affected commit, platform, DeepSeek Harness version, configuration, 
 
 ## Supported versions
 
-Until the first stable release, only the latest tagged dsh-skillflux version is supported. The current MVP targets DeepSeek Harness `0.1.1-rc.1`.
+Until the first stable release, only the latest tagged dsh-skillflux version is supported. The current MVP targets DeepSeek Harness `0.1.1-rc.2`.
 
 ## Trust model
 

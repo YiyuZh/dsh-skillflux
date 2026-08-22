@@ -4,7 +4,7 @@
 
 `dsh-skillflux` 不把完整 Skill 池永久暴露给模型，而是根据当前回合选择少量相关 Skill，按需挂载本地缓存或远程 Skill，并在回合结束后卸载。下载文件会保留到用户主动清理。
 
-> 当前状态：适配 DeepSeek Harness `0.1.1-rc.1` 的 MVP。Harness 仍处于开发者预览阶段，本项目暂时跟随当前 RC API。
+> 当前状态：适配 DeepSeek Harness `0.1.1-rc.2` 的 MVP。Harness 仍处于开发者预览阶段，本项目暂时跟随当前 RC API。
 
 [English](README.md)
 
@@ -48,7 +48,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux
 dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 ```
 
-插件 bundle patch 会覆盖配置中 `id: tool-skill` 的行，但保留官方 `skill` 和 `skill-filesystem` 服务。安装后重启对应 Harness profile。
+插件 bundle patch 会禁用配置中 `id: tool-skill` 的模型侧消费层，并以独立的 `skillflux` Loader ID 挂载本插件；官方 `skill` Registry 和 `skill-filesystem` Provider 保持不变。安装后重启对应 Harness profile。
 
 ## 配置
 

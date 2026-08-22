@@ -6,7 +6,7 @@ Thanks for helping improve dsh-skillflux.
 
 - Node.js `>=22.20.0`
 - Corepack with pnpm `11.7.0`
-- DeepSeek Harness packages on the `0.1.1-rc.1` line
+- DeepSeek Harness packages on the `0.1.1-rc.2` line
 
 ```bash
 corepack enable

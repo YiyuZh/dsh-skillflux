@@ -1,5 +1,10 @@
-# Replace only the model-facing skill consumer. The official skill registry and
-# filesystem providers remain mounted and continue to own discovery/loading.
+# Disable only the existing model-facing skill consumer, then mount SkillFlux
+# under its own loader id. Cordis patches cannot change a row's plugin `name`:
+# that field is an identity guard, so a same-id name change is skipped. The
+# official skill registry and filesystem providers remain mounted and continue
+# to own discovery/loading.
+- id: tool-skill
+  disabled: true
 - insert:
-    - id: tool-skill
+    - id: skillflux
       name: dsh-skillflux
