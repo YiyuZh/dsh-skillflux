@@ -15,13 +15,14 @@ import {
 } from '@deepseek-ai/dsh-skill'
 import { defineTool, type PreToolDecision, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { SkillCache } from './cache.js'
-import { updateCatalog, updateRemoteCandidates } from './catalog.js'
+import { estimateCatalogTokens, updateCatalog, updateRemoteCandidates } from './catalog.js'
 import { EmbeddingRouter } from './embedding.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { cacheCandidates, registryCandidates, selectCandidates, tokenize } from './router.js'
 import { UsageStore } from './usage.js'
 import type {
   CacheEntry,
+  CatalogStats,
   EmbeddingRouterStats,
   MountedSkill,
   RemoteCandidate,
@@ -35,6 +36,7 @@ import type {
 
 export type * from './types.js'
 export { normalizeText, routeScore, selectCandidates, tokenize } from './router.js'
+export { estimateCatalogTokens, estimateTextTokens } from './catalog.js'
 export { parseSkillMarkdown, inspectSkillDirectory } from './skill-file.js'
 export { SkillCache, isLoopbackProxyFailure } from './cache.js'
 export { EmbeddingRouter, type EmbeddingRouterOptions } from './embedding.js'
@@ -53,6 +55,7 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   remoteSearchLimit: 5,
   remoteSearchTimeoutMs: 8_000,
   catalogDescriptionMaxLength: 160,
+  catalogTokenBudget: 0,
   maxSkillFiles: 1_000,
   maxSkillBytes: 10 * 1024 * 1024,
   installTimeoutMs: 300_000,
@@ -111,6 +114,13 @@ function positiveInteger(name: string, value: number, minimum = 1): number {
   return value
 }
 
+class CatalogBudgetExceededError extends Error {
+  constructor(readonly skill: string, readonly estimatedTokens: number, readonly budget: number) {
+    super(`cannot mount skill "${skill}": estimated catalog size ${estimatedTokens} exceeds token budget ${budget}`)
+    this.name = 'CatalogBudgetExceededError'
+  }
+}
+
 function boundedNumber(name: string, value: number, minimum: number, maximum: number): number {
   if (!Number.isFinite(value) || value < minimum || value > maximum) {
     throw new Error(`dsh-skillflux: ${name} must be between ${minimum} and ${maximum}`)
@@ -122,6 +132,11 @@ function boundedInteger(name: string, value: number, minimum: number, maximum: n
   positiveInteger(name, value, minimum)
   if (value > maximum) throw new Error(`dsh-skillflux: ${name} must be less than or equal to ${maximum}`)
   return value
+}
+
+function catalogTokenBudget(value: number): number {
+  if (value === 0) return value
+  return boundedInteger('catalogTokenBudget', value, 64, 1_000_000)
 }
 
 function nonEmptyString(name: string, value: string): string {
@@ -168,6 +183,7 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
       config.catalogDescriptionMaxLength ?? DEFAULTS.catalogDescriptionMaxLength,
       3,
     ),
+    catalogTokenBudget: catalogTokenBudget(config.catalogTokenBudget ?? DEFAULTS.catalogTokenBudget),
     maxSkillFiles: positiveInteger('maxSkillFiles', config.maxSkillFiles ?? DEFAULTS.maxSkillFiles),
     maxSkillBytes: positiveInteger('maxSkillBytes', config.maxSkillBytes ?? DEFAULTS.maxSkillBytes),
     installTimeoutMs: positiveInteger('installTimeoutMs', config.installTimeoutMs ?? DEFAULTS.installTimeoutMs),
@@ -338,6 +354,7 @@ export class SkillFluxService extends Service {
     remoteSearchLimit: z.number().default(DEFAULTS.remoteSearchLimit),
     remoteSearchTimeoutMs: z.number().default(DEFAULTS.remoteSearchTimeoutMs),
     catalogDescriptionMaxLength: z.number().default(DEFAULTS.catalogDescriptionMaxLength),
+    catalogTokenBudget: z.number().default(DEFAULTS.catalogTokenBudget),
     maxSkillFiles: z.number().default(DEFAULTS.maxSkillFiles),
     maxSkillBytes: z.number().default(DEFAULTS.maxSkillBytes),
     installTimeoutMs: z.number().default(DEFAULTS.installTimeoutMs),
@@ -496,7 +513,17 @@ export class SkillFluxService extends Service {
     const state = this.state(agent)
     const candidate = state.candidates.get(candidateId)
     if (candidate === undefined) throw new Error('candidate id is unknown or expired; run skillflux_search again')
-    return await this.mountCandidate(state, candidate, signal)
+    try {
+      return await this.mountCandidate(state, candidate, signal)
+    } catch (error: unknown) {
+      if (error instanceof CatalogBudgetExceededError) {
+        const trace = routingTrace(candidate, state.turn)
+        const existing = state.lastRouting.findIndex(item => item.candidateId === candidate.id)
+        if (existing === -1) state.lastRouting.push({ ...trace, outcome: 'budget-skipped' })
+        else this.markRoutingOutcome(state, candidate.id, 'budget-skipped')
+      }
+      throw error
+    }
   }
 
   unmount(agent: Agent, name?: string): void {
@@ -533,6 +560,18 @@ export class SkillFluxService extends Service {
 
   mounted(agent: Agent): readonly MountedSkill[] {
     return [...(this.stateByAgent.get(agent)?.active.values() ?? [])]
+  }
+
+  catalogStats(agent: Agent): CatalogStats {
+    const mounted = this.mounted(agent)
+    return {
+      mountedSkills: mounted.length,
+      estimatedTokens: estimateCatalogTokens(
+        mounted.map(item => item.definition),
+        this.config.catalogDescriptionMaxLength,
+      ),
+      ...(this.config.catalogTokenBudget === 0 ? {} : { budget: this.config.catalogTokenBudget }),
+    }
   }
 
   lastRouting(agent: Agent): readonly RoutingTrace[] {
@@ -732,13 +771,15 @@ export class SkillFluxService extends Service {
     if (parts.length === 1 && parts[0] === 'status') {
       const mounted = this.mounted(invocation.agent)
       const stats = this.embeddingStats()
+      const catalog = this.catalogStats(invocation.agent)
       const router = this.config.routerMode === 'lexical'
         ? 'Router: lexical.'
         : `Router: hybrid (${this.config.embeddingProvider}, ${this.config.embeddingModel}); embedding requests ${stats?.requests ?? 0}, cache ${stats?.cacheEntries ?? 0}/${this.config.embeddingCacheSize}.`
       const telemetry = `Usage tracking: ${this.config.usageTracking ? 'on' : 'off'}; adaptive routing: ${this.config.adaptiveRouting ? 'on' : 'off'}.`
+      const catalogBudget = catalog.budget === undefined ? 'off' : String(catalog.budget)
       return {
         kind: 'success',
-        text: `${router}\n${telemetry}\n${mounted.length === 0
+        text: `${router}\n${telemetry}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
           : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
       }
@@ -835,6 +876,8 @@ export class SkillFluxService extends Service {
     state.lastRouting = selected.map(candidate => routingTrace(candidate, turn))
     for (const candidate of selected) {
       if (state.active.size >= this.config.maxActiveSkills) break
+      let mounted = false
+      let budgetSkipped = false
       for (const fallback of fallbacksByName.get(candidate.name) ?? []) {
         try {
           await this.mountCandidate(state, {
@@ -844,22 +887,28 @@ export class SkillFluxService extends Service {
             ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
             score: candidate.score,
           }, signal, generation)
+          mounted = true
           break
         } catch (error: unknown) {
           signal.throwIfAborted()
           if (error instanceof ExpiredAgentStateError) throw error
-          this.runtimeCtx.logger.warn(
-            `SkillFlux skipped candidate ${fallback.name} from ${fallback.source}: ${errorMessage(error)}`,
-          )
+          if (error instanceof CatalogBudgetExceededError) {
+            budgetSkipped = true
+          } else {
+            this.runtimeCtx.logger.warn(
+              `SkillFlux skipped candidate ${fallback.name} from ${fallback.source}: ${errorMessage(error)}`,
+            )
+          }
         }
       }
+      if (!mounted && budgetSkipped) this.markRoutingOutcome(state, candidate.id, 'budget-skipped')
     }
     if (state.active.size > 0 || this.config.remoteDiscovery !== 'automatic') {
       return updateRemoteCandidates(agent, [])
     }
-    let remote: RemoteCandidate[]
+    let discoveredRemote: RemoteCandidate[]
     try {
-      remote = await this.remote.search(automaticDiscoveryQuery(task), signal)
+      discoveredRemote = await this.remote.search(automaticDiscoveryQuery(task), signal)
       signal.throwIfAborted()
       this.assertStateCurrent(state, generation)
     } catch (error: unknown) {
@@ -867,6 +916,11 @@ export class SkillFluxService extends Service {
       if (error instanceof ExpiredAgentStateError) throw error
       this.runtimeCtx.logger.warn(`SkillFlux remote discovery skipped: ${errorMessage(error)}`)
       return updateRemoteCandidates(agent, [])
+    }
+    const remote: RemoteCandidate[] = []
+    for (const candidate of discoveredRemote) {
+      if (this.catalogFitsBudget(state, candidate)) remote.push(candidate)
+      else state.lastRouting.push({ ...routingTrace(candidate, turn), outcome: 'budget-skipped' })
     }
     for (const candidate of remote) state.candidates.set(candidate.id, candidate)
     if (remote.length === 0) return updateRemoteCandidates(agent, [])
@@ -878,7 +932,11 @@ export class SkillFluxService extends Service {
       } catch (error: unknown) {
         signal.throwIfAborted()
         if (error instanceof ExpiredAgentStateError) throw error
-        this.runtimeCtx.logger.warn(`SkillFlux automatic remote mount failed: ${errorMessage(error)}`)
+        if (error instanceof CatalogBudgetExceededError) {
+          state.lastRouting.push({ ...routingTrace(remote[0]!, turn), outcome: 'budget-skipped' })
+        } else {
+          this.runtimeCtx.logger.warn(`SkillFlux automatic remote mount failed: ${errorMessage(error)}`)
+        }
       }
     }
     return updateRemoteCandidates(agent, remote)
@@ -896,6 +954,7 @@ export class SkillFluxService extends Service {
     const current = state.active.get(candidate.name)
     if (current !== undefined) return current
     this.assertCapacity(state, candidate.name)
+    this.assertCatalogBudget(state, candidate)
     const lookup = skillLookup(state.agent, signal)
     if (candidate.origin === 'registry') {
       const definition = await this.runtimeCtx.skills.get(candidate.name, lookup)
@@ -909,6 +968,7 @@ export class SkillFluxService extends Service {
       const raced = state.active.get(definition.name)
       if (raced !== undefined) return raced
       this.assertCapacity(state, definition.name)
+      this.assertCatalogBudget(state, definition)
       const mounted: MountedSkill = {
         candidateId: candidate.id,
         name: candidate.name,
@@ -945,6 +1005,7 @@ export class SkillFluxService extends Service {
     const raced = state.active.get(definition.name)
     if (raced !== undefined) return raced
     this.assertCapacity(state, definition.name)
+    this.assertCatalogBudget(state, definition)
     this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
     const dispose = state.agent.ctx.skills.register({
       name: definition.name,
@@ -998,6 +1059,29 @@ export class SkillFluxService extends Service {
     if (state.active.size >= this.config.maxActiveSkills) {
       throw new Error(`cannot mount skill "${name}": the ${this.config.maxActiveSkills}-skill turn limit is reached`)
     }
+  }
+
+  private assertCatalogBudget(
+    state: AgentState,
+    skill: Pick<SkillDefinition, 'name' | 'description'>,
+  ): void {
+    if (this.catalogFitsBudget(state, skill)) return
+    const estimatedTokens = estimateCatalogTokens(
+      [...[...state.active.values()].map(item => item.definition), skill],
+      this.config.catalogDescriptionMaxLength,
+    )
+    throw new CatalogBudgetExceededError(skill.name, estimatedTokens, this.config.catalogTokenBudget)
+  }
+
+  private catalogFitsBudget(
+    state: AgentState,
+    skill: Pick<SkillDefinition, 'name' | 'description'>,
+  ): boolean {
+    if (this.config.catalogTokenBudget === 0 || state.active.has(skill.name)) return true
+    return estimateCatalogTokens(
+      [...[...state.active.values()].map(item => item.definition), skill],
+      this.config.catalogDescriptionMaxLength,
+    ) <= this.config.catalogTokenBudget
   }
 
   private async selectLocalCandidates(
@@ -1115,6 +1199,12 @@ export class SkillFluxService extends Service {
     const index = state.lastRouting.findIndex(item => item.candidateId === trace.candidateId)
     if (index === -1) state.lastRouting.push(trace)
     else state.lastRouting[index] = trace
+  }
+
+  private markRoutingOutcome(state: AgentState, candidateId: string, outcome: RoutingTrace['outcome']): void {
+    const index = state.lastRouting.findIndex(item => item.candidateId === candidateId)
+    const trace = state.lastRouting[index]
+    if (index !== -1 && trace !== undefined) state.lastRouting[index] = { ...trace, outcome }
   }
 
   private trackUsage(operation: Promise<void> | undefined): void {

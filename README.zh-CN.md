@@ -60,7 +60,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
   -> 可选的有界使用历史排序
   -> 可选的 embedding 语义补位
   -> 本地 Registry + 持久缓存 + skills.sh
-  -> 按配置上限选择并挂载 Skill（默认 3 个）
+  -> 在 Skill 数量和可选目录 token 预算内选择并挂载
   -> Agent 调用已挂载的 Skill
   -> turn/end 自动卸载
   -> 下载文件保留到用户主动清理
@@ -77,6 +77,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 - 可选使用本地 Ollama 或 OpenAI-compatible embedding 服务，为尚未填满的目录
   位置补充语义相近 Skill。
 - 使用 `maxActiveSkills` 限制模型可见目录。
+- 可选使用保守的 token 估算预算限制 Skill 目录提示。
 - 从 DSH Registry、SkillFlux 缓存和
   [skills.sh](https://skills.sh/) 发现候选。
 - 将远程候选固定到不可变的 GitHub commit SHA。
@@ -100,8 +101,9 @@ SkillFlux 按以下顺序处理任务：
    时间衰减的使用历史分。规则始终优先，历史不会让无关候选越过相关性阈值。
 6. 在 `hybrid` 模式下，仅当规则和词法结果未填满目录时才使用 embedding；语义
    结果不会替换前面已经命中的规则或词法结果。
-7. 依次挂载选中名称，直到达到 `maxActiveSkills`。如果首选候选加载失败，则按
-   候选池顺序尝试同名 fallback。
+7. 依次挂载选中名称，直到达到 `maxActiveSkills`。启用
+   `catalogTokenBudget` 后，如果某候选会使目录提示估算值超过预算，则跳过该候选；
+   如果候选无法加载，继续按候选池顺序尝试同名 fallback。
 
 词法评分如下：
 
@@ -130,6 +132,7 @@ remoteDiscovery: automatic   # automatic | on-demand | off
 remoteSearchLimit: 5
 remoteSearchTimeoutMs: 8000
 catalogDescriptionMaxLength: 160
+catalogTokenBudget: 0              # 0 表示关闭；否则为 64-1000000
 maxSkillFiles: 1000
 maxSkillBytes: 10485760
 installTimeoutMs: 300000
@@ -217,6 +220,23 @@ SkillFlux 只保存 candidate ID、Skill 名称、来源类型、来源、计数
 不会中断 Agent。设置 `usageTracking: false` 可关闭持久化，此时
 `adaptiveRouting` 也必须保持关闭。
 
+### 目录上下文预算
+
+`catalogTokenBudget` 是 `maxActiveSkills` 之外的可选第二重限制。默认值 `0`
+保持现有行为不变。设置非零值后，每次挂载都会先检查目录估算值；只跳过导致超额
+的候选，后续更小的候选或同名 fallback 仍可继续尝试：
+
+```yaml
+maxActiveSkills: 3
+catalogDescriptionMaxLength: 160
+catalogTokenBudget: 512
+```
+
+估算范围是 description 截断后的完整“替换型”Skill 目录提示，算法为
+`ceil(UTF-8 字节数 / 3)`。它对常见英文偏保守，对中文约等于每字一个 token，
+但不是特定模型 tokenizer 的精确结果。`/skillflux status` 会显示当前估算值，
+`/skillflux explain` 会把因预算跳过的候选标记为 `budget-skipped`。
+
 ### 审批策略
 
 | 策略 | 行为 |
@@ -247,7 +267,7 @@ SkillFlux 只保存 candidate ID、Skill 名称、来源类型、来源、计数
 ```
 
 `explain` 会展示候选的 Router 阶段、总分、基础分、自适应加分，以及它只是被
-选中还是已经成功挂载。
+选中、已经成功挂载，还是因为目录预算被跳过。
 
 清理时会跳过仍在挂载的缓存。到达 `turn/end` 时，SkillFlux 注销运行时挂载，
 但保留下载文件供下次复用。
@@ -282,9 +302,9 @@ Skill 本质上仍是交给 Agent 的外部指令，可能包含恶意内容。�
 corepack pnpm eval
 ```
 
-测评包含 36 个词法场景、4 个自适应安全场景和 8 个与 Provider 无关的语义向量
-场景，覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、
-同名去重、语义 Top-K 和负例拒绝。
+测评包含 36 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
+场景和 7 个目录预算场景，覆盖英文、中文、文本归一化、规则优先级、阈值、
+容量限制、同分排序、同名去重、语义 Top-K 和负例拒绝。
 
 | 指标 | 当前基线 |
 | --- | ---: |
@@ -305,6 +325,8 @@ embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测
 - Hybrid 效果取决于配置的 embedding 模型，SkillFlux 不负责下载或管理模型。
 - 语义补位最多处理当前 Registry/缓存顺序中的 `embeddingCandidateLimit` 个本地
   候选。
+- 目录 token 数是可移植估算值，不是当前聊天模型 tokenizer 的精确计数；它不
+  包含已加载的 Skill 正文、工具 schema 或其他 session history。
 - 远程安装仅支持 skills.sh 发现的公开 GitHub Skill。
 - 卸载无法删除已经写入 session history 的文本。
 - 上游出现新 commit 时会形成新的不可变缓存；旧版本需要用户主动清理。
