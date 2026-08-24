@@ -18,6 +18,7 @@ import { SkillCache } from './cache.js'
 import { estimateCatalogTokens, updateCatalog, updateRemoteCandidates } from './catalog.js'
 import { EmbeddingRouter } from './embedding.js'
 import { RemoteDiscoveryClient } from './remote.js'
+import { RemoteDiscoveryCache } from './remote-cache.js'
 import { cacheCandidates, registryCandidates, selectCandidates, tokenize } from './router.js'
 import { UsageStore } from './usage.js'
 import type {
@@ -26,6 +27,7 @@ import type {
   EmbeddingRouterStats,
   MountedSkill,
   RemoteCandidate,
+  RemoteDiscoveryCacheStats,
   ResolvedSkillFluxConfig,
   RoutingTrace,
   SkillFluxCandidate,
@@ -46,6 +48,13 @@ export {
   type RemoteDiscoveryOptions,
   type RemoteQualityInput,
 } from './remote.js'
+export {
+  RemoteDiscoveryCache,
+  remoteDiscoveryCacheState,
+  type RemoteDiscoveryCacheHit,
+  type RemoteDiscoveryCacheOptions,
+  type RemoteDiscoveryCacheState,
+} from './remote-cache.js'
 export { UsageStore, type AdaptiveUsageOptions, type UsageStoreOptions } from './usage.js'
 
 export const name = 'skillflux'
@@ -64,6 +73,9 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   remoteMinStars: 0,
   remoteRecentActivityDays: 30,
   remoteTrustedOwners: [],
+  remoteCacheTtlMs: 5 * 60_000,
+  remoteCacheStaleIfErrorMs: 24 * 60 * 60_000,
+  remoteCacheMaxEntries: 100,
   catalogDescriptionMaxLength: 160,
   catalogTokenBudget: 0,
   maxSkillFiles: 1_000,
@@ -224,6 +236,24 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
       3_650,
     ),
     remoteTrustedOwners: remoteTrustedOwners(config.remoteTrustedOwners ?? DEFAULTS.remoteTrustedOwners),
+    remoteCacheTtlMs: boundedInteger(
+      'remoteCacheTtlMs',
+      config.remoteCacheTtlMs ?? DEFAULTS.remoteCacheTtlMs,
+      0,
+      7 * 24 * 60 * 60_000,
+    ),
+    remoteCacheStaleIfErrorMs: boundedInteger(
+      'remoteCacheStaleIfErrorMs',
+      config.remoteCacheStaleIfErrorMs ?? DEFAULTS.remoteCacheStaleIfErrorMs,
+      0,
+      30 * 24 * 60 * 60_000,
+    ),
+    remoteCacheMaxEntries: boundedInteger(
+      'remoteCacheMaxEntries',
+      config.remoteCacheMaxEntries ?? DEFAULTS.remoteCacheMaxEntries,
+      1,
+      1_000,
+    ),
     catalogDescriptionMaxLength: positiveInteger(
       'catalogDescriptionMaxLength',
       config.catalogDescriptionMaxLength ?? DEFAULTS.catalogDescriptionMaxLength,
@@ -404,6 +434,9 @@ export class SkillFluxService extends Service {
     remoteMinStars: z.number().default(DEFAULTS.remoteMinStars),
     remoteRecentActivityDays: z.number().default(DEFAULTS.remoteRecentActivityDays),
     remoteTrustedOwners: z.array(z.string()).default([]),
+    remoteCacheTtlMs: z.number().default(DEFAULTS.remoteCacheTtlMs),
+    remoteCacheStaleIfErrorMs: z.number().default(DEFAULTS.remoteCacheStaleIfErrorMs),
+    remoteCacheMaxEntries: z.number().default(DEFAULTS.remoteCacheMaxEntries),
     catalogDescriptionMaxLength: z.number().default(DEFAULTS.catalogDescriptionMaxLength),
     catalogTokenBudget: z.number().default(DEFAULTS.catalogTokenBudget),
     maxSkillFiles: z.number().default(DEFAULTS.maxSkillFiles),
@@ -448,6 +481,13 @@ export class SkillFluxService extends Service {
       maxBytes: this.config.maxSkillBytes,
       installTimeoutMs: this.config.installTimeoutMs,
     })
+    const discoveryCache = new RemoteDiscoveryCache({
+      file: dshHomePath('storages', 'skillflux', 'remote-discovery.json'),
+      ttlMs: this.config.remoteCacheTtlMs,
+      staleIfErrorMs: this.config.remoteCacheStaleIfErrorMs,
+      maxEntries: this.config.remoteCacheMaxEntries,
+      warn: message => { ctx.logger.warn(message) },
+    })
     this.remote = new RemoteDiscoveryClient({
       searchLimit: this.config.remoteSearchLimit,
       timeoutMs: this.config.remoteSearchTimeoutMs,
@@ -456,6 +496,7 @@ export class SkillFluxService extends Service {
       minStars: this.config.remoteMinStars,
       recentActivityDays: this.config.remoteRecentActivityDays,
       trustedOwners: this.config.remoteTrustedOwners,
+      cache: discoveryCache,
     })
     this.usage = this.config.usageTracking
       ? new UsageStore({
@@ -650,6 +691,14 @@ export class SkillFluxService extends Service {
     return await this.cache.list()
   }
 
+  async discoveryCacheStats(): Promise<RemoteDiscoveryCacheStats | undefined> {
+    return await this.remote.discoveryCacheStats()
+  }
+
+  async clearDiscoveryCache(): Promise<number> {
+    return await this.remote.clearDiscoveryCache()
+  }
+
   async cleanCache(selector: string): Promise<{ removed: string[]; skipped: string[] }> {
     const activeIds = new Set<string>()
     for (const state of this.states) {
@@ -842,7 +891,7 @@ export class SkillFluxService extends Service {
     ctx.commands.register({
       name: 'skillflux',
       description: 'inspect SkillFlux mounts and manage its persistent cache',
-      input: { hint: 'status | explain | usage | cache list | cache clean <cache-id|all>' },
+      input: { hint: 'status | explain | usage | cache list | cache clean <cache-id|all> | discovery-cache status | discovery-cache clean' },
       handler: async invocation => await this.executeCommand(invocation),
     })
   }
@@ -852,6 +901,7 @@ export class SkillFluxService extends Service {
     if (parts.length === 1 && parts[0] === 'status') {
       const mounted = this.mounted(invocation.agent)
       const stats = this.embeddingStats()
+      const discoveryCache = await this.discoveryCacheStats()
       const catalog = this.catalogStats(invocation.agent)
       const router = this.config.routerMode === 'lexical'
         ? 'Router: lexical.'
@@ -861,9 +911,12 @@ export class SkillFluxService extends Service {
       const discovery = `Remote discovery: ${this.config.remoteDiscovery}; providers ${this.config.remoteProviders
         .map(provider => provider === 'github' && !this.remote.githubSearchEnabled ? 'github (token unavailable)' : provider)
         .join(', ')}; quality >= ${this.config.remoteMinQualityScore}; stars >= ${this.config.remoteMinStars}; recent window ${this.config.remoteRecentActivityDays} days.`
+      const discoveryCacheStatus = discoveryCache === undefined
+        ? 'Remote discovery cache: unavailable.'
+        : `Remote discovery cache: ${discoveryCache.enabled ? 'on' : 'off'}; ${discoveryCache.entries}/${this.config.remoteCacheMaxEntries} entries; hits ${discoveryCache.hits}, misses ${discoveryCache.misses}, stale fallbacks ${discoveryCache.staleHits}.`
       return {
         kind: 'success',
-        text: `${router}\n${telemetry}\n${discovery}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
+        text: `${router}\n${telemetry}\n${discovery}\n${discoveryCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
           : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
       }
@@ -916,7 +969,20 @@ export class SkillFluxService extends Service {
         text: `Removed ${result.removed.length} cache entr${result.removed.length === 1 ? 'y' : 'ies'}${result.skipped.length === 0 ? '.' : `; skipped active: ${result.skipped.join(', ')}.`}`,
       }
     }
-    return { kind: 'error', text: 'Usage: /skillflux status | explain | usage | cache list | cache clean <cache-id|all>' }
+    if (parts.length === 2 && parts[0] === 'discovery-cache' && parts[1] === 'status') {
+      const stats = await this.discoveryCacheStats()
+      return {
+        kind: 'success',
+        text: stats === undefined
+          ? 'SkillFlux remote discovery cache is unavailable.'
+          : `SkillFlux remote discovery cache: ${stats.enabled ? 'enabled' : 'disabled'}, ${stats.entries}/${this.config.remoteCacheMaxEntries} entries, ${stats.hits} hits, ${stats.misses} misses, ${stats.staleHits} stale fallbacks, ${stats.writes} writes.`,
+      }
+    }
+    if (parts.length === 2 && parts[0] === 'discovery-cache' && parts[1] === 'clean') {
+      const removed = await this.clearDiscoveryCache()
+      return { kind: 'success', text: `Removed ${removed} remote discovery cache entr${removed === 1 ? 'y' : 'ies'}.` }
+    }
+    return { kind: 'error', text: 'Usage: /skillflux status | explain | usage | cache list | cache clean <cache-id|all> | discovery-cache status | discovery-cache clean' }
   }
 
   private async routeTurn(

@@ -1,7 +1,12 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RemoteDiscoveryClient, remoteQualityScore } from '../src/remote.js'
+import { RemoteDiscoveryCache } from '../src/remote-cache.js'
 
 const sha = 'a'.repeat(40)
+const roots: string[] = []
 
 function repository(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -36,9 +41,10 @@ function graphqlRepository(overrides: Record<string, unknown> = {}): Record<stri
   }
 }
 
-afterEach(() => {
+afterEach(async () => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+  await Promise.all(roots.splice(0).map(async root => await rm(root, { recursive: true, force: true })))
 })
 
 describe('remote discovery', () => {
@@ -232,6 +238,144 @@ describe('remote discovery', () => {
     await started
     controller.abort(new Error('cancelled by test'))
     await expect(pending).rejects.toThrow('cancelled by test')
+  })
+
+  it('reuses fresh discovery results and falls back to stale pinned candidates only on provider failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-remote-integration-'))
+    roots.push(root)
+    let now = Date.parse('2026-08-24T00:00:00Z')
+    const cache = new RemoteDiscoveryCache({
+      file: join(root, 'remote-discovery.json'),
+      ttlMs: 100,
+      staleIfErrorMs: 1_000,
+      maxEntries: 10,
+      now: () => now,
+    })
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://skills.sh/')) {
+        return new Response(JSON.stringify({
+          skills: [{ skillId: 'pdf-reader', name: 'PDF reader', installs: 500, source: 'acme/agent-skills' }],
+        }), { status: 200 })
+      }
+      if (url.endsWith('/commits/HEAD')) return new Response(JSON.stringify({ sha }), { status: 200 })
+      return new Response(JSON.stringify(repository()), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new RemoteDiscoveryClient({
+      searchLimit: 5,
+      timeoutMs: 1_000,
+      providers: ['skills.sh'],
+      cache,
+      now: () => now,
+    })
+    const live = await client.search('read pdf')
+    const callsAfterLiveSearch = fetchMock.mock.calls.length
+    expect(live).toHaveLength(1)
+    expect(await client.search('read pdf')).toEqual(live)
+    expect(fetchMock).toHaveBeenCalledTimes(callsAfterLiveSearch)
+
+    now += 101
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => String(input).startsWith('https://skills.sh/')
+      ? new Response(JSON.stringify({
+          skills: [{ skillId: 'pdf-reader', name: 'PDF reader', installs: 500, source: 'acme/agent-skills' }],
+        }), { status: 200 })
+      : new Response('{}', { status: 503 })))
+    expect(await client.search('read pdf')).toEqual(live)
+    expect(await client.discoveryCacheStats()).toMatchObject({
+      entries: 1,
+      hits: 1,
+      misses: 2,
+      staleHits: 1,
+      writes: 1,
+    })
+
+    let searchStarted!: () => void
+    const started = new Promise<void>(resolve => { searchStarted = resolve })
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL, init?: RequestInit) => {
+      searchStarted()
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+      })
+    }))
+    const controller = new AbortController()
+    const cancelled = client.search('read pdf', controller.signal)
+    await started
+    controller.abort(new Error('cancelled with stale cache available'))
+    await expect(cancelled).rejects.toThrow('cancelled with stale cache available')
+  })
+
+  it('does not reuse cached results across ranking configurations', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-remote-config-cache-'))
+    roots.push(root)
+    const cache = new RemoteDiscoveryCache({
+      file: join(root, 'remote-discovery.json'),
+      ttlMs: 10_000,
+      staleIfErrorMs: 10_000,
+      maxEntries: 10,
+    })
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://skills.sh/')) {
+        return new Response(JSON.stringify({
+          skills: [{ skillId: 'pdf-reader', name: 'PDF reader', installs: 500, source: 'acme/agent-skills' }],
+        }), { status: 200 })
+      }
+      if (url.endsWith('/commits/HEAD')) return new Response(JSON.stringify({ sha }), { status: 200 })
+      return new Response(JSON.stringify(repository()), { status: 200 })
+    }))
+    await new RemoteDiscoveryClient({
+      searchLimit: 5,
+      timeoutMs: 1_000,
+      providers: ['skills.sh'],
+      minStars: 0,
+      cache,
+    }).search('read pdf')
+
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('must query the stricter configuration') }))
+    const stricter = new RemoteDiscoveryClient({
+      searchLimit: 5,
+      timeoutMs: 1_000,
+      providers: ['skills.sh'],
+      minStars: 1_000,
+      cache,
+    })
+    await expect(stricter.search('read pdf')).rejects.toThrow('must query the stricter configuration')
+  })
+
+  it('short-term caches useful cold-start results when one provider is degraded', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-remote-partial-cache-'))
+    roots.push(root)
+    const cache = new RemoteDiscoveryCache({
+      file: join(root, 'remote-discovery.json'),
+      ttlMs: 10_000,
+      staleIfErrorMs: 10_000,
+      maxEntries: 10,
+    })
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://skills.sh/')) {
+        return new Response(JSON.stringify({
+          skills: [{ skillId: 'pdf-reader', name: 'PDF reader', installs: 500, source: 'acme/agent-skills' }],
+        }), { status: 200 })
+      }
+      if (url.startsWith('https://api.github.com/search/code')) return new Response('{}', { status: 503 })
+      expect(url).toBe('https://api.github.com/graphql')
+      return new Response(JSON.stringify({ data: { r0: graphqlRepository() } }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new RemoteDiscoveryClient({
+      searchLimit: 5,
+      timeoutMs: 1_000,
+      githubToken: 'test-token',
+      cache,
+    })
+    const partial = await client.search('read pdf')
+    const calls = fetchMock.mock.calls.length
+    expect(partial).toHaveLength(1)
+    expect(await client.search('read pdf')).toEqual(partial)
+    expect(fetchMock).toHaveBeenCalledTimes(calls)
+    expect(await client.discoveryCacheStats()).toMatchObject({ hits: 1, writes: 1 })
   })
 
   it('rewards activity inside the configured 30-day window without making it mandatory', () => {

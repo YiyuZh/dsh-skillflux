@@ -20,3 +20,10 @@ configured trusted-owner boost can all be manipulated or become stale. Review
 the exact pinned commit before approval. `GITHUB_TOKEN` and `GH_TOKEN` are read
 from the process environment for GitHub search and are never written to cache
 manifests or usage telemetry.
+
+The remote discovery result cache stores a SHA-256 fingerprint of the bounded
+query and active ranking configuration plus validated candidate metadata. It
+does not store query text, credentials, or Skill bodies. Freshness expiry does
+not change candidate identity: cached and stale-fallback candidates remain
+pinned to the immutable commit that was originally validated. Explicit caller
+cancellation never triggers stale fallback.

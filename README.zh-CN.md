@@ -166,6 +166,20 @@ dsh web
 没有 token 时，SkillFlux 仍会在线搜索 skills.sh，并通过公共 GitHub REST API
 补全这些结果；只会跳过范围更广的 GitHub Code Search provider。
 
+### 发现结果缓存
+
+成功的在线搜索会跨 DSH 重启缓存。默认 5 分钟 TTL 可避免同类任务反复调用市场
+和 GitHub API。TTL 过期后 SkillFlux 会重新查询 provider；如果刷新失败，可以在
+额外 24 小时内复用此前的不可变候选。用户主动取消时绝不会回退到 stale 结果。
+
+缓存 key 是“有界归一化查询 + 当前发现与排序配置”的 SHA-256 指纹，不保存用户
+任务原文、token 或 Skill 正文。候选仍固定在最初验证过的 commit，因此 stale
+回退只影响排名证据的新鲜度，不改变源码完整性或审批对象。
+
+缓存通过原子替换写入
+`$DSH_HOME/storages/skillflux/remote-discovery.json`，默认最多 100 条，并有
+4 MiB 硬限制。设置 `remoteCacheTtlMs: 0` 可完全关闭。
+
 ## 配置
 
 SkillFlux 支持以下插件配置：
@@ -182,6 +196,9 @@ remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
 remoteRecentActivityDays: 30
 remoteTrustedOwners: []       # 例如 [anthropics, openai, vercel-labs]
+remoteCacheTtlMs: 300000                  # 0 表示关闭
+remoteCacheStaleIfErrorMs: 86400000       # TTL 后的额外 stale 窗口
+remoteCacheMaxEntries: 100
 catalogDescriptionMaxLength: 160
 catalogTokenBudget: 0              # 0 表示关闭；否则为 64-1000000
 maxSkillFiles: 1000
@@ -315,6 +332,8 @@ catalogTokenBudget: 512
 /skillflux cache list
 /skillflux cache clean <cache-id>
 /skillflux cache clean all
+/skillflux discovery-cache status
+/skillflux discovery-cache clean
 ```
 
 `explain` 会展示候选的 Router 阶段、总分、基础分、自适应加分，以及它只是被
@@ -347,6 +366,8 @@ catalogTokenBudget: 512
   Skill 正文或资源。
 - 使用统计不包含任务文本或 Skill 内容，并限制在 DSH 存储目录中的
   `usageMaxEntries` 条记录以内。
+- 远程发现缓存只持久化查询/配置指纹和有界、经过校验的候选元数据，不保存查询
+  原文或 API 凭据。
 - 可选的 `GITHUB_TOKEN` 或 `GH_TOKEN` 会启用 GitHub Code Search 和批量仓库
   元数据补全；SkillFlux 不会持久化它。
 
@@ -362,9 +383,9 @@ corepack pnpm eval
 ```
 
 测评包含 36 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
-场景、7 个目录预算场景和 8 个远程质量两两对比场景，覆盖英文、中文、文本
-归一化、规则优先级、阈值、容量限制、同分排序、同名去重、语义 Top-K、上下文
-预算、freshness、可信度、采用度和负例拒绝。
+场景、7 个目录预算场景、8 个远程质量两两对比场景和 7 个远程缓存策略场景，
+覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、
+语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期和负例拒绝。
 
 | 指标 | 当前基线 |
 | --- | ---: |
@@ -376,6 +397,7 @@ corepack pnpm eval
 | 语义正例 Top-1 | 100.0% |
 | 语义负例拒绝率 | 100.0% |
 | 远程质量两两排序正确率 | 100.0% |
+| 远程缓存策略边界正确率 | 100.0% |
 
 这些结果验证确定性 Router 和向量排序契约。语义向量是合成数据，不代表某个
 embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测评格式和限制见
@@ -392,6 +414,8 @@ embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测
   skills.sh provider 仍可使用。
 - 质量分是基于证据的候选筛选，不是代码安全审计。挂载前仍应查看精确固定版本，
   并保持审批与 sandbox 控制开启。
+- provider 故障期间，stale 回退可能在配置窗口内返回较旧的排名证据，但候选始终
+  固定在此前已验证的不可变 commit。
 - 卸载无法删除已经写入 session history 的文本。
 - 上游出现新 commit 时会形成新的不可变缓存；旧版本需要用户主动清理。
 
@@ -410,7 +434,8 @@ corepack pnpm pack --dry-run
 ```
 
 `test:discovery-live` 会执行真实的 skills.sh 查询；存在 `GITHUB_TOKEN` 或
-`GH_TOKEN` 时还会测试 GitHub Code Search。可用 `SKILLFLUX_DISCOVERY_QUERY`
+`GH_TOKEN` 时还会测试 GitHub Code Search，并验证第二次相同查询由持久发现缓存
+直接返回。可用 `SKILLFLUX_DISCOVERY_QUERY`
 替换任务，用 `SKILLFLUX_TRUSTED_OWNERS` 传入逗号分隔的可信 owner，或设置
 `SKILLFLUX_REQUIRE_GITHUB=1`，让 GitHub provider 不可用时测试直接失败。
 
@@ -418,8 +443,9 @@ corepack pnpm pack --dry-run
 `SKILLFLUX_EMBEDDING_MODEL`、`SKILLFLUX_EMBEDDING_ENDPOINT` 和
 `SKILLFLUX_EMBEDDING_PROVIDER` 覆盖默认值。
 
-测试覆盖路由、DSH 目录虚拟化、显式调用、远程响应校验、缓存完整性、生命周期
-清理、有界使用存储、自适应阈值安全和 Bundle patch。提交修改前请阅读
+测试覆盖路由、DSH 目录虚拟化、显式调用、远程响应校验、发现缓存过期与回退、
+安装缓存完整性、生命周期清理、有界使用存储、自适应阈值安全和 Bundle patch。
+提交修改前请阅读
 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证

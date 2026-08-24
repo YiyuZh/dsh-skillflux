@@ -184,6 +184,24 @@ Without a token, SkillFlux continues to search skills.sh and enrich those
 results through the public GitHub REST API. It simply skips the broader GitHub
 code-search provider.
 
+### Discovery result cache
+
+Successful online searches are cached across DSH restarts. The default five-
+minute TTL avoids repeated marketplace and GitHub API calls for the same task.
+After the TTL, SkillFlux queries the providers again. If that refresh fails, it
+may reuse the prior immutable candidates for an additional 24 hours; an explicit
+caller cancellation never falls back to stale data.
+
+The cache key is a SHA-256 fingerprint of the bounded normalized query and the
+active discovery/ranking configuration. User task text, tokens, and Skill bodies
+are not persisted. Candidate metadata remains pinned to the commit originally
+validated, so stale fallback affects ranking freshness rather than source
+integrity or approval identity.
+
+The cache is stored atomically at
+`$DSH_HOME/storages/skillflux/remote-discovery.json`, limited to 100 entries by
+default, and hard-capped at 4 MiB. Set `remoteCacheTtlMs: 0` to disable it.
+
 ## Configuration
 
 SkillFlux accepts these plugin options:
@@ -200,6 +218,9 @@ remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
 remoteRecentActivityDays: 30
 remoteTrustedOwners: []       # e.g. [anthropics, openai, vercel-labs]
+remoteCacheTtlMs: 300000                  # 0 disables
+remoteCacheStaleIfErrorMs: 86400000       # additional stale window
+remoteCacheMaxEntries: 100
 catalogDescriptionMaxLength: 160
 catalogTokenBudget: 0              # 0 disables; otherwise 64-1000000
 maxSkillFiles: 1000
@@ -346,6 +367,8 @@ You can use:
 /skillflux cache list
 /skillflux cache clean <cache-id>
 /skillflux cache clean all
+/skillflux discovery-cache status
+/skillflux discovery-cache clean
 ```
 
 `explain` shows each candidate's router stage, score, base score, adaptive
@@ -382,6 +405,9 @@ unregisters runtime mounts but retains downloaded files for later reuse.
   the configured embedding endpoint. It never sends Skill bodies or resources.
 - Usage records never include task text or Skill content and are bounded to
   `usageMaxEntries` entries in the DSH storage directory.
+- The remote discovery cache persists only a query/configuration fingerprint and
+  bounded, validated candidate metadata. It never stores the query text or API
+  credentials.
 - `GITHUB_TOKEN` or `GH_TOKEN` is optional. It enables broad GitHub code search
   and batched repository enrichment; SkillFlux doesn't persist it.
 
@@ -398,10 +424,11 @@ corepack pnpm eval
 ```
 
 The suite contains 36 lexical cases, 4 adaptive safety cases, 8
-provider-independent semantic-vector cases, 7 catalog-budget cases, and 8
-remote-quality pairwise cases covering English, Chinese, normalization, rules,
-thresholds, capacity, ranking, deduplication, semantic top-k, context budgets,
-freshness, trust, adoption, and negative rejection.
+provider-independent semantic-vector cases, 7 catalog-budget cases, 8
+remote-quality pairwise cases, and 7 remote-cache policy cases covering English,
+Chinese, normalization, rules, thresholds, capacity, ranking, deduplication,
+semantic top-k, context budgets, freshness, trust, adoption, cache expiry, and
+negative rejection.
 
 | Metric | Current baseline |
 | --- | ---: |
@@ -413,6 +440,7 @@ freshness, trust, adoption, and negative rejection.
 | Semantic positive Top-1 | 100.0% |
 | Semantic negative rejection | 100.0% |
 | Remote-quality pairwise ordering | 100.0% |
+| Remote-cache policy boundaries | 100.0% |
 
 These results verify the deterministic router and vector-ranking contracts
 against checked-in inputs. The semantic vectors are synthetic, so these results
@@ -433,6 +461,9 @@ final answer from an online model. Read the
   skills.sh provider remains available.
 - Quality scoring is evidence-based triage, not a code audit. Inspect the exact
   pinned candidate and keep approval/sandbox controls enabled before mounting.
+- During a provider outage, stale fallback can temporarily return older ranking
+  evidence for the configured window, though every candidate remains pinned to
+  its previously validated immutable commit.
 - Unmounting can't remove text already committed to session history.
 - A new upstream commit creates a new immutable cache entry. Old entries remain
   until explicit cleanup.
@@ -452,8 +483,9 @@ corepack pnpm test:embedding-live
 corepack pnpm pack --dry-run
 ```
 
-`test:discovery-live` runs a real skills.sh query and also GitHub Code Search
-when `GITHUB_TOKEN` or `GH_TOKEN` is present. Override the task with
+`test:discovery-live` runs a real skills.sh query, also uses GitHub Code Search
+when `GITHUB_TOKEN` or `GH_TOKEN` is present, and verifies that the identical
+second query is served from the persistent discovery cache. Override the task with
 `SKILLFLUX_DISCOVERY_QUERY`, add comma-separated trusted owners with
 `SKILLFLUX_TRUSTED_OWNERS`, or set `SKILLFLUX_REQUIRE_GITHUB=1` to fail when the
 GitHub provider is unavailable.
@@ -463,8 +495,9 @@ the defaults with `SKILLFLUX_EMBEDDING_MODEL`, `SKILLFLUX_EMBEDDING_ENDPOINT`,
 and `SKILLFLUX_EMBEDDING_PROVIDER` when testing another endpoint.
 
 The test suite covers routing, DSH catalog virtualization, explicit invocation,
-remote response validation, cache integrity, lifecycle cleanup, bounded usage
-storage, adaptive-threshold safety, and the bundle patch. Read
+remote response validation, discovery-cache expiry/fallback, install-cache
+integrity, lifecycle cleanup, bounded usage storage, adaptive-threshold safety,
+and the bundle patch. Read
 [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
 
 ## License

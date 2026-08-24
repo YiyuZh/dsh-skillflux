@@ -38,6 +38,11 @@ async function setup(
   overrides: SkillFluxConfig = {},
   plugin: Parameters<Context['plugin']>[0] = SkillFluxService,
 ): Promise<Context> {
+  if (process.env.DSH_HOME === undefined) {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-service-home-'))
+    roots.push(root)
+    vi.stubEnv('DSH_HOME', root)
+  }
   const context = new Context()
   await mount(context, SystemPrompt)
   await mount(context, ToolRuntime)
@@ -108,6 +113,9 @@ describe('SkillFlux service', () => {
       remoteMinStars: 25,
       remoteRecentActivityDays: 30,
       remoteTrustedOwners: ['Anthropics', 'openai'],
+      remoteCacheTtlMs: 60_000,
+      remoteCacheStaleIfErrorMs: 600_000,
+      remoteCacheMaxEntries: 25,
     })
     expect(context.skillFlux.config).toMatchObject({
       remoteProviders: ['github'],
@@ -115,10 +123,34 @@ describe('SkillFlux service', () => {
       remoteMinStars: 25,
       remoteRecentActivityDays: 30,
       remoteTrustedOwners: ['anthropics', 'openai'],
+      remoteCacheTtlMs: 60_000,
+      remoteCacheStaleIfErrorMs: 600_000,
+      remoteCacheMaxEntries: 25,
     })
     await expect(setup({ remoteProviders: [] })).rejects.toThrow('remoteProviders must contain at least one')
     await expect(setup({ remoteMinQualityScore: 101 })).rejects.toThrow('remoteMinQualityScore')
     await expect(setup({ remoteTrustedOwners: ['bad/owner'] })).rejects.toThrow('invalid GitHub owner')
+    await expect(setup({ remoteCacheTtlMs: -1 })).rejects.toThrow('remoteCacheTtlMs')
+    await expect(setup({ remoteCacheMaxEntries: 1_001 })).rejects.toThrow('remoteCacheMaxEntries')
+  })
+
+  it('reports and clears the persistent remote discovery cache', async () => {
+    const context = await setup()
+    const agent = fakeAgent(context)
+    const status = await context.commands.execute(
+      agent,
+      '/skillflux discovery-cache status',
+      [],
+      new AbortController().signal,
+    )
+    expect(status?.result.text).toContain('enabled, 0/100 entries')
+    const cleaned = await context.commands.execute(
+      agent,
+      '/skillflux discovery-cache clean',
+      [],
+      new AbortController().signal,
+    )
+    expect(cleaned?.result.text).toBe('Removed 0 remote discovery cache entries.')
   })
 
   it('virtualizes a large registry to the configured active catalog', async () => {

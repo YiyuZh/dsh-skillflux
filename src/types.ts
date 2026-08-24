@@ -26,6 +26,9 @@ export interface SkillFluxConfig {
   readonly remoteMinStars?: number
   readonly remoteRecentActivityDays?: number
   readonly remoteTrustedOwners?: string[]
+  readonly remoteCacheTtlMs?: number
+  readonly remoteCacheStaleIfErrorMs?: number
+  readonly remoteCacheMaxEntries?: number
   readonly catalogDescriptionMaxLength?: number
   readonly catalogTokenBudget?: number
   readonly maxSkillFiles?: number
@@ -61,6 +64,9 @@ export interface ResolvedSkillFluxConfig {
   readonly remoteMinStars: number
   readonly remoteRecentActivityDays: number
   readonly remoteTrustedOwners: readonly string[]
+  readonly remoteCacheTtlMs: number
+  readonly remoteCacheStaleIfErrorMs: number
+  readonly remoteCacheMaxEntries: number
   readonly catalogDescriptionMaxLength: number
   readonly catalogTokenBudget: number
   readonly maxSkillFiles: number
@@ -89,6 +95,15 @@ export interface EmbeddingRouterStats {
   readonly cacheHits: number
   readonly cacheMisses: number
   readonly cacheEntries: number
+}
+
+export interface RemoteDiscoveryCacheStats {
+  readonly enabled: boolean
+  readonly entries: number
+  readonly hits: number
+  readonly misses: number
+  readonly staleHits: number
+  readonly writes: number
 }
 
 export interface CandidateRoutingMetadata {
