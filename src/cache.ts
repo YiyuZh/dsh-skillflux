@@ -44,6 +44,8 @@ function validManifest(value: unknown): value is CacheManifest {
     && typeof item.skillId === 'string'
     && typeof item.name === 'string'
     && typeof item.description === 'string'
+    && (item.installs === undefined
+      || (typeof item.installs === 'number' && Number.isSafeInteger(item.installs) && item.installs >= 0))
     && typeof item.installedAt === 'string'
     && typeof item.fileCount === 'number'
     && Number.isSafeInteger(item.fileCount) && item.fileCount >= 1
@@ -136,11 +138,11 @@ export class SkillCache {
     return await this.get(cacheId(source, ref, skillId))
   }
 
-  async load(entry: CacheEntry): Promise<SkillDefinition> {
+  async load(entry: CacheEntry, signal?: AbortSignal): Promise<SkillDefinition> {
     const inspected = await inspectSkillDirectory(entry.directory, {
       maxFiles: this.options.maxFiles,
       maxBytes: this.options.maxBytes,
-    })
+    }, signal)
     if (inspected.definition.name !== entry.manifest.name) throw new Error('cached skill name no longer matches its manifest')
     if (inspected.fileCount !== entry.manifest.fileCount
       || inspected.totalBytes !== entry.manifest.totalBytes
@@ -151,8 +153,10 @@ export class SkillCache {
   }
 
   async install(candidate: RemoteCandidate, signal?: AbortSignal): Promise<CacheEntry> {
+    signal?.throwIfAborted()
     const id = cacheId(candidate.source, candidate.ref, candidate.skillId)
     const existing = await this.get(id)
+    signal?.throwIfAborted()
     if (existing !== undefined) return existing
     const staging = join(this.stagingRoot, randomUUID())
     const workspace = join(staging, 'workspace')
@@ -209,7 +213,7 @@ export class SkillCache {
       const inspected = await inspectSkillDirectory(downloaded, {
         maxFiles: this.options.maxFiles,
         maxBytes: this.options.maxBytes,
-      })
+      }, signal)
       if (inspected.definition.name !== candidate.skillId) {
         throw new Error(`downloaded skill name "${inspected.definition.name}" does not match "${candidate.skillId}"`)
       }
@@ -222,6 +226,7 @@ export class SkillCache {
         name: inspected.definition.name,
         description: inspected.definition.description,
         ...(inspected.definition.whenToUse === undefined ? {} : { whenToUse: inspected.definition.whenToUse }),
+        installs: candidate.installs,
         installedAt: new Date().toISOString(),
         fileCount: inspected.fileCount,
         totalBytes: inspected.totalBytes,
@@ -233,6 +238,7 @@ export class SkillCache {
         await rename(downloaded, destination)
       } catch (error: unknown) {
         const raced = await this.get(id)
+        signal?.throwIfAborted()
         if (raced !== undefined) return raced
         throw error
       }

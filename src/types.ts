@@ -93,6 +93,7 @@ export interface CacheManifest {
   readonly name: string
   readonly description: string
   readonly whenToUse?: string
+  readonly installs?: number
   readonly installedAt: string
   readonly fileCount: number
   readonly totalBytes: number

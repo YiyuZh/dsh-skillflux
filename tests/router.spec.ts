@@ -22,6 +22,11 @@ describe('router', () => {
     expect(tokens).toContain('分析')
     expect(tokens).toContain('文档')
     expect(tokens).not.toContain('please')
+    const compact = tokenize('帮我分析这个中文文档')
+    expect(compact).toContain('分析')
+    expect(compact).toContain('中文')
+    expect(compact).not.toContain('帮我')
+    expect(compact).not.toContain('我分')
   })
 
   it('weights exact names above description-only matches', () => {
@@ -58,6 +63,15 @@ describe('router', () => {
       limit: 3,
       minScore: 8,
       routes: [],
+    })
+    expect(selected).toEqual([])
+  })
+
+  it('matches Latin route terms at token boundaries', () => {
+    const selected = selectCandidates('Prepare a quarterly report', [candidate('art', 'Create art assets')], {
+      limit: 1,
+      minScore: 8,
+      routes: [{ matchAny: ['art'], skills: ['art'] }],
     })
     expect(selected).toEqual([])
   })

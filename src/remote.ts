@@ -37,6 +37,7 @@ function isSearchItem(value: unknown): value is SkillsSearchItem {
   return typeof item.skillId === 'string'
     && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(item.skillId)
     && typeof item.name === 'string'
+    && item.name.trim().length > 0
     && typeof item.installs === 'number'
     && Number.isSafeInteger(item.installs)
     && item.installs >= 0
@@ -80,12 +81,21 @@ export class RemoteDiscoveryClient {
     const payload = await response.json() as Partial<SkillsSearchResponse>
     if (!Array.isArray(payload.skills)) throw new Error('skills.sh returned an invalid response')
     const items = payload.skills.filter(isSearchItem).slice(0, this.searchLimit)
+    const heads = new Map<string, Promise<string>>()
+    const head = (source: string): Promise<string> => {
+      let pending = heads.get(source)
+      if (pending === undefined) {
+        pending = resolveHead(source, operationSignal)
+        heads.set(source, pending)
+      }
+      return pending
+    }
     const resolved = await Promise.allSettled(items.map(async (item): Promise<RemoteCandidate> => {
-      const ref = await resolveHead(item.source, operationSignal)
+      const ref = await head(item.source)
       return {
         id: candidateId('remote', item.source, ref, item.skillId),
         origin: 'remote',
-        name: item.name,
+        name: item.skillId,
         description: `${item.name} from ${item.source} (${item.installs} installs)`,
         source: item.source,
         ref,
@@ -94,6 +104,7 @@ export class RemoteDiscoveryClient {
         installs: item.installs,
       }
     }))
+    operationSignal.throwIfAborted()
     return resolved.flatMap(result => result.status === 'fulfilled' ? [result.value] : [])
   }
 }

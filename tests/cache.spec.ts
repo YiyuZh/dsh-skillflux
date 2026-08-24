@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { isLoopbackProxyFailure, SkillCache } from '../src/cache.js'
 import { inspectSkillDirectory } from '../src/skill-file.js'
+import { cacheCandidates } from '../src/router.js'
 import type { CacheManifest, RemoteCandidate } from '../src/types.js'
 
 const roots: string[] = []
@@ -118,8 +119,9 @@ describe('persistent cache', () => {
     ])
     expect(invocations[1]?.timeoutMs).toBe(1_234)
     expect(installed.manifest).toMatchObject({
-      source: 'owner/repo', ref: candidate.ref, skillId: 'demo', name: 'demo',
+      source: 'owner/repo', ref: candidate.ref, skillId: 'demo', name: 'demo', installs: 42,
     })
+    expect(cacheCandidates([installed])[0]).toMatchObject({ name: 'demo', installs: 42 })
     expect((await cache.load(installed)).content).toContain('Use the remote demo')
   })
 })

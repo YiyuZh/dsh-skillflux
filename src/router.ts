@@ -5,8 +5,11 @@ import type { SkillSummary } from '@deepseek-ai/dsh-skill'
 const STOP_WORDS = new Set([
   'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'help', 'i', 'in', 'is', 'it',
   'me', 'of', 'on', 'or', 'please', 'that', 'the', 'this', 'to', 'use', 'with', 'you',
-  '一个', '一下', '以及', '使用', '帮我', '我们', '我的', '这个', '进行', '需要', '可以', '如何',
 ])
+
+const CJK_STOP_PHRASES = [
+  '一个', '一下', '以及', '使用', '帮我', '我们', '我的', '这个', '那个', '进行', '需要', '可以', '如何',
+] as const
 
 export function normalizeText(value: string): string {
   return value.normalize('NFKC').toLocaleLowerCase('en-US').replaceAll(/\s+/gu, ' ').trim()
@@ -17,9 +20,15 @@ export function tokenize(value: string): Set<string> {
   const result = new Set<string>()
   for (const token of normalized.match(/[\p{L}\p{N}]+/gu) ?? []) {
     if (/^[\p{Script=Han}]+$/u.test(token)) {
-      if (token.length === 1) result.add(token)
-      for (let index = 0; index < token.length - 1; index += 1) {
-        result.add(token.slice(index, index + 2))
+      let segments = [token]
+      for (const stop of CJK_STOP_PHRASES) {
+        segments = segments.flatMap(segment => segment.split(stop).filter(Boolean))
+      }
+      for (const segment of segments) {
+        if (segment.length === 1) result.add(segment)
+        for (let index = 0; index < segment.length - 1; index += 1) {
+          result.add(segment.slice(index, index + 2))
+        }
       }
       continue
     }
@@ -62,8 +71,12 @@ function ruleMatches(query: string, rule: RouteRule): boolean {
   const normalized = normalizeText(query)
   const all = rule.matchAll ?? []
   const any = rule.matchAny ?? []
-  if (all.length > 0 && !all.every(value => normalized.includes(normalizeText(value)))) return false
-  if (any.length > 0 && !any.some(value => normalized.includes(normalizeText(value)))) return false
+  const matches = (value: string): boolean => {
+    const term = normalizeText(value)
+    return /\p{Script=Han}/u.test(term) ? normalized.includes(term) : containsNamePhrase(normalized, term)
+  }
+  if (all.length > 0 && !all.every(matches)) return false
+  if (any.length > 0 && !any.some(matches)) return false
   return all.length > 0 || any.length > 0
 }
 
@@ -136,6 +149,7 @@ export function cacheCandidates(entries: readonly CacheEntry[]): SkillFluxCandid
     source: manifest.source,
     ref: manifest.ref,
     cacheId: manifest.cacheId,
+    ...(manifest.installs === undefined ? {} : { installs: manifest.installs }),
     score: 0,
   }))
 }

@@ -72,18 +72,25 @@ export function parseSkillMarkdown(raw: string, directory: string): SkillDefinit
   }
 }
 
-export async function inspectSkillDirectory(directory: string, limits: TreeLimits): Promise<ParsedSkillFile> {
+export async function inspectSkillDirectory(
+  directory: string,
+  limits: TreeLimits,
+  signal?: AbortSignal,
+): Promise<ParsedSkillFile> {
   let fileCount = 0
   let totalBytes = 0
   const hash = createHash('sha256')
   async function visit(current: string): Promise<void> {
+    signal?.throwIfAborted()
     const entries = await readdir(current, { withFileTypes: true })
+    signal?.throwIfAborted()
     entries.sort((left, right) => left.name.localeCompare(right.name, 'en'))
     for (const entry of entries) {
       const path = join(current, entry.name)
       const relativePath = relative(directory, path).replaceAll('\\', '/')
       if (relativePath === '.skillflux.json') continue
       const stats = await lstat(path)
+      signal?.throwIfAborted()
       if (stats.isSymbolicLink()) throw new Error(`symbolic links are not allowed: ${relativePath}`)
       if (stats.isDirectory()) {
         await visit(path)
@@ -95,12 +102,15 @@ export async function inspectSkillDirectory(directory: string, limits: TreeLimit
       if (fileCount > limits.maxFiles) throw new Error(`skill exceeds ${limits.maxFiles} files`)
       if (totalBytes > limits.maxBytes) throw new Error(`skill exceeds ${limits.maxBytes} bytes`)
       const content = await readFile(path)
+      signal?.throwIfAborted()
       hash.update(relativePath).update('\0').update(content).update('\0')
     }
   }
   await visit(directory)
+  signal?.throwIfAborted()
   const skillPath = join(directory, 'SKILL.md')
   const raw = await readFile(skillPath, 'utf8')
+  signal?.throwIfAborted()
   return {
     definition: parseSkillMarkdown(raw, directory),
     fileCount,

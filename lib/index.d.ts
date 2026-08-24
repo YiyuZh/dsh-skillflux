@@ -87,6 +87,7 @@ interface CacheManifest {
   readonly name: string;
   readonly description: string;
   readonly whenToUse?: string;
+  readonly installs?: number;
   readonly installedAt: string;
   readonly fileCount: number;
   readonly totalBytes: number;
@@ -123,7 +124,7 @@ interface TreeLimits {
   readonly maxBytes: number;
 }
 declare function parseSkillMarkdown(raw: string, directory: string): SkillDefinition;
-declare function inspectSkillDirectory(directory: string, limits: TreeLimits): Promise<ParsedSkillFile>;
+declare function inspectSkillDirectory(directory: string, limits: TreeLimits, signal?: AbortSignal): Promise<ParsedSkillFile>;
 //#endregion
 //#region src/cache.d.ts
 declare function isLoopbackProxyFailure(error: unknown): boolean;
@@ -152,7 +153,7 @@ declare class SkillCache {
   list(): Promise<CacheEntry[]>;
   get(id: string): Promise<CacheEntry | undefined>;
   find(source: string, ref: string, skillId: string): Promise<CacheEntry | undefined>;
-  load(entry: CacheEntry): Promise<SkillDefinition>;
+  load(entry: CacheEntry, signal?: AbortSignal): Promise<SkillDefinition>;
   install(candidate: RemoteCandidate, signal?: AbortSignal): Promise<CacheEntry>;
   clean(selector: string, active?: ReadonlySet<string>): Promise<{
     removed: string[];
@@ -210,6 +211,8 @@ declare class SkillFluxService extends Service {
   private routeTurn;
   private mountCandidate;
   private assertCapacity;
+  private assertStateCurrent;
+  private assertMountCurrent;
   private beginTurn;
   private state;
   private cleanupState;

@@ -27,6 +27,7 @@
     "eval": "vitest run tests/eval.spec.ts --reporter=verbose",
     "test:coverage": "vitest run --coverage",
     "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm build",
+    "prepack": "pnpm build",
     "pack:check": "pnpm pack --dry-run"
   },
   "keywords": [

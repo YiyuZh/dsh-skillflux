@@ -14,7 +14,8 @@ describe('remote discovery', () => {
       if (url.startsWith('https://skills.sh/')) {
         return new Response(JSON.stringify({
           skills: [
-            { skillId: 'pdf', name: 'pdf', installs: 100, source: 'openai/skills' },
+            { skillId: 'pdf-ocr-extraction', name: 'PDF OCR extraction', installs: 100, source: 'openai/skills' },
+            { skillId: 'pdf', name: 'PDF toolkit', installs: 90, source: 'openai/skills' },
             { skillId: '../bad', name: 'bad', installs: 1, source: 'evil/repo' },
           ],
         }), { status: 200 })
@@ -25,9 +26,13 @@ describe('remote discovery', () => {
     vi.stubGlobal('fetch', fetchMock)
     const client = new RemoteDiscoveryClient(5, 1_000)
     const result = await client.search('pdf')
-    expect(result).toHaveLength(1)
-    expect(result[0]).toMatchObject({ source: 'openai/skills', skillId: 'pdf', ref: sha, installs: 100 })
+    expect(result).toHaveLength(2)
+    expect(result[0]).toMatchObject({
+      name: 'pdf-ocr-extraction', source: 'openai/skills', skillId: 'pdf-ocr-extraction', ref: sha, installs: 100,
+    })
+    expect(result[0]?.description).toContain('PDF OCR extraction')
     expect(result[0]?.id).toMatch(/^[0-9a-f]{24}$/u)
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('api.github.com'))).toHaveLength(1)
   })
 
   it('fails closed on a malformed marketplace response', async () => {
@@ -41,5 +46,26 @@ describe('remote discovery', () => {
       : new Response('{}', { status: 429 })))
     const result = await new RemoteDiscoveryClient(5, 1_000).search('pdf')
     expect(result).toEqual([])
+  })
+
+  it('propagates cancellation during immutable HEAD resolution', async () => {
+    let headStarted!: () => void
+    const started = new Promise<void>(resolve => { headStarted = resolve })
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: RequestInit) => {
+      if (String(input).includes('skills.sh')) {
+        return new Response(JSON.stringify({
+          skills: [{ skillId: 'pdf', name: 'PDF', installs: 10, source: 'openai/skills' }],
+        }), { status: 200 })
+      }
+      headStarted()
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+      })
+    }))
+    const controller = new AbortController()
+    const pending = new RemoteDiscoveryClient(5, 5_000).search('pdf', controller.signal)
+    await started
+    controller.abort(new Error('cancelled by test'))
+    await expect(pending).rejects.toThrow('cancelled by test')
   })
 })
