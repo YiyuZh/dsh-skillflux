@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "exact-new-skill-beats-weak-popular-match",
+      "left": { "relevanceScore": 100, "installs": 0, "stars": 0, "forks": 0, "ageDays": 5, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "right": { "relevanceScore": 3, "installs": 1000000, "stars": 100000, "forks": 10000, "ageDays": 5, "trustedSource": false, "organizationOwned": true, "hasLicense": true },
+      "expected": "left"
+    },
+    {
+      "name": "recent-activity-breaks-equal-match",
+      "left": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 10, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "right": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 500, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "expected": "left"
+    },
+    {
+      "name": "maintained-project-beats-stale-project",
+      "left": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 60, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "right": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 500, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "expected": "left"
+    },
+    {
+      "name": "trusted-owner-breaks-equal-match",
+      "left": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 10, "trustedSource": true, "organizationOwned": false, "hasLicense": true },
+      "right": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 10, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "expected": "left"
+    },
+    {
+      "name": "market-adoption-breaks-equal-match",
+      "left": { "relevanceScore": 20, "installs": 10000, "stars": 100, "forks": 10, "ageDays": 10, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "right": { "relevanceScore": 20, "installs": 10, "stars": 100, "forks": 10, "ageDays": 10, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "expected": "left"
+    },
+    {
+      "name": "repository-adoption-breaks-equal-match",
+      "left": { "relevanceScore": 20, "installs": 100, "stars": 10000, "forks": 1000, "ageDays": 10, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "right": { "relevanceScore": 20, "installs": 100, "stars": 10, "forks": 1, "ageDays": 10, "trustedSource": false, "organizationOwned": false, "hasLicense": true },
+      "expected": "left"
+    },
+    {
+      "name": "organization-and-license-are-positive-evidence",
+      "left": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 10, "trustedSource": false, "organizationOwned": true, "hasLicense": true },
+      "right": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 10, "trustedSource": false, "organizationOwned": false, "hasLicense": false },
+      "expected": "left"
+    },
+    {
+      "name": "quality-score-is-capped",
+      "left": { "relevanceScore": 200, "installs": 1000000, "stars": 100000, "forks": 10000, "ageDays": 1, "trustedSource": true, "organizationOwned": true, "hasLicense": true },
+      "right": { "relevanceScore": 20, "installs": 0, "stars": 0, "forks": 0, "ageDays": 500, "trustedSource": false, "organizationOwned": false, "hasLicense": false },
+      "expected": "left",
+      "expectedLeftScore": 100
+    }
+  ]
+}

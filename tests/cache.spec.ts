@@ -1,4 +1,5 @@
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -85,6 +86,7 @@ describe('persistent cache', () => {
   it('uses the pinned installer contract and retries a loopback proxy failure', async () => {
     const root = await mkdtemp(join(tmpdir(), 'skillflux-cache-install-'))
     roots.push(root)
+    const downloadedMarkdown = '---\nname: demo\ndescription: Demo remote skill\n---\nUse the remote demo.\n'
     const candidate: RemoteCandidate = {
       id: 'remote-demo',
       origin: 'remote',
@@ -95,6 +97,16 @@ describe('persistent cache', () => {
       score: 1,
       skillId: 'demo',
       installs: 42,
+      discoverySources: ['github'],
+      qualityScore: 72,
+      relevanceScore: 100,
+      stars: 120,
+      forks: 8,
+      pushedAt: '2026-08-20T00:00:00Z',
+      license: 'MIT',
+      recentlyActive: true,
+      trustedSource: false,
+      skillFileHash: createHash('sha256').update(downloadedMarkdown).digest('hex'),
     }
     const invocations: Array<{ args: readonly string[]; cwd: string; timeoutMs: number }> = []
     const cache = new SkillCache({
@@ -107,7 +119,7 @@ describe('persistent cache', () => {
         if (invocations.length === 1) throw { stderr: 'Failed to connect to localhost port 7890: refused' }
         const downloaded = join(invocation.cwd, '.agents', 'skills', 'demo')
         await mkdir(downloaded, { recursive: true })
-        await writeFile(join(downloaded, 'SKILL.md'), '---\nname: demo\ndescription: Demo remote skill\n---\nUse the remote demo.\n')
+        await writeFile(join(downloaded, 'SKILL.md'), downloadedMarkdown)
       },
     })
     const installed = await cache.install(candidate)
@@ -123,5 +135,41 @@ describe('persistent cache', () => {
     })
     expect(cacheCandidates([installed])[0]).toMatchObject({ name: 'demo', installs: 42 })
     expect((await cache.load(installed)).content).toContain('Use the remote demo')
+  })
+
+  it('rejects an installed SKILL.md that differs from its GitHub search preview', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-cache-preview-'))
+    roots.push(root)
+    const candidate: RemoteCandidate = {
+      id: 'remote-preview',
+      origin: 'remote',
+      name: 'demo',
+      description: 'Demo remote skill',
+      source: 'owner/repo',
+      ref: 'e'.repeat(40),
+      score: 70,
+      skillId: 'demo',
+      installs: 0,
+      discoverySources: ['github'],
+      qualityScore: 70,
+      relevanceScore: 100,
+      stars: 100,
+      forks: 5,
+      recentlyActive: true,
+      trustedSource: false,
+      skillFileHash: '0'.repeat(64),
+    }
+    const cache = new SkillCache({
+      root,
+      maxFiles: 10,
+      maxBytes: 10_000,
+      installTimeoutMs: 1_000,
+      runInstaller: async invocation => {
+        const downloaded = join(invocation.cwd, '.agents', 'skills', 'demo')
+        await mkdir(downloaded, { recursive: true })
+        await writeFile(join(downloaded, 'SKILL.md'), '---\nname: demo\ndescription: Changed\n---\nChanged.\n')
+      },
+    })
+    await expect(cache.install(candidate)).rejects.toThrow('does not match the GitHub search preview')
   })
 })

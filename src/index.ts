@@ -40,7 +40,12 @@ export { estimateCatalogTokens, estimateTextTokens } from './catalog.js'
 export { parseSkillMarkdown, inspectSkillDirectory } from './skill-file.js'
 export { SkillCache, isLoopbackProxyFailure } from './cache.js'
 export { EmbeddingRouter, type EmbeddingRouterOptions } from './embedding.js'
-export { RemoteDiscoveryClient } from './remote.js'
+export {
+  RemoteDiscoveryClient,
+  remoteQualityScore,
+  type RemoteDiscoveryOptions,
+  type RemoteQualityInput,
+} from './remote.js'
 export { UsageStore, type AdaptiveUsageOptions, type UsageStoreOptions } from './usage.js'
 
 export const name = 'skillflux'
@@ -52,8 +57,13 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   minRouteScore: 8,
   approvalPolicy: 'always',
   remoteDiscovery: 'automatic',
+  remoteProviders: ['skills.sh', 'github'],
   remoteSearchLimit: 5,
-  remoteSearchTimeoutMs: 8_000,
+  remoteSearchTimeoutMs: 30_000,
+  remoteMinQualityScore: 35,
+  remoteMinStars: 0,
+  remoteRecentActivityDays: 30,
+  remoteTrustedOwners: [],
   catalogDescriptionMaxLength: 160,
   catalogTokenBudget: 0,
   maxSkillFiles: 1_000,
@@ -139,6 +149,22 @@ function catalogTokenBudget(value: number): number {
   return boundedInteger('catalogTokenBudget', value, 64, 1_000_000)
 }
 
+function remoteProviders(values: ResolvedSkillFluxConfig['remoteProviders']): ResolvedSkillFluxConfig['remoteProviders'] {
+  const providers = [...new Set(values)]
+  if (providers.length === 0) throw new Error('dsh-skillflux: remoteProviders must contain at least one provider')
+  return providers
+}
+
+function remoteTrustedOwners(values: readonly string[]): readonly string[] {
+  const owners = values.map(value => value.trim()).filter(value => value.length > 0)
+  for (const owner of owners) {
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u.test(owner)) {
+      throw new Error(`dsh-skillflux: invalid GitHub owner "${owner}" in remoteTrustedOwners`)
+    }
+  }
+  return [...new Set(owners.map(owner => owner.toLocaleLowerCase('en-US')))]
+}
+
 function nonEmptyString(name: string, value: string): string {
   const normalized = value.trim()
   if (normalized.length === 0) throw new Error(`dsh-skillflux: ${name} must not be empty`)
@@ -176,8 +202,28 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
     minRouteScore: positiveInteger('minRouteScore', config.minRouteScore ?? DEFAULTS.minRouteScore, 0),
     approvalPolicy: config.approvalPolicy ?? DEFAULTS.approvalPolicy,
     remoteDiscovery: config.remoteDiscovery ?? DEFAULTS.remoteDiscovery,
-    remoteSearchLimit: positiveInteger('remoteSearchLimit', config.remoteSearchLimit ?? DEFAULTS.remoteSearchLimit),
-    remoteSearchTimeoutMs: positiveInteger('remoteSearchTimeoutMs', config.remoteSearchTimeoutMs ?? DEFAULTS.remoteSearchTimeoutMs),
+    remoteProviders: remoteProviders(config.remoteProviders ?? DEFAULTS.remoteProviders),
+    remoteSearchLimit: boundedInteger('remoteSearchLimit', config.remoteSearchLimit ?? DEFAULTS.remoteSearchLimit, 1, 25),
+    remoteSearchTimeoutMs: boundedInteger(
+      'remoteSearchTimeoutMs',
+      config.remoteSearchTimeoutMs ?? DEFAULTS.remoteSearchTimeoutMs,
+      100,
+      120_000,
+    ),
+    remoteMinQualityScore: boundedInteger(
+      'remoteMinQualityScore',
+      config.remoteMinQualityScore ?? DEFAULTS.remoteMinQualityScore,
+      0,
+      100,
+    ),
+    remoteMinStars: boundedInteger('remoteMinStars', config.remoteMinStars ?? DEFAULTS.remoteMinStars, 0, 10_000_000),
+    remoteRecentActivityDays: boundedInteger(
+      'remoteRecentActivityDays',
+      config.remoteRecentActivityDays ?? DEFAULTS.remoteRecentActivityDays,
+      1,
+      3_650,
+    ),
+    remoteTrustedOwners: remoteTrustedOwners(config.remoteTrustedOwners ?? DEFAULTS.remoteTrustedOwners),
     catalogDescriptionMaxLength: positiveInteger(
       'catalogDescriptionMaxLength',
       config.catalogDescriptionMaxLength ?? DEFAULTS.catalogDescriptionMaxLength,
@@ -351,8 +397,13 @@ export class SkillFluxService extends Service {
     minRouteScore: z.number().default(DEFAULTS.minRouteScore),
     approvalPolicy: z.union(['always', 'session', 'automatic'] as const).default(DEFAULTS.approvalPolicy),
     remoteDiscovery: z.union(['automatic', 'on-demand', 'off'] as const).default(DEFAULTS.remoteDiscovery),
+    remoteProviders: z.array(z.union(['skills.sh', 'github'] as const)).default([...DEFAULTS.remoteProviders]),
     remoteSearchLimit: z.number().default(DEFAULTS.remoteSearchLimit),
     remoteSearchTimeoutMs: z.number().default(DEFAULTS.remoteSearchTimeoutMs),
+    remoteMinQualityScore: z.number().default(DEFAULTS.remoteMinQualityScore),
+    remoteMinStars: z.number().default(DEFAULTS.remoteMinStars),
+    remoteRecentActivityDays: z.number().default(DEFAULTS.remoteRecentActivityDays),
+    remoteTrustedOwners: z.array(z.string()).default([]),
     catalogDescriptionMaxLength: z.number().default(DEFAULTS.catalogDescriptionMaxLength),
     catalogTokenBudget: z.number().default(DEFAULTS.catalogTokenBudget),
     maxSkillFiles: z.number().default(DEFAULTS.maxSkillFiles),
@@ -397,7 +448,15 @@ export class SkillFluxService extends Service {
       maxBytes: this.config.maxSkillBytes,
       installTimeoutMs: this.config.installTimeoutMs,
     })
-    this.remote = new RemoteDiscoveryClient(this.config.remoteSearchLimit, this.config.remoteSearchTimeoutMs)
+    this.remote = new RemoteDiscoveryClient({
+      searchLimit: this.config.remoteSearchLimit,
+      timeoutMs: this.config.remoteSearchTimeoutMs,
+      providers: this.config.remoteProviders,
+      minQualityScore: this.config.remoteMinQualityScore,
+      minStars: this.config.remoteMinStars,
+      recentActivityDays: this.config.remoteRecentActivityDays,
+      trustedOwners: this.config.remoteTrustedOwners,
+    })
     this.usage = this.config.usageTracking
       ? new UsageStore({
           file: dshHomePath('storages', 'skillflux', 'usage.json'),
@@ -649,6 +708,16 @@ export class SkillFluxService extends Service {
                   source: { type: 'string', required: true },
                   ref: { type: 'string' },
                   installs: { type: 'integer' },
+                  discoverySources: { type: 'array', items: { type: 'string' } },
+                  qualityScore: { type: 'integer' },
+                  relevanceScore: { type: 'integer' },
+                  stars: { type: 'integer' },
+                  forks: { type: 'integer' },
+                  pushedAt: { type: 'string' },
+                  license: { type: 'string' },
+                  recentlyActive: { type: 'boolean' },
+                  trustedSource: { type: 'boolean' },
+                  path: { type: 'string' },
                   score: { type: 'integer', required: true },
                   selection: { type: 'string' },
                   baseScore: { type: 'integer' },
@@ -680,6 +749,18 @@ export class SkillFluxService extends Service {
             source: candidate.source,
             ...('ref' in candidate ? { ref: candidate.ref } : {}),
             ...('installs' in candidate && candidate.installs !== undefined ? { installs: candidate.installs } : {}),
+            ...(candidate.origin !== 'remote' ? {} : {
+              discoverySources: [...candidate.discoverySources],
+              qualityScore: candidate.qualityScore,
+              relevanceScore: candidate.relevanceScore,
+              stars: candidate.stars,
+              forks: candidate.forks,
+              ...(candidate.pushedAt === undefined ? {} : { pushedAt: candidate.pushedAt }),
+              ...(candidate.license === undefined ? {} : { license: candidate.license }),
+              recentlyActive: candidate.recentlyActive,
+              trustedSource: candidate.trustedSource,
+              ...(candidate.path === undefined ? {} : { path: candidate.path }),
+            }),
             score: candidate.score,
             ...(candidate.selection === undefined ? {} : { selection: candidate.selection }),
             ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
@@ -777,9 +858,12 @@ export class SkillFluxService extends Service {
         : `Router: hybrid (${this.config.embeddingProvider}, ${this.config.embeddingModel}); embedding requests ${stats?.requests ?? 0}, cache ${stats?.cacheEntries ?? 0}/${this.config.embeddingCacheSize}.`
       const telemetry = `Usage tracking: ${this.config.usageTracking ? 'on' : 'off'}; adaptive routing: ${this.config.adaptiveRouting ? 'on' : 'off'}.`
       const catalogBudget = catalog.budget === undefined ? 'off' : String(catalog.budget)
+      const discovery = `Remote discovery: ${this.config.remoteDiscovery}; providers ${this.config.remoteProviders
+        .map(provider => provider === 'github' && !this.remote.githubSearchEnabled ? 'github (token unavailable)' : provider)
+        .join(', ')}; quality >= ${this.config.remoteMinQualityScore}; stars >= ${this.config.remoteMinStars}; recent window ${this.config.remoteRecentActivityDays} days.`
       return {
         kind: 'success',
-        text: `${router}\n${telemetry}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
+        text: `${router}\n${telemetry}\n${discovery}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
           : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
       }

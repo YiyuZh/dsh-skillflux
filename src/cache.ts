@@ -46,6 +46,15 @@ function validManifest(value: unknown): value is CacheManifest {
     && typeof item.description === 'string'
     && (item.installs === undefined
       || (typeof item.installs === 'number' && Number.isSafeInteger(item.installs) && item.installs >= 0))
+    && (item.qualityScore === undefined
+      || (typeof item.qualityScore === 'number' && Number.isSafeInteger(item.qualityScore)
+        && item.qualityScore >= 0 && item.qualityScore <= 100))
+    && (item.stars === undefined
+      || (typeof item.stars === 'number' && Number.isSafeInteger(item.stars) && item.stars >= 0))
+    && (item.pushedAt === undefined || typeof item.pushedAt === 'string')
+    && (item.discoverySources === undefined
+      || (Array.isArray(item.discoverySources)
+        && item.discoverySources.every(source => source === 'skills.sh' || source === 'github')))
     && typeof item.installedAt === 'string'
     && typeof item.fileCount === 'number'
     && Number.isSafeInteger(item.fileCount) && item.fileCount >= 1
@@ -210,6 +219,13 @@ export class SkillCache {
         await execute(withoutLoopbackProxy(baseEnvironment))
       }
       await access(downloaded)
+      if (candidate.skillFileHash !== undefined) {
+        const downloadedSkill = await readFile(join(downloaded, 'SKILL.md'))
+        const downloadedHash = createHash('sha256').update(downloadedSkill).digest('hex')
+        if (downloadedHash !== candidate.skillFileHash) {
+          throw new Error('downloaded SKILL.md does not match the GitHub search preview')
+        }
+      }
       const inspected = await inspectSkillDirectory(downloaded, {
         maxFiles: this.options.maxFiles,
         maxBytes: this.options.maxBytes,
@@ -227,6 +243,10 @@ export class SkillCache {
         description: inspected.definition.description,
         ...(inspected.definition.whenToUse === undefined ? {} : { whenToUse: inspected.definition.whenToUse }),
         installs: candidate.installs,
+        qualityScore: candidate.qualityScore,
+        stars: candidate.stars,
+        ...(candidate.pushedAt === undefined ? {} : { pushedAt: candidate.pushedAt }),
+        discoverySources: candidate.discoverySources,
         installedAt: new Date().toISOString(),
         fileCount: inspected.fileCount,
         totalBytes: inspected.totalBytes,

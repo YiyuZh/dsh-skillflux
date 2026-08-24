@@ -87,6 +87,8 @@ function candidateOrder(left: SkillFluxCandidate, right: SkillFluxCandidate): nu
     return originRank[left.origin] - originRank[right.origin]
   }
   if (left.origin === 'cache' && right.origin === 'cache') {
+    const quality = (right.qualityScore ?? 0) - (left.qualityScore ?? 0)
+    if (quality !== 0) return quality
     const installs = (right.installs ?? 0) - (left.installs ?? 0)
     if (installs !== 0) return installs
   }
@@ -171,6 +173,10 @@ export function cacheCandidates(entries: readonly CacheEntry[]): SkillFluxCandid
     ref: manifest.ref,
     cacheId: manifest.cacheId,
     ...(manifest.installs === undefined ? {} : { installs: manifest.installs }),
+    ...(manifest.qualityScore === undefined ? {} : { qualityScore: manifest.qualityScore }),
+    ...(manifest.stars === undefined ? {} : { stars: manifest.stars }),
+    ...(manifest.pushedAt === undefined ? {} : { pushedAt: manifest.pushedAt }),
+    ...(manifest.discoverySources === undefined ? {} : { discoverySources: manifest.discoverySources }),
     score: 0,
   }))
 }

@@ -18,6 +18,15 @@ const candidate: RemoteCandidate = {
   score: 0,
   skillId: 'pdf-reader',
   installs: 100,
+  discoverySources: ['skills.sh'],
+  qualityScore: 80,
+  relevanceScore: 100,
+  stars: 500,
+  forks: 20,
+  pushedAt: '2026-08-20T00:00:00Z',
+  license: 'MIT',
+  recentlyActive: true,
+  trustedSource: false,
 }
 
 function agentWithRemoteHistory(entries: readonly RemoteCandidate[][]): Agent {

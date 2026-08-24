@@ -13,3 +13,10 @@ Until the first stable release, only the latest tagged dsh-skillflux version is 
 ## Trust model
 
 Remote skills are untrusted instructions. Commit pinning and cache integrity prevent source drift; they do not prove that a skill is safe. Use the default `always` approval policy and keep the Harness sandbox and tool permissions enabled.
+
+The remote quality score is discovery triage, not a security score. Stars,
+installs, recent activity, organization ownership, license metadata, and a
+configured trusted-owner boost can all be manipulated or become stale. Review
+the exact pinned commit before approval. `GITHUB_TOKEN` and `GH_TOKEN` are read
+from the process environment for GitHub search and are never written to cache
+manifests or usage telemetry.

@@ -262,6 +262,13 @@ function toCandidate(candidate: EvalCandidate): SkillFluxCandidate {
     ref: 'b'.repeat(40),
     skillId: candidate.name,
     installs: candidate.installs ?? 0,
+    discoverySources: ['skills.sh'],
+    qualityScore: 0,
+    relevanceScore: 0,
+    stars: 0,
+    forks: 0,
+    recentlyActive: false,
+    trustedSource: false,
   }
 }
 
