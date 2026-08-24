@@ -6,6 +6,8 @@ import { Agent } from "@deepseek-ai/dsh-agent";
 type ApprovalPolicy = 'always' | 'session' | 'automatic';
 type RemoteDiscovery = 'automatic' | 'on-demand' | 'off';
 type CandidateOrigin = 'registry' | 'cache' | 'remote';
+type RouterMode = 'lexical' | 'hybrid';
+type EmbeddingProvider = 'ollama' | 'openai-compatible';
 interface RouteRule {
   matchAll?: string[];
   matchAny?: string[];
@@ -22,6 +24,15 @@ interface SkillFluxConfig {
   readonly maxSkillFiles?: number;
   readonly maxSkillBytes?: number;
   readonly installTimeoutMs?: number;
+  readonly routerMode?: RouterMode;
+  readonly embeddingProvider?: EmbeddingProvider;
+  readonly embeddingEndpoint?: string;
+  readonly embeddingModel?: string;
+  readonly embeddingApiKeyEnv?: string;
+  readonly embeddingTimeoutMs?: number;
+  readonly embeddingCandidateLimit?: number;
+  readonly embeddingCacheSize?: number;
+  readonly minEmbeddingSimilarity?: number;
   readonly routes?: RouteRule[];
 }
 interface ResolvedSkillFluxConfig {
@@ -35,7 +46,22 @@ interface ResolvedSkillFluxConfig {
   readonly maxSkillFiles: number;
   readonly maxSkillBytes: number;
   readonly installTimeoutMs: number;
+  readonly routerMode: RouterMode;
+  readonly embeddingProvider: EmbeddingProvider;
+  readonly embeddingEndpoint: string;
+  readonly embeddingModel: string;
+  readonly embeddingApiKeyEnv: string;
+  readonly embeddingTimeoutMs: number;
+  readonly embeddingCandidateLimit: number;
+  readonly embeddingCacheSize: number;
+  readonly minEmbeddingSimilarity: number;
   readonly routes: readonly RouteRule[];
+}
+interface EmbeddingRouterStats {
+  readonly requests: number;
+  readonly cacheHits: number;
+  readonly cacheMisses: number;
+  readonly cacheEntries: number;
 }
 interface RegistryCandidate {
   readonly id: string;
@@ -162,6 +188,32 @@ declare class SkillCache {
   private read;
 }
 //#endregion
+//#region src/embedding.d.ts
+interface EmbeddingRouterOptions {
+  readonly provider: EmbeddingProvider;
+  readonly endpoint: string;
+  readonly model: string;
+  readonly apiKeyEnv: string;
+  readonly timeoutMs: number;
+  readonly candidateLimit: number;
+  readonly cacheSize: number;
+  readonly minSimilarity: number;
+}
+declare class EmbeddingRouter {
+  private readonly options;
+  private readonly vectors;
+  private requests;
+  private cacheHits;
+  private cacheMisses;
+  constructor(options: EmbeddingRouterOptions);
+  stats(): EmbeddingRouterStats;
+  rank(query: string, candidates: readonly SkillFluxCandidate[], limit: number, signal?: AbortSignal): Promise<SkillFluxCandidate[]>;
+  private cached;
+  private store;
+  private embed;
+  private request;
+}
+//#endregion
 //#region src/remote.d.ts
 declare class RemoteDiscoveryClient {
   private readonly searchLimit;
@@ -184,6 +236,7 @@ declare class SkillFluxService extends Service {
   private readonly runtimeCtx;
   private readonly cache;
   private readonly remote;
+  private readonly embedding;
   private readonly stateByAgent;
   private readonly states;
   private readonly trustedBySession;
@@ -196,6 +249,7 @@ declare class SkillFluxService extends Service {
   unmount(agent: Agent, name?: string): void;
   reload(agent: Agent, name: string, signal?: AbortSignal): Promise<MountedSkill>;
   mounted(agent: Agent): readonly MountedSkill[];
+  embeddingStats(): EmbeddingRouterStats | undefined;
   listCache(): Promise<CacheEntry[]>;
   cleanCache(selector: string): Promise<{
     removed: string[];
@@ -211,6 +265,7 @@ declare class SkillFluxService extends Service {
   private routeTurn;
   private mountCandidate;
   private assertCapacity;
+  private selectLocalCandidates;
   private assertStateCurrent;
   private assertMountCurrent;
   private beginTurn;
@@ -221,5 +276,5 @@ declare class SkillFluxService extends Service {
   private disposeAgent;
 }
 //#endregion
-export { type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryClient, type ResolvedSkillFluxConfig, type RouteRule, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, routeScore, selectCandidates, tokenize };
+export { type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryClient, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, routeScore, selectCandidates, tokenize };
 //# sourceMappingURL=index.d.ts.map

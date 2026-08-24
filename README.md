@@ -7,7 +7,7 @@ SkillFlux keeps the full Skill pool outside the model-facing catalog. For each
 task, it selects a small set of relevant Skills, mounts them for the current
 turn, and releases the mounts when the turn ends.
 
-> **Status:** MVP for DeepSeek Harness `0.1.1-rc.2`. Harness is still a
+> **Status:** v0.2 for DeepSeek Harness `0.1.1-rc.2`. Harness is still a
 > developer preview, so this project follows the current RC API.
 
 [中文文档](README.zh-CN.md)
@@ -58,7 +58,8 @@ the official `skill` Registry and `skill-filesystem` provider active.
 
 ```text
 User task
-  -> deterministic Skill router
+  -> ordered rules + deterministic lexical router
+  -> optional embedding fallback for unfilled slots
   -> local Registry + persistent cache + skills.sh
   -> select and mount up to the configured limit (3 by default)
   -> Agent calls a mounted Skill
@@ -70,9 +71,11 @@ A mount is scoped to the receiving Agent. Unmounting removes the runtime
 registration from future catalogs; it doesn't delete cached files or text
 already stored in session history.
 
-## MVP capabilities
+## Capabilities
 
 - Route by ordered rules, then deterministic English and Chinese lexical scores.
+- Optionally fill unmatched catalog slots with semantic similarity from a local
+  Ollama or OpenAI-compatible embedding endpoint.
 - Limit the model-facing catalog with `maxActiveSkills`.
 - Discover candidates from the DSH Registry, the SkillFlux cache, and
   [skills.sh](https://skills.sh/).
@@ -96,10 +99,12 @@ SkillFlux routes a task in this order:
 3. Apply matching `routes` in configuration order.
 4. Score the remaining name representatives with deterministic lexical
    matching and reject scores below `minRouteScore`.
-5. Mount the selected names until `maxActiveSkills` is reached. If a candidate
+5. In `hybrid` mode, use embeddings only when rules and lexical matching leave
+   catalog slots unfilled. Semantic results never displace those earlier matches.
+6. Mount the selected names until `maxActiveSkills` is reached. If a candidate
    can't load, try its same-name fallbacks in candidate-pool order.
 
-The MVP lexical score is:
+The lexical score is:
 
 | Match | Score |
 | --- | ---: |
@@ -111,6 +116,10 @@ The MVP lexical score is:
 For equal scores, Registry candidates rank before cached candidates, and cached
 candidates rank before remote candidates. Cache ties prefer higher install
 counts and then a stable source/name order.
+
+Semantic fallback uses cosine similarity, filters results below
+`minEmbeddingSimilarity`, and reports a rounded 0-100 score. It runs only after
+the ordered rule and lexical stages.
 
 ## Configuration
 
@@ -127,6 +136,15 @@ catalogDescriptionMaxLength: 160
 maxSkillFiles: 1000
 maxSkillBytes: 10485760
 installTimeoutMs: 300000
+routerMode: lexical                # lexical | hybrid
+embeddingProvider: ollama          # ollama | openai-compatible
+embeddingEndpoint: http://127.0.0.1:11434/api/embed
+embeddingModel: embeddinggemma
+embeddingApiKeyEnv: SKILLFLUX_EMBEDDING_API_KEY
+embeddingTimeoutMs: 5000
+embeddingCandidateLimit: 128
+embeddingCacheSize: 512
+minEmbeddingSimilarity: 0.45
 routes: []
 ```
 
@@ -143,6 +161,37 @@ routes:
 A rule can contain `matchAll`, `matchAny`, or both. Rule results keep their
 declared order, skip unavailable Skills, and still respect
 `maxActiveSkills`.
+
+### Hybrid embedding router
+
+Embedding routing is opt-in. The recommended private setup uses Ollama:
+
+```bash
+ollama pull embeddinggemma
+```
+
+```yaml
+routerMode: hybrid
+embeddingProvider: ollama
+embeddingEndpoint: http://127.0.0.1:11434/api/embed
+embeddingModel: embeddinggemma
+```
+
+For an OpenAI-compatible embedding service, select the protocol and point at
+its exact embeddings endpoint:
+
+```yaml
+routerMode: hybrid
+embeddingProvider: openai-compatible
+embeddingEndpoint: https://provider.example/v1/embeddings
+embeddingModel: provider-embedding-model
+embeddingApiKeyEnv: SKILLFLUX_EMBEDDING_API_KEY
+```
+
+Set the named environment variable in the process that launches DSH. SkillFlux
+never stores that value. Candidate vectors are kept in a bounded in-memory LRU
+and disappear when the plugin stops. An unavailable, malformed, timed-out, or
+reconfigured embedding endpoint fails open to the lexical result.
 
 ### Approval policies
 
@@ -192,6 +241,9 @@ unregisters runtime mounts but retains downloaded files for later reuse.
 - SkillFlux caches scripts as resources but never executes them.
 - Automatic discovery sends a bounded keyword query instead of the complete
   user message.
+- Hybrid routing sends at most 1,000 characters of the direct task and at most
+  1,000 characters of each candidate's name, `whenToUse`, and description to
+  the configured embedding endpoint. It never sends Skill bodies or resources.
 - `GITHUB_TOKEN` or `GH_TOKEN` is optional and used only for GitHub API rate
   limits; SkillFlux doesn't persist it.
 
@@ -207,8 +259,9 @@ Run the versioned routing corpus without an API key or network access:
 corepack pnpm eval
 ```
 
-The corpus contains 36 English, Chinese, normalization, rule, threshold,
-capacity, ranking, and deduplication cases.
+The suite contains 36 lexical cases and 8 provider-independent semantic-vector
+cases covering English, Chinese, normalization, rules, thresholds, capacity,
+ranking, deduplication, semantic top-k, and negative rejection.
 
 | Metric | Current baseline |
 | --- | ---: |
@@ -216,15 +269,22 @@ capacity, ranking, and deduplication cases.
 | Top-1 accuracy on positive cases | 100.0% |
 | Negative-task rejection | 100.0% |
 | Selector-limit compliance | 100.0% |
+| Semantic exact ordered match | 100.0% |
+| Semantic positive Top-1 | 100.0% |
+| Semantic negative rejection | 100.0% |
 
-These results verify the deterministic MVP routing contract against the
-checked-in corpus. They don't measure third-party Skill quality or the final
-answer from an online model. Read the
+These results verify the deterministic router and vector-ranking contracts
+against checked-in inputs. The semantic vectors are synthetic, so these results
+do not measure a particular embedding model, third-party Skill quality, or the
+final answer from an online model. Read the
 [evaluation corpus guide](evals/README.md) for the case format and limitations.
 
-## Known MVP limits
+## Known limitations
 
-- Selection uses rules and lexical scoring, not embeddings or an LLM router.
+- Hybrid quality depends on the configured embedding model. SkillFlux does not
+  download or manage that model.
+- Semantic fallback considers at most `embeddingCandidateLimit` local
+  candidates in current Registry/cache order.
 - Remote installation supports only public GitHub Skills discovered through
   skills.sh.
 - Unmounting can't remove text already committed to session history.
@@ -237,8 +297,13 @@ answer from an online model. Read the
 corepack pnpm install
 corepack pnpm check
 corepack pnpm eval
+corepack pnpm test:embedding-live
 corepack pnpm pack --dry-run
 ```
+
+`test:embedding-live` expects the configured Ollama model to exist. Override
+the defaults with `SKILLFLUX_EMBEDDING_MODEL`, `SKILLFLUX_EMBEDDING_ENDPOINT`,
+and `SKILLFLUX_EMBEDDING_PROVIDER` when testing another endpoint.
 
 The test suite covers routing, DSH catalog virtualization, explicit invocation,
 remote response validation, cache integrity, lifecycle cleanup, and the bundle

@@ -16,10 +16,12 @@ import {
 import { defineTool, type PreToolDecision, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { SkillCache } from './cache.js'
 import { updateCatalog, updateRemoteCandidates } from './catalog.js'
+import { EmbeddingRouter } from './embedding.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { cacheCandidates, registryCandidates, selectCandidates, tokenize } from './router.js'
 import type {
   CacheEntry,
+  EmbeddingRouterStats,
   MountedSkill,
   RemoteCandidate,
   ResolvedSkillFluxConfig,
@@ -31,10 +33,13 @@ export type * from './types.js'
 export { normalizeText, routeScore, selectCandidates, tokenize } from './router.js'
 export { parseSkillMarkdown, inspectSkillDirectory } from './skill-file.js'
 export { SkillCache, isLoopbackProxyFailure } from './cache.js'
+export { EmbeddingRouter, type EmbeddingRouterOptions } from './embedding.js'
 export { RemoteDiscoveryClient } from './remote.js'
 
 export const name = 'skillflux'
 const MOUNT_TOOL = 'skillflux_mount'
+const OLLAMA_EMBEDDING_ENDPOINT = 'http://127.0.0.1:11434/api/embed'
+const OPENAI_EMBEDDING_ENDPOINT = 'https://api.openai.com/v1/embeddings'
 const DEFAULTS: ResolvedSkillFluxConfig = {
   maxActiveSkills: 3,
   minRouteScore: 8,
@@ -46,6 +51,15 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   maxSkillFiles: 1_000,
   maxSkillBytes: 10 * 1024 * 1024,
   installTimeoutMs: 300_000,
+  routerMode: 'lexical',
+  embeddingProvider: 'ollama',
+  embeddingEndpoint: OLLAMA_EMBEDDING_ENDPOINT,
+  embeddingModel: 'embeddinggemma',
+  embeddingApiKeyEnv: 'SKILLFLUX_EMBEDDING_API_KEY',
+  embeddingTimeoutMs: 5_000,
+  embeddingCandidateLimit: 128,
+  embeddingCacheSize: 512,
+  minEmbeddingSimilarity: 0.45,
   routes: [],
 }
 
@@ -85,7 +99,51 @@ function positiveInteger(name: string, value: number, minimum = 1): number {
   return value
 }
 
+function boundedNumber(name: string, value: number, minimum: number, maximum: number): number {
+  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error(`dsh-skillflux: ${name} must be between ${minimum} and ${maximum}`)
+  }
+  return value
+}
+
+function boundedInteger(name: string, value: number, minimum: number, maximum: number): number {
+  positiveInteger(name, value, minimum)
+  if (value > maximum) throw new Error(`dsh-skillflux: ${name} must be less than or equal to ${maximum}`)
+  return value
+}
+
+function nonEmptyString(name: string, value: string): string {
+  const normalized = value.trim()
+  if (normalized.length === 0) throw new Error(`dsh-skillflux: ${name} must not be empty`)
+  return normalized
+}
+
+function embeddingEndpoint(value: string): string {
+  let endpoint: URL
+  try {
+    endpoint = new URL(nonEmptyString('embeddingEndpoint', value))
+  } catch {
+    throw new Error('dsh-skillflux: embeddingEndpoint must be an absolute URL')
+  }
+  if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
+    throw new Error('dsh-skillflux: embeddingEndpoint must use http or https')
+  }
+  if (endpoint.username.length > 0 || endpoint.password.length > 0 || endpoint.hash.length > 0) {
+    throw new Error('dsh-skillflux: embeddingEndpoint must not contain credentials or a fragment')
+  }
+  return endpoint.toString()
+}
+
+function environmentVariable(value: string): string {
+  const name = nonEmptyString('embeddingApiKeyEnv', value)
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) {
+    throw new Error('dsh-skillflux: embeddingApiKeyEnv must be an environment variable name')
+  }
+  return name
+}
+
 function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
+  const embeddingProvider = config.embeddingProvider ?? DEFAULTS.embeddingProvider
   return {
     maxActiveSkills: positiveInteger('maxActiveSkills', config.maxActiveSkills ?? DEFAULTS.maxActiveSkills),
     minRouteScore: positiveInteger('minRouteScore', config.minRouteScore ?? DEFAULTS.minRouteScore, 0),
@@ -101,6 +159,39 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
     maxSkillFiles: positiveInteger('maxSkillFiles', config.maxSkillFiles ?? DEFAULTS.maxSkillFiles),
     maxSkillBytes: positiveInteger('maxSkillBytes', config.maxSkillBytes ?? DEFAULTS.maxSkillBytes),
     installTimeoutMs: positiveInteger('installTimeoutMs', config.installTimeoutMs ?? DEFAULTS.installTimeoutMs),
+    routerMode: config.routerMode ?? DEFAULTS.routerMode,
+    embeddingProvider,
+    embeddingEndpoint: embeddingEndpoint(config.embeddingEndpoint ?? (embeddingProvider === 'ollama'
+      ? OLLAMA_EMBEDDING_ENDPOINT
+      : OPENAI_EMBEDDING_ENDPOINT)),
+    embeddingModel: nonEmptyString('embeddingModel', config.embeddingModel ?? (embeddingProvider === 'ollama'
+      ? DEFAULTS.embeddingModel
+      : 'text-embedding-3-small')),
+    embeddingApiKeyEnv: environmentVariable(config.embeddingApiKeyEnv ?? DEFAULTS.embeddingApiKeyEnv),
+    embeddingTimeoutMs: boundedInteger(
+      'embeddingTimeoutMs',
+      config.embeddingTimeoutMs ?? DEFAULTS.embeddingTimeoutMs,
+      100,
+      120_000,
+    ),
+    embeddingCandidateLimit: boundedInteger(
+      'embeddingCandidateLimit',
+      config.embeddingCandidateLimit ?? DEFAULTS.embeddingCandidateLimit,
+      1,
+      512,
+    ),
+    embeddingCacheSize: boundedInteger(
+      'embeddingCacheSize',
+      config.embeddingCacheSize ?? DEFAULTS.embeddingCacheSize,
+      1,
+      10_000,
+    ),
+    minEmbeddingSimilarity: boundedNumber(
+      'minEmbeddingSimilarity',
+      config.minEmbeddingSimilarity ?? DEFAULTS.minEmbeddingSimilarity,
+      0,
+      1,
+    ),
     routes: config.routes ?? DEFAULTS.routes,
   }
 }
@@ -208,6 +299,15 @@ export class SkillFluxService extends Service {
     maxSkillFiles: z.number().default(DEFAULTS.maxSkillFiles),
     maxSkillBytes: z.number().default(DEFAULTS.maxSkillBytes),
     installTimeoutMs: z.number().default(DEFAULTS.installTimeoutMs),
+    routerMode: z.union(['lexical', 'hybrid'] as const).default(DEFAULTS.routerMode),
+    embeddingProvider: z.union(['ollama', 'openai-compatible'] as const).default(DEFAULTS.embeddingProvider),
+    embeddingEndpoint: z.string(),
+    embeddingModel: z.string(),
+    embeddingApiKeyEnv: z.string().default(DEFAULTS.embeddingApiKeyEnv),
+    embeddingTimeoutMs: z.number().default(DEFAULTS.embeddingTimeoutMs),
+    embeddingCandidateLimit: z.number().default(DEFAULTS.embeddingCandidateLimit),
+    embeddingCacheSize: z.number().default(DEFAULTS.embeddingCacheSize),
+    minEmbeddingSimilarity: z.number().default(DEFAULTS.minEmbeddingSimilarity),
     routes: z.array(routeRuleSchema).default([]),
   })
 
@@ -215,6 +315,7 @@ export class SkillFluxService extends Service {
   private readonly runtimeCtx: Context
   private readonly cache: SkillCache
   private readonly remote: RemoteDiscoveryClient
+  private readonly embedding: EmbeddingRouter | undefined
   private readonly stateByAgent = new WeakMap<Agent, AgentState>()
   private readonly states = new Set<AgentState>()
   private readonly trustedBySession = new WeakMap<Session, Set<string>>()
@@ -230,6 +331,18 @@ export class SkillFluxService extends Service {
       installTimeoutMs: this.config.installTimeoutMs,
     })
     this.remote = new RemoteDiscoveryClient(this.config.remoteSearchLimit, this.config.remoteSearchTimeoutMs)
+    this.embedding = this.config.routerMode === 'hybrid'
+      ? new EmbeddingRouter({
+          provider: this.config.embeddingProvider,
+          endpoint: this.config.embeddingEndpoint,
+          model: this.config.embeddingModel,
+          apiKeyEnv: this.config.embeddingApiKeyEnv,
+          timeoutMs: this.config.embeddingTimeoutMs,
+          candidateLimit: this.config.embeddingCandidateLimit,
+          cacheSize: this.config.embeddingCacheSize,
+          minSimilarity: this.config.minEmbeddingSimilarity,
+        })
+      : undefined
 
     const skillTool = this.createSkillTool()
     ctx.tools.register(skillTool)
@@ -308,11 +421,14 @@ export class SkillFluxService extends Service {
     const cached = await this.cache.list()
     options.signal?.throwIfAborted()
     const local = dedupeByName([...registryCandidates(installed), ...cacheCandidates(cached)])
-    const selected = selectCandidates(query, local, {
-      limit: this.config.remoteSearchLimit,
-      minScore: this.config.minRouteScore,
-      routes: this.config.routes,
-    })
+    const selected = await this.selectLocalCandidates(
+      query,
+      local,
+      this.config.remoteSearchLimit,
+      this.config.remoteSearchLimit,
+      options.signal,
+    )
+    options.signal?.throwIfAborted()
     if (options.remote !== true || this.config.remoteDiscovery === 'off') return selected
     const remote = await this.remote.search(query, options.signal)
     options.signal?.throwIfAborted()
@@ -360,6 +476,10 @@ export class SkillFluxService extends Service {
 
   mounted(agent: Agent): readonly MountedSkill[] {
     return [...(this.stateByAgent.get(agent)?.active.values() ?? [])]
+  }
+
+  embeddingStats(): EmbeddingRouterStats | undefined {
+    return this.embedding?.stats()
   }
 
   async listCache(): Promise<CacheEntry[]> {
@@ -538,11 +658,15 @@ export class SkillFluxService extends Service {
     const parts = invocation.rawInput.trim().split(/\s+/u).filter(Boolean)
     if (parts.length === 1 && parts[0] === 'status') {
       const mounted = this.mounted(invocation.agent)
+      const stats = this.embeddingStats()
+      const router = this.config.routerMode === 'lexical'
+        ? 'Router: lexical.'
+        : `Router: hybrid (${this.config.embeddingProvider}, ${this.config.embeddingModel}); embedding requests ${stats?.requests ?? 0}, cache ${stats?.cacheEntries ?? 0}/${this.config.embeddingCacheSize}.`
       return {
         kind: 'success',
-        text: mounted.length === 0
+        text: `${router}\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
-          : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`,
+          : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
       }
     }
     if (parts.length === 2 && parts[0] === 'cache' && parts[1] === 'list') {
@@ -597,13 +721,17 @@ export class SkillFluxService extends Service {
       fallbacksByName.set(candidate.name, fallbacks)
     }
     const local = dedupeByName(localPool)
-    const selected = selectCandidates(task, local, {
-      // Keep ranked fallbacks available: a corrupt top candidate must not
-      // consume one of the bounded active slots for the entire turn.
-      limit: local.length,
-      minScore: this.config.minRouteScore,
-      routes: this.config.routes,
-    })
+    // Keep a few differently named fallbacks available: a corrupt top candidate
+    // must not consume one of the bounded active slots for the entire turn.
+    const selected = await this.selectLocalCandidates(
+      task,
+      local,
+      Math.min(local.length, this.config.maxActiveSkills * 3),
+      this.config.maxActiveSkills,
+      signal,
+    )
+    signal.throwIfAborted()
+    this.assertStateCurrent(state, generation)
     for (const candidate of selected) {
       if (state.active.size >= this.config.maxActiveSkills) break
       for (const fallback of fallbacksByName.get(candidate.name) ?? []) {
@@ -743,6 +871,33 @@ export class SkillFluxService extends Service {
     if (state.active.has(name)) return
     if (state.active.size >= this.config.maxActiveSkills) {
       throw new Error(`cannot mount skill "${name}": the ${this.config.maxActiveSkills}-skill turn limit is reached`)
+    }
+  }
+
+  private async selectLocalCandidates(
+    query: string,
+    candidates: readonly SkillFluxCandidate[],
+    limit: number,
+    semanticTrigger: number,
+    signal?: AbortSignal,
+  ): Promise<SkillFluxCandidate[]> {
+    if (limit <= 0 || candidates.length === 0) return []
+    const lexical = selectCandidates(query, candidates, {
+      limit,
+      minScore: this.config.minRouteScore,
+      routes: this.config.routes,
+    })
+    if (this.embedding === undefined || lexical.length >= semanticTrigger || lexical.length >= limit) return lexical
+    const selectedNames = new Set(lexical.map(candidate => candidate.name))
+    const remaining = candidates.filter(candidate => !selectedNames.has(candidate.name))
+    try {
+      const semantic = await this.embedding.rank(query, remaining, limit - lexical.length, signal)
+      signal?.throwIfAborted()
+      return [...lexical, ...semantic]
+    } catch (error: unknown) {
+      signal?.throwIfAborted()
+      this.runtimeCtx.logger.warn(`SkillFlux embedding routing failed open: ${errorMessage(error)}`)
+      return lexical
     }
   }
 

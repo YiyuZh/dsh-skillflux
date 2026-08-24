@@ -6,7 +6,7 @@ Runtime 管理器。
 SkillFlux 不把完整 Skill 池永久暴露给模型。它会针对当前任务选择少量相关
 Skill，只在当前回合挂载，并在回合结束后释放挂载。
 
-> **当前状态：** 适配 DeepSeek Harness `0.1.1-rc.2` 的 MVP。Harness
+> **当前状态：** 适配 DeepSeek Harness `0.1.1-rc.2` 的 v0.2。Harness
 > 仍处于开发者预览阶段，本项目暂时跟随当前 RC API。
 
 [English](README.md)
@@ -56,7 +56,8 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 
 ```text
 用户任务
-  -> 确定性 Skill Router
+  -> 有序规则 + 确定性词法 Router
+  -> 可选的 embedding 语义补位
   -> 本地 Registry + 持久缓存 + skills.sh
   -> 按配置上限选择并挂载 Skill（默认 3 个）
   -> Agent 调用已挂载的 Skill
@@ -67,9 +68,11 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 每个挂载只属于接收任务的 Agent。卸载会阻止它继续出现在后续目录，但不会删除
 缓存文件，也无法删除已经写入 session history 的文本。
 
-## MVP 功能
+## 功能
 
 - 先按配置规则路由，再用确定性的英文单词和中文二元词评分。
+- 可选使用本地 Ollama 或 OpenAI-compatible embedding 服务，为尚未填满的目录
+  位置补充语义相近 Skill。
 - 使用 `maxActiveSkills` 限制模型可见目录。
 - 从 DSH Registry、SkillFlux 缓存和
   [skills.sh](https://skills.sh/) 发现候选。
@@ -90,10 +93,12 @@ SkillFlux 按以下顺序处理任务：
 3. 按配置顺序应用匹配的 `routes`。
 4. 对剩余的名称代表候选进行确定性词法评分，并拒绝低于 `minRouteScore` 的
    候选。
-5. 依次挂载选中名称，直到达到 `maxActiveSkills`。如果首选候选加载失败，则按
+5. 在 `hybrid` 模式下，仅当规则和词法结果未填满目录时才使用 embedding；语义
+   结果不会替换前面已经命中的规则或词法结果。
+6. 依次挂载选中名称，直到达到 `maxActiveSkills`。如果首选候选加载失败，则按
    候选池顺序尝试同名 fallback。
 
-MVP 词法评分如下：
+词法评分如下：
 
 | 命中方式 | 分数 |
 | --- | ---: |
@@ -104,6 +109,9 @@ MVP 词法评分如下：
 
 同分时，本地 Registry 优先于缓存，缓存优先于远程候选。缓存同分时先比较安装
 量，再按来源和名称进行稳定排序。
+
+语义补位使用余弦相似度，拒绝低于 `minEmbeddingSimilarity` 的结果，并将分数
+换算为 0-100 的整数。它始终位于有序规则和词法阶段之后。
 
 ## 配置
 
@@ -120,6 +128,15 @@ catalogDescriptionMaxLength: 160
 maxSkillFiles: 1000
 maxSkillBytes: 10485760
 installTimeoutMs: 300000
+routerMode: lexical                # lexical | hybrid
+embeddingProvider: ollama          # ollama | openai-compatible
+embeddingEndpoint: http://127.0.0.1:11434/api/embed
+embeddingModel: embeddinggemma
+embeddingApiKeyEnv: SKILLFLUX_EMBEDDING_API_KEY
+embeddingTimeoutMs: 5000
+embeddingCandidateLimit: 128
+embeddingCacheSize: 512
+minEmbeddingSimilarity: 0.45
 routes: []
 ```
 
@@ -135,6 +152,35 @@ routes:
 
 每条规则可以包含 `matchAll`、`matchAny` 或同时包含两者。规则结果保持声明
 顺序，跳过不存在的 Skill，并继续受 `maxActiveSkills` 限制。
+
+### Hybrid embedding Router
+
+Embedding 路由默认关闭。推荐使用本地 Ollama，避免把任务文本发送给第三方：
+
+```bash
+ollama pull embeddinggemma
+```
+
+```yaml
+routerMode: hybrid
+embeddingProvider: ollama
+embeddingEndpoint: http://127.0.0.1:11434/api/embed
+embeddingModel: embeddinggemma
+```
+
+使用 OpenAI-compatible embedding 服务时，配置其准确 endpoint：
+
+```yaml
+routerMode: hybrid
+embeddingProvider: openai-compatible
+embeddingEndpoint: https://provider.example/v1/embeddings
+embeddingModel: provider-embedding-model
+embeddingApiKeyEnv: SKILLFLUX_EMBEDDING_API_KEY
+```
+
+请在启动 DSH 的进程环境中设置对应变量。SkillFlux 不保存该值。候选向量只保留
+在有界内存 LRU 中，插件停止后自动释放。端点不可用、响应异常、超时或模型维度
+变化时，Router 会自动回退到词法结果。
 
 ### 审批策略
 
@@ -178,6 +224,9 @@ routes:
   manifest。
 - SkillFlux 会缓存脚本资源，但不会执行它们。
 - 自动发现只发送长度受限的关键词，不发送完整用户消息。
+- Hybrid 路由最多向配置的 embedding endpoint 发送 1,000 个字符的直接任务，
+  以及每个候选最多 1,000 个字符的名称、`whenToUse` 和 description；不会发送
+  Skill 正文或资源。
 - 可选的 `GITHUB_TOKEN` 或 `GH_TOKEN` 只用于 GitHub API 限流，不会持久化。
 
 Skill 本质上仍是交给 Agent 的外部指令，可能包含恶意内容。审批是信任决策，
@@ -191,8 +240,9 @@ Skill 本质上仍是交给 Agent 的外部指令，可能包含恶意内容。�
 corepack pnpm eval
 ```
 
-测评集包含 36 个场景，覆盖英文、中文、文本归一化、规则优先级、阈值、容量
-限制、同分排序和同名去重。
+测评包含 36 个词法场景和 8 个与 Provider 无关的语义向量场景，覆盖英文、中文、
+文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、语义 Top-K 和
+负例拒绝。
 
 | 指标 | 当前基线 |
 | --- | ---: |
@@ -200,14 +250,19 @@ corepack pnpm eval
 | 正例 Top-1 准确率 | 100.0% |
 | 无关任务拒绝率 | 100.0% |
 | Selector 容量限制合规率 | 100.0% |
+| 语义完整顺序匹配率 | 100.0% |
+| 语义正例 Top-1 | 100.0% |
+| 语义负例拒绝率 | 100.0% |
 
-这些结果只验证当前 MVP Router 在仓库测评集上的确定性行为，不代表第三方 Skill
-质量或在线模型最终回答质量。测评格式和限制见
+这些结果验证确定性 Router 和向量排序契约。语义向量是合成数据，不代表某个
+embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测评格式和限制见
 [测评集说明](evals/README.md)。
 
-## MVP 已知限制
+## 已知限制
 
-- 目前使用规则和词法评分，不使用 embedding 或 LLM Router。
+- Hybrid 效果取决于配置的 embedding 模型，SkillFlux 不负责下载或管理模型。
+- 语义补位最多处理当前 Registry/缓存顺序中的 `embeddingCandidateLimit` 个本地
+  候选。
 - 远程安装仅支持 skills.sh 发现的公开 GitHub Skill。
 - 卸载无法删除已经写入 session history 的文本。
 - 上游出现新 commit 时会形成新的不可变缓存；旧版本需要用户主动清理。
@@ -218,8 +273,13 @@ corepack pnpm eval
 corepack pnpm install
 corepack pnpm check
 corepack pnpm eval
+corepack pnpm test:embedding-live
 corepack pnpm pack --dry-run
 ```
+
+`test:embedding-live` 要求配置的 Ollama 模型已经存在。测试其他 endpoint 时可通过
+`SKILLFLUX_EMBEDDING_MODEL`、`SKILLFLUX_EMBEDDING_ENDPOINT` 和
+`SKILLFLUX_EMBEDDING_PROVIDER` 覆盖默认值。
 
 测试覆盖路由、DSH 目录虚拟化、显式调用、远程响应校验、缓存完整性、生命周期
 清理和 Bundle patch。提交修改前请阅读

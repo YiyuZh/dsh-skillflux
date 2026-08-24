@@ -18,6 +18,8 @@ const disposers: Array<() => Promise<void>> = []
 
 afterEach(async () => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
   for (const dispose of disposers.splice(0).reverse()) await dispose()
 })
 
@@ -693,6 +695,88 @@ describe('SkillFlux service', () => {
       agent,
       candidateId('registry', 'provider-a', '', 'published-moving-skill'),
     )).rejects.toThrow('provider changed; search again')
+    expect(context.skillFlux.mounted(agent)).toEqual([])
+  })
+
+  it('uses embeddings only to fill lexical routing gaps', async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { input: string[] }
+      return new Response(JSON.stringify({
+        embeddings: request.input.map(text => {
+          if (text.includes('calendar')) return [0, 1]
+          return [1, 0]
+        }),
+      }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const context = await setup({
+      maxActiveSkills: 1,
+      routes: [],
+      routerMode: 'hybrid',
+      embeddingCandidateLimit: 8,
+    })
+    context.skills.register({
+      name: 'ocr-reader',
+      description: 'Extract printed words from images',
+      source: 'runtime',
+      content: 'OCR instructions.',
+    })
+    context.skills.register({
+      name: 'calendar-agent',
+      description: 'Manage calendar meetings and events',
+      source: 'runtime',
+      content: 'Calendar instructions.',
+    })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Make this scanned receipt searchable' }],
+      source: { kind: 'user' },
+    })
+    await propose(context, agent, [user])
+    expect(context.skillFlux.mounted(agent).map(skill => skill.name)).toEqual(['ocr-reader'])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(context.skillFlux.embeddingStats()).toMatchObject({ requests: 1, cacheEntries: 3 })
+  })
+
+  it('does not call embeddings when lexical routing already fills the catalog', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const context = await setup({
+      maxActiveSkills: 1,
+      routes: [],
+      routerMode: 'hybrid',
+    })
+    context.skills.register({
+      name: 'pdf-reader',
+      description: 'Read PDF documents',
+      source: 'runtime',
+      content: 'PDF instructions.',
+    })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Read this PDF' }],
+      source: { kind: 'user' },
+    })
+    await propose(context, agent, [user])
+    expect(context.skillFlux.mounted(agent).map(skill => skill.name)).toEqual(['pdf-reader'])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('fails open to lexical routing when the embedding endpoint is unavailable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('unavailable', { status: 503 })))
+    const context = await setup({ routes: [], routerMode: 'hybrid' })
+    context.skills.register({
+      name: 'ocr-reader',
+      description: 'Extract printed words from images',
+      source: 'runtime',
+      content: 'OCR instructions.',
+    })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Make this scanned receipt searchable' }],
+      source: { kind: 'user' },
+    })
+    await expect(propose(context, agent, [user])).resolves.toMatchObject({ kind: 'enter' })
     expect(context.skillFlux.mounted(agent)).toEqual([])
   })
 })

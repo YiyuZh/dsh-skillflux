@@ -3,6 +3,8 @@ import type { SkillDefinition, SkillSummary } from '@deepseek-ai/dsh-skill'
 export type ApprovalPolicy = 'always' | 'session' | 'automatic'
 export type RemoteDiscovery = 'automatic' | 'on-demand' | 'off'
 export type CandidateOrigin = 'registry' | 'cache' | 'remote'
+export type RouterMode = 'lexical' | 'hybrid'
+export type EmbeddingProvider = 'ollama' | 'openai-compatible'
 
 export interface RouteRule {
   matchAll?: string[]
@@ -21,6 +23,15 @@ export interface SkillFluxConfig {
   readonly maxSkillFiles?: number
   readonly maxSkillBytes?: number
   readonly installTimeoutMs?: number
+  readonly routerMode?: RouterMode
+  readonly embeddingProvider?: EmbeddingProvider
+  readonly embeddingEndpoint?: string
+  readonly embeddingModel?: string
+  readonly embeddingApiKeyEnv?: string
+  readonly embeddingTimeoutMs?: number
+  readonly embeddingCandidateLimit?: number
+  readonly embeddingCacheSize?: number
+  readonly minEmbeddingSimilarity?: number
   readonly routes?: RouteRule[]
 }
 
@@ -35,7 +46,23 @@ export interface ResolvedSkillFluxConfig {
   readonly maxSkillFiles: number
   readonly maxSkillBytes: number
   readonly installTimeoutMs: number
+  readonly routerMode: RouterMode
+  readonly embeddingProvider: EmbeddingProvider
+  readonly embeddingEndpoint: string
+  readonly embeddingModel: string
+  readonly embeddingApiKeyEnv: string
+  readonly embeddingTimeoutMs: number
+  readonly embeddingCandidateLimit: number
+  readonly embeddingCacheSize: number
+  readonly minEmbeddingSimilarity: number
   readonly routes: readonly RouteRule[]
+}
+
+export interface EmbeddingRouterStats {
+  readonly requests: number
+  readonly cacheHits: number
+  readonly cacheMisses: number
+  readonly cacheEntries: number
 }
 
 export interface RegistryCandidate {
