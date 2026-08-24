@@ -22,6 +22,12 @@ export interface SkillFluxCandidatesSource {
     readonly source: string
     readonly ref: string
     readonly installs: number
+    readonly discoverySources: readonly string[]
+    readonly qualityScore: number
+    readonly relevanceScore: number
+    readonly stars: number
+    readonly recentlyActive: boolean
+    readonly trustedSource: boolean
   }[]
 }
 
@@ -115,13 +121,26 @@ function readRemoteEntries(source: unknown): RemoteEntries | undefined {
       || typeof item.name !== 'string'
       || typeof item.source !== 'string'
       || typeof item.ref !== 'string'
-      || typeof item.installs !== 'number') return undefined
+      || typeof item.installs !== 'number'
+      || !Array.isArray(item.discoverySources)
+      || !item.discoverySources.every(value => typeof value === 'string')
+      || typeof item.qualityScore !== 'number'
+      || typeof item.relevanceScore !== 'number'
+      || typeof item.stars !== 'number'
+      || typeof item.recentlyActive !== 'boolean'
+      || typeof item.trustedSource !== 'boolean') return undefined
     result.push({
       id: item.id,
       name: item.name,
       source: item.source,
       ref: item.ref,
       installs: item.installs,
+      discoverySources: item.discoverySources,
+      qualityScore: item.qualityScore,
+      relevanceScore: item.relevanceScore,
+      stars: item.stars,
+      recentlyActive: item.recentlyActive,
+      trustedSource: item.trustedSource,
     })
   }
   return result
@@ -129,7 +148,19 @@ function readRemoteEntries(source: unknown): RemoteEntries | undefined {
 
 function remoteDigest(entries: RemoteEntries): string {
   return createHash('sha256')
-    .update(entries.map(entry => JSON.stringify([entry.id, entry.name, entry.source, entry.ref, entry.installs])).join('\n'))
+    .update(entries.map(entry => JSON.stringify([
+      entry.id,
+      entry.name,
+      entry.source,
+      entry.ref,
+      entry.installs,
+      entry.discoverySources,
+      entry.qualityScore,
+      entry.relevanceScore,
+      entry.stars,
+      entry.recentlyActive,
+      entry.trustedSource,
+    ])).join('\n'))
     .digest('hex')
 }
 
@@ -207,6 +238,12 @@ function candidateEntries(candidates: readonly RemoteCandidate[]): RemoteEntries
     source: candidate.source,
     ref: candidate.ref,
     installs: candidate.installs,
+    discoverySources: candidate.discoverySources,
+    qualityScore: candidate.qualityScore,
+    relevanceScore: candidate.relevanceScore,
+    stars: candidate.stars,
+    recentlyActive: candidate.recentlyActive,
+    trustedSource: candidate.trustedSource,
   }))
 }
 
@@ -217,9 +254,18 @@ function buildRemoteCandidateMessage(candidates: readonly RemoteCandidate[], upd
     source: candidate.source,
     ref: candidate.ref,
     installs: candidate.installs,
+    discoverySources: candidate.discoverySources,
+    qualityScore: candidate.qualityScore,
+    relevanceScore: candidate.relevanceScore,
+    stars: candidate.stars,
+    recentlyActive: candidate.recentlyActive,
+    trustedSource: candidate.trustedSource,
   }))
   const lines = entries.map(entry =>
-    `- \`${entry.id}\` — \`${entry.name}\` from ${entry.source} @ ${entry.ref.slice(0, 12)} (${entry.installs} installs)`)
+    `- \`${entry.id}\` — \`${entry.name}\` from ${entry.source} @ ${entry.ref.slice(0, 12)} `
+    + `(quality ${entry.qualityScore}, relevance ${entry.relevanceScore}, ${entry.installs} installs, `
+    + `${entry.stars} stars, ${entry.recentlyActive ? 'active in freshness window' : 'older activity'}, `
+    + `via ${entry.discoverySources.join('+')}${entry.trustedSource ? ', trusted owner' : ''})`)
   return createUserMessage({
     content: [{
       type: 'text',

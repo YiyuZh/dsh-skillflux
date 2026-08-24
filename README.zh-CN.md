@@ -6,6 +6,10 @@ Runtime 管理器。
 SkillFlux 不把完整 Skill 池永久暴露给模型。它会针对当前任务选择少量相关
 Skill，只在当前回合挂载，并在回合结束后释放挂载。
 
+本地池没有合适结果时，SkillFlux 可以实时搜索 skills.sh 和 GitHub 公共
+`SKILL.md`，先用相关性优先的质量分与 30 天仓库活跃度信号排序，再提出固定到
+commit SHA 的挂载候选。
+
 > **当前状态：** 适配 DeepSeek Harness `0.1.1-rc.2` 的 v0.2。Harness
 > 仍处于开发者预览阶段，本项目暂时跟随当前 RC API。
 
@@ -59,7 +63,8 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
   -> 有序规则 + 确定性词法 Router
   -> 可选的有界使用历史排序
   -> 可选的 embedding 语义补位
-  -> 本地 Registry + 持久缓存 + skills.sh
+  -> 本地 Registry + 持久缓存 + 在线多源发现
+  -> 相关性优先的质量排序 + 30 天活跃度信号
   -> 在 Skill 数量和可选目录 token 预算内选择并挂载
   -> Agent 调用已挂载的 Skill
   -> turn/end 自动卸载
@@ -78,8 +83,10 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
   位置补充语义相近 Skill。
 - 使用 `maxActiveSkills` 限制模型可见目录。
 - 可选使用保守的 token 估算预算限制 Skill 目录提示。
-- 从 DSH Registry、SkillFlux 缓存和
-  [skills.sh](https://skills.sh/) 发现候选。
+- 从 DSH Registry、SkillFlux 缓存、[skills.sh](https://skills.sh/) 和经过
+  身份验证的 GitHub `SKILL.md` Code Search 发现候选。
+- 根据任务相关性、市场安装量、仓库活跃度、stars、forks、license 元数据及配置的
+  可信 owner，对远程结果重新排序。
 - 将远程候选固定到不可变的 GitHub commit SHA。
 - 通过当前 Agent 的 `ctx.skills` scope 注册缓存 Skill。
 - 每次加载前使用 SHA-256 manifest 校验缓存内容。
@@ -120,6 +127,45 @@ SkillFlux 按以下顺序处理任务：
 语义补位使用余弦相似度，拒绝低于 `minEmbeddingSimilarity` 的结果，并将分数
 换算为 0-100 的整数。它始终位于有序规则和词法阶段之后。
 
+## 在线高质量 Skill 发现
+
+远程发现读取实时网络数据，不使用打包在插件里的静态目录：
+
+1. skills.sh 提供市场匹配结果和安装量。
+2. 存在 `GITHUB_TOKEN` 或 `GH_TOKEN` 时，GitHub Code Search 会继续发现市场外的
+   公共 `SKILL.md`；SkillFlux 会先拉取并校验命中的 frontmatter。
+3. GitHub 仓库元数据提供不可变 HEAD commit、stars、forks、license、归档状态、
+   owner 类型和最近 push 时间。
+4. SkillFlux 拒绝零相关、已归档、已禁用、低于 stars 门槛或低于质量门槛的结果，
+   再返回质量最高的候选。
+
+质量分最高为 100。相关性既是准入门槛，也是权重最大的单项，因此高 star 但不
+相关的仓库不会仅凭热度压过精确匹配的新 Skill。
+
+| 信号 | 最高贡献 |
+| --- | ---: |
+| 任务与名称/description 的相关性 | 55 |
+| skills.sh 安装量 | 15 |
+| GitHub stars | 15 |
+| GitHub forks | 5 |
+| 仓库活跃度，配置的近期窗口权重最高 | 10 |
+| 可信 owner、组织归属和 license 元数据 | 15 |
+
+`remoteRecentActivityDays` 默认是 30。窗口内活跃可获得完整 freshness 加分；更老但
+仍维护的项目会逐步衰减，而不是直接淘汰。只有经过你独立验证的 owner 才应加入
+`remoteTrustedOwners`；组织账号或高 stars 本身不等于可信认证。
+
+GitHub Code Search 需要身份验证。请从带有标准环境变量的 shell 启动 DSH，例如
+PowerShell：
+
+```powershell
+$env:GH_TOKEN = gh auth token
+dsh web
+```
+
+没有 token 时，SkillFlux 仍会在线搜索 skills.sh，并通过公共 GitHub REST API
+补全这些结果；只会跳过范围更广的 GitHub Code Search provider。
+
 ## 配置
 
 SkillFlux 支持以下插件配置：
@@ -129,8 +175,13 @@ maxActiveSkills: 3
 minRouteScore: 8
 approvalPolicy: always       # always | session | automatic
 remoteDiscovery: automatic   # automatic | on-demand | off
+remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
-remoteSearchTimeoutMs: 8000
+remoteSearchTimeoutMs: 30000
+remoteMinQualityScore: 35     # 0-100
+remoteMinStars: 0
+remoteRecentActivityDays: 30
+remoteTrustedOwners: []       # 例如 [anthropics, openai, vercel-labs]
 catalogDescriptionMaxLength: 160
 catalogTokenBudget: 0              # 0 表示关闭；否则为 64-1000000
 maxSkillFiles: 1000
@@ -274,7 +325,14 @@ catalogTokenBudget: 512
 
 ## 安全与信任
 
-- 远程发现只接受 skills.sh 返回的公开 GitHub `owner/repository`。
+- 远程发现只接受 skills.sh 或经过身份验证的 GitHub `SKILL.md` Code Search 返回的
+  公共 GitHub 仓库。
+- GitHub 发现的 `SKILL.md` 限制为 256 KiB，并且必须先通过同一套 frontmatter
+  parser，才能成为候选。
+- 安装器最终选中的 `SKILL.md` 必须与 GitHub 搜索预览的 SHA-256 一致，防止仓库
+  内其他同名 Skill 静默替换已展示的结果。
+- 已归档和已禁用仓库会被拒绝。热度、活跃度和 license 只是排序证据，不是安全
+  审计结论。
 - 每个远程结果先解析为 40 位 commit SHA，再生成 candidate ID。
 - 通过固定的 `skills@1.5.23` CLI 下载该 SHA 对应的不可变 GitHub codeload
   归档。
@@ -289,7 +347,8 @@ catalogTokenBudget: 512
   Skill 正文或资源。
 - 使用统计不包含任务文本或 Skill 内容，并限制在 DSH 存储目录中的
   `usageMaxEntries` 条记录以内。
-- 可选的 `GITHUB_TOKEN` 或 `GH_TOKEN` 只用于 GitHub API 限流，不会持久化。
+- 可选的 `GITHUB_TOKEN` 或 `GH_TOKEN` 会启用 GitHub Code Search 和批量仓库
+  元数据补全；SkillFlux 不会持久化它。
 
 Skill 本质上仍是交给 Agent 的外部指令，可能包含恶意内容。审批是信任决策，
 不是沙箱。建议保留 DSH 权限、沙箱和工具审批。
@@ -303,8 +362,9 @@ corepack pnpm eval
 ```
 
 测评包含 36 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
-场景和 7 个目录预算场景，覆盖英文、中文、文本归一化、规则优先级、阈值、
-容量限制、同分排序、同名去重、语义 Top-K 和负例拒绝。
+场景、7 个目录预算场景和 8 个远程质量两两对比场景，覆盖英文、中文、文本
+归一化、规则优先级、阈值、容量限制、同分排序、同名去重、语义 Top-K、上下文
+预算、freshness、可信度、采用度和负例拒绝。
 
 | 指标 | 当前基线 |
 | --- | ---: |
@@ -315,6 +375,7 @@ corepack pnpm eval
 | 语义完整顺序匹配率 | 100.0% |
 | 语义正例 Top-1 | 100.0% |
 | 语义负例拒绝率 | 100.0% |
+| 远程质量两两排序正确率 | 100.0% |
 
 这些结果验证确定性 Router 和向量排序契约。语义向量是合成数据，不代表某个
 embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测评格式和限制见
@@ -327,7 +388,10 @@ embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测
   候选。
 - 目录 token 数是可移植估算值，不是当前聊天模型 tokenizer 的精确计数；它不
   包含已加载的 Skill 正文、工具 schema 或其他 session history。
-- 远程安装仅支持 skills.sh 发现的公开 GitHub Skill。
+- 没有 `GITHUB_TOKEN` 或 `GH_TOKEN` 时无法使用 GitHub Code Search，但
+  skills.sh provider 仍可使用。
+- 质量分是基于证据的候选筛选，不是代码安全审计。挂载前仍应查看精确固定版本，
+  并保持审批与 sandbox 控制开启。
 - 卸载无法删除已经写入 session history 的文本。
 - 上游出现新 commit 时会形成新的不可变缓存；旧版本需要用户主动清理。
 
@@ -337,9 +401,15 @@ embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测
 corepack pnpm install
 corepack pnpm check
 corepack pnpm eval
+corepack pnpm test:discovery-live
 corepack pnpm test:embedding-live
 corepack pnpm pack --dry-run
 ```
+
+`test:discovery-live` 会执行真实的 skills.sh 查询；存在 `GITHUB_TOKEN` 或
+`GH_TOKEN` 时还会测试 GitHub Code Search。可用 `SKILLFLUX_DISCOVERY_QUERY`
+替换任务，用 `SKILLFLUX_TRUSTED_OWNERS` 传入逗号分隔的可信 owner，或设置
+`SKILLFLUX_REQUIRE_GITHUB=1`，让 GitHub provider 不可用时测试直接失败。
 
 `test:embedding-live` 要求配置的 Ollama 模型已经存在。测试其他 endpoint 时可通过
 `SKILLFLUX_EMBEDDING_MODEL`、`SKILLFLUX_EMBEDDING_ENDPOINT` 和

@@ -7,6 +7,10 @@ SkillFlux keeps the full Skill pool outside the model-facing catalog. For each
 task, it selects a small set of relevant Skills, mounts them for the current
 turn, and releases the mounts when the turn ends.
 
+When the local pool has no good match, SkillFlux can search skills.sh and the
+public GitHub `SKILL.md` corpus live, then rank candidates with relevance-first
+quality and 30-day repository activity signals before proposing a pinned mount.
+
 > **Status:** v0.2 for DeepSeek Harness `0.1.1-rc.2`. Harness is still a
 > developer preview, so this project follows the current RC API.
 
@@ -61,7 +65,8 @@ User task
   -> ordered rules + deterministic lexical router
   -> optional bounded usage-based tie-breaking
   -> optional embedding fallback for unfilled slots
-  -> local Registry + persistent cache + skills.sh
+  -> local Registry + persistent cache + online multi-source discovery
+  -> relevance-first quality ranking with 30-day activity signals
   -> select and mount within the skill-count and optional catalog-token budgets
   -> Agent calls a mounted Skill
   -> unmount at turn/end
@@ -82,8 +87,11 @@ already stored in session history.
 - Limit the model-facing catalog with `maxActiveSkills`.
 - Optionally enforce a conservative estimated-token budget for the Skill
   catalog prompt.
-- Discover candidates from the DSH Registry, the SkillFlux cache, and
-  [skills.sh](https://skills.sh/).
+- Discover candidates from the DSH Registry, the SkillFlux cache,
+  [skills.sh](https://skills.sh/), and authenticated GitHub `SKILL.md` code
+  search.
+- Re-rank remote matches by task relevance, marketplace adoption, repository
+  activity, stars, forks, license metadata, and configured trusted owners.
 - Resolve remote candidates to immutable GitHub commit SHAs.
 - Register cached Skills through the current Agent's `ctx.skills` scope.
 - Verify cached content with a SHA-256 manifest before every load.
@@ -132,6 +140,50 @@ Semantic fallback uses cosine similarity, filters results below
 `minEmbeddingSimilarity`, and reports a rounded 0-100 score. It runs only after
 the ordered rule and lexical stages.
 
+## Online quality discovery
+
+Remote discovery is live, not a bundled catalog:
+
+1. skills.sh supplies marketplace matches and install counts.
+2. When `GITHUB_TOKEN` or `GH_TOKEN` is available, GitHub Code Search finds
+   matching public `SKILL.md` files outside the marketplace. SkillFlux fetches
+   and validates each matched frontmatter before accepting it.
+3. GitHub repository metadata supplies the immutable HEAD commit, stars,
+   forks, license, archive state, owner type, and last push time.
+4. SkillFlux rejects zero-relevance, archived, disabled, below-star, and
+   below-quality candidates, then returns the highest-quality matches.
+
+The quality score is capped at 100. Relevance is a gate and the largest single
+component, so a famous but unrelated repository cannot outrank an exact new
+match merely because it has more stars.
+
+| Signal | Maximum contribution |
+| --- | ---: |
+| Task/name/description relevance | 55 |
+| skills.sh installs | 15 |
+| GitHub stars | 15 |
+| GitHub forks | 5 |
+| Repository activity, with the configured recent window worth most | 10 |
+| Trusted owner, organization ownership, and license metadata | 15 |
+
+`remoteRecentActivityDays` defaults to 30. Activity inside that window receives
+the full freshness contribution; older maintained projects decay gradually
+instead of being discarded. Add owners you have independently vetted to
+`remoteTrustedOwners`; being an organization or having many stars is not itself
+treated as verification.
+
+GitHub code search requires authentication. Start DSH from a shell that exposes
+one of the standard variables, for example in PowerShell:
+
+```powershell
+$env:GH_TOKEN = gh auth token
+dsh web
+```
+
+Without a token, SkillFlux continues to search skills.sh and enrich those
+results through the public GitHub REST API. It simply skips the broader GitHub
+code-search provider.
+
 ## Configuration
 
 SkillFlux accepts these plugin options:
@@ -141,8 +193,13 @@ maxActiveSkills: 3
 minRouteScore: 8
 approvalPolicy: always       # always | session | automatic
 remoteDiscovery: automatic   # automatic | on-demand | off
+remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
-remoteSearchTimeoutMs: 8000
+remoteSearchTimeoutMs: 30000
+remoteMinQualityScore: 35     # 0-100
+remoteMinStars: 0
+remoteRecentActivityDays: 30
+remoteTrustedOwners: []       # e.g. [anthropics, openai, vercel-labs]
 catalogDescriptionMaxLength: 160
 catalogTokenBudget: 0              # 0 disables; otherwise 64-1000000
 maxSkillFiles: 1000
@@ -300,8 +357,15 @@ unregisters runtime mounts but retains downloaded files for later reuse.
 
 ## Security and trust
 
-- Remote discovery accepts only public GitHub `owner/repository` results from
-  skills.sh.
+- Remote discovery accepts only public GitHub repositories from skills.sh or
+  authenticated GitHub `SKILL.md` code search.
+- GitHub-discovered `SKILL.md` files are bounded to 256 KiB and must pass the
+  same supported frontmatter parser before they become candidates.
+- The SHA-256 hash of a GitHub search preview must match the `SKILL.md` selected
+  by the installer, preventing a same-name Skill elsewhere in the repository
+  from silently replacing the reviewed match.
+- Archived and disabled repositories are rejected. Repository popularity,
+  activity, and license metadata are ranking evidence, not a security verdict.
 - Each remote result is resolved to a 40-character commit SHA before SkillFlux
   creates its candidate ID.
 - Installation downloads that immutable GitHub codeload archive through the
@@ -318,8 +382,8 @@ unregisters runtime mounts but retains downloaded files for later reuse.
   the configured embedding endpoint. It never sends Skill bodies or resources.
 - Usage records never include task text or Skill content and are bounded to
   `usageMaxEntries` entries in the DSH storage directory.
-- `GITHUB_TOKEN` or `GH_TOKEN` is optional and used only for GitHub API rate
-  limits; SkillFlux doesn't persist it.
+- `GITHUB_TOKEN` or `GH_TOKEN` is optional. It enables broad GitHub code search
+  and batched repository enrichment; SkillFlux doesn't persist it.
 
 Skills are external instructions and can be malicious. Approval is a trust
 decision, not a sandbox. Keep DSH permissions, sandboxing, and tool approvals
@@ -334,10 +398,10 @@ corepack pnpm eval
 ```
 
 The suite contains 36 lexical cases, 4 adaptive safety cases, 8
-provider-independent semantic-vector cases, and 7 catalog-budget cases
-covering English, Chinese,
-normalization, rules, thresholds, capacity, ranking, deduplication, semantic
-top-k, and negative rejection.
+provider-independent semantic-vector cases, 7 catalog-budget cases, and 8
+remote-quality pairwise cases covering English, Chinese, normalization, rules,
+thresholds, capacity, ranking, deduplication, semantic top-k, context budgets,
+freshness, trust, adoption, and negative rejection.
 
 | Metric | Current baseline |
 | --- | ---: |
@@ -348,6 +412,7 @@ top-k, and negative rejection.
 | Semantic exact ordered match | 100.0% |
 | Semantic positive Top-1 | 100.0% |
 | Semantic negative rejection | 100.0% |
+| Remote-quality pairwise ordering | 100.0% |
 
 These results verify the deterministic router and vector-ranking contracts
 against checked-in inputs. The semantic vectors are synthetic, so these results
@@ -364,8 +429,10 @@ final answer from an online model. Read the
 - Catalog token counts are portable estimates, not exact counts from the
   configured chat model. They exclude loaded Skill bodies, tool schemas, and
   other session history.
-- Remote installation supports only public GitHub Skills discovered through
-  skills.sh.
+- GitHub Code Search is unavailable without `GITHUB_TOKEN` or `GH_TOKEN`; the
+  skills.sh provider remains available.
+- Quality scoring is evidence-based triage, not a code audit. Inspect the exact
+  pinned candidate and keep approval/sandbox controls enabled before mounting.
 - Unmounting can't remove text already committed to session history.
 - A new upstream commit creates a new immutable cache entry. Old entries remain
   until explicit cleanup.
@@ -376,9 +443,16 @@ final answer from an online model. Read the
 corepack pnpm install
 corepack pnpm check
 corepack pnpm eval
+corepack pnpm test:discovery-live
 corepack pnpm test:embedding-live
 corepack pnpm pack --dry-run
 ```
+
+`test:discovery-live` runs a real skills.sh query and also GitHub Code Search
+when `GITHUB_TOKEN` or `GH_TOKEN` is present. Override the task with
+`SKILLFLUX_DISCOVERY_QUERY`, add comma-separated trusted owners with
+`SKILLFLUX_TRUSTED_OWNERS`, or set `SKILLFLUX_REQUIRE_GITHUB=1` to fail when the
+GitHub provider is unavailable.
 
 `test:embedding-live` expects the configured Ollama model to exist. Override
 the defaults with `SKILLFLUX_EMBEDDING_MODEL`, `SKILLFLUX_EMBEDDING_ENDPOINT`,

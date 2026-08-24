@@ -6,10 +6,11 @@ import "@deepseek-ai/dsh-session";
 //#region src/types.d.ts
 type ApprovalPolicy = 'always' | 'session' | 'automatic';
 type RemoteDiscovery = 'automatic' | 'on-demand' | 'off';
+type RemoteDiscoveryProvider = 'skills.sh' | 'github';
 type CandidateOrigin = 'registry' | 'cache' | 'remote';
 type RouterMode = 'lexical' | 'hybrid';
 type EmbeddingProvider = 'ollama' | 'openai-compatible';
-type CandidateSelection = 'rule' | 'lexical' | 'embedding' | 'manual';
+type CandidateSelection = 'rule' | 'lexical' | 'embedding' | 'remote-quality' | 'manual';
 interface RouteRule {
   matchAll?: string[];
   matchAny?: string[];
@@ -20,8 +21,13 @@ interface SkillFluxConfig {
   readonly minRouteScore?: number;
   readonly approvalPolicy?: ApprovalPolicy;
   readonly remoteDiscovery?: RemoteDiscovery;
+  readonly remoteProviders?: RemoteDiscoveryProvider[];
   readonly remoteSearchLimit?: number;
   readonly remoteSearchTimeoutMs?: number;
+  readonly remoteMinQualityScore?: number;
+  readonly remoteMinStars?: number;
+  readonly remoteRecentActivityDays?: number;
+  readonly remoteTrustedOwners?: string[];
   readonly catalogDescriptionMaxLength?: number;
   readonly catalogTokenBudget?: number;
   readonly maxSkillFiles?: number;
@@ -49,8 +55,13 @@ interface ResolvedSkillFluxConfig {
   readonly minRouteScore: number;
   readonly approvalPolicy: ApprovalPolicy;
   readonly remoteDiscovery: RemoteDiscovery;
+  readonly remoteProviders: readonly RemoteDiscoveryProvider[];
   readonly remoteSearchLimit: number;
   readonly remoteSearchTimeoutMs: number;
+  readonly remoteMinQualityScore: number;
+  readonly remoteMinStars: number;
+  readonly remoteRecentActivityDays: number;
+  readonly remoteTrustedOwners: readonly string[];
   readonly catalogDescriptionMaxLength: number;
   readonly catalogTokenBudget: number;
   readonly maxSkillFiles: number;
@@ -105,6 +116,10 @@ interface CachedCandidate extends CandidateRoutingMetadata {
   readonly score: number;
   readonly cacheId: string;
   readonly installs?: number;
+  readonly qualityScore?: number;
+  readonly stars?: number;
+  readonly pushedAt?: string;
+  readonly discoverySources?: readonly RemoteDiscoveryProvider[];
 }
 interface RemoteCandidate extends CandidateRoutingMetadata {
   readonly id: string;
@@ -116,6 +131,17 @@ interface RemoteCandidate extends CandidateRoutingMetadata {
   readonly score: number;
   readonly skillId: string;
   readonly installs: number;
+  readonly discoverySources: readonly RemoteDiscoveryProvider[];
+  readonly qualityScore: number;
+  readonly relevanceScore: number;
+  readonly stars: number;
+  readonly forks: number;
+  readonly pushedAt?: string;
+  readonly license?: string;
+  readonly recentlyActive: boolean;
+  readonly trustedSource: boolean;
+  readonly path?: string;
+  readonly skillFileHash?: string;
 }
 type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate;
 interface MountedSkill {
@@ -169,6 +195,10 @@ interface CacheManifest {
   readonly description: string;
   readonly whenToUse?: string;
   readonly installs?: number;
+  readonly qualityScore?: number;
+  readonly stars?: number;
+  readonly pushedAt?: string;
+  readonly discoverySources?: readonly RemoteDiscoveryProvider[];
   readonly installedAt: string;
   readonly fileCount: number;
   readonly totalBytes: number;
@@ -214,6 +244,12 @@ interface SkillFluxCandidatesSource {
     readonly source: string;
     readonly ref: string;
     readonly installs: number;
+    readonly discoverySources: readonly string[];
+    readonly qualityScore: number;
+    readonly relevanceScore: number;
+    readonly stars: number;
+    readonly recentlyActive: boolean;
+    readonly trustedSource: boolean;
   }[];
 }
 type CatalogItem = Pick<SkillSummary, 'name' | 'description'>;
@@ -309,10 +345,37 @@ declare class EmbeddingRouter {
 }
 //#endregion
 //#region src/remote.d.ts
+interface RemoteDiscoveryOptions {
+  readonly searchLimit: number;
+  readonly timeoutMs: number;
+  readonly providers?: readonly RemoteDiscoveryProvider[];
+  readonly minQualityScore?: number;
+  readonly minStars?: number;
+  readonly recentActivityDays?: number;
+  readonly trustedOwners?: readonly string[];
+  readonly githubToken?: string;
+  readonly now?: () => number;
+}
+interface RemoteQualityInput {
+  readonly relevanceScore: number;
+  readonly installs: number;
+  readonly stars: number;
+  readonly forks: number;
+  readonly pushedAt?: string;
+  readonly recentActivityDays: number;
+  readonly trustedSource: boolean;
+  readonly organizationOwned: boolean;
+  readonly hasLicense: boolean;
+  readonly now: number;
+}
+declare function remoteQualityScore(input: RemoteQualityInput): number;
 declare class RemoteDiscoveryClient {
-  private readonly searchLimit;
-  private readonly timeoutMs;
+  private readonly options;
+  private readonly githubToken;
+  private readonly now;
   constructor(searchLimit: number, timeoutMs: number);
+  constructor(options: RemoteDiscoveryOptions);
+  get githubSearchEnabled(): boolean;
   search(query: string, signal?: AbortSignal): Promise<RemoteCandidate[]>;
 }
 //#endregion
@@ -414,5 +477,5 @@ declare class SkillFluxService extends Service {
   private disposeAgent;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryClient, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, routeScore, selectCandidates, tokenize };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteQualityInput, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, remoteQualityScore, routeScore, selectCandidates, tokenize };
 //# sourceMappingURL=index.d.ts.map

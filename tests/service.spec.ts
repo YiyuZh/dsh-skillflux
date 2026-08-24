@@ -101,6 +101,26 @@ describe('SkillFlux service', () => {
     )
   })
 
+  it('validates and normalizes remote quality discovery configuration', async () => {
+    const context = await setup({
+      remoteProviders: ['github', 'github'],
+      remoteMinQualityScore: 60,
+      remoteMinStars: 25,
+      remoteRecentActivityDays: 30,
+      remoteTrustedOwners: ['Anthropics', 'openai'],
+    })
+    expect(context.skillFlux.config).toMatchObject({
+      remoteProviders: ['github'],
+      remoteMinQualityScore: 60,
+      remoteMinStars: 25,
+      remoteRecentActivityDays: 30,
+      remoteTrustedOwners: ['anthropics', 'openai'],
+    })
+    await expect(setup({ remoteProviders: [] })).rejects.toThrow('remoteProviders must contain at least one')
+    await expect(setup({ remoteMinQualityScore: 101 })).rejects.toThrow('remoteMinQualityScore')
+    await expect(setup({ remoteTrustedOwners: ['bad/owner'] })).rejects.toThrow('invalid GitHub owner')
+  })
+
   it('virtualizes a large registry to the configured active catalog', async () => {
     const context = await setup()
     for (let index = 0; index < 100; index += 1) {
