@@ -26,6 +26,7 @@ export interface SkillFluxCandidatesSource {
 }
 
 type RemoteEntries = SkillFluxCandidatesSource['entries']
+type CatalogItem = Pick<SkillSummary, 'name' | 'description'>
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -39,8 +40,49 @@ function description(value: string, maxLength: number): string {
   return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 3)}...`
 }
 
-function sourceEntries(skills: readonly SkillSummary[], maxLength: number): SkillCatalogSource['entries'] {
+function sourceEntries(skills: readonly CatalogItem[], maxLength: number): SkillCatalogSource['entries'] {
   return skills.map(skill => ({ name: skill.name, description: description(skill.description, maxLength) }))
+}
+
+function catalogText(entries: SkillCatalogSource['entries'], update: boolean): string {
+  const lines = entries.map(entry => `- \`${entry.name}\`: ${escapeText(entry.description)}`)
+  return update
+    ? [
+        '<system-reminder>',
+        'The available skill catalog changed. This complete catalog replaces every earlier available-skills list in this session:',
+        '', '<available_skills>', ...lines, '</available_skills>', '',
+        ...(entries.length === 0
+          ? ['No skills are currently mounted through the `skill` tool. Do not use names from earlier catalogs.']
+          : ['Use only names in this replacement catalog. Call `skill` with the exact name before acting.']),
+        'A user may still invoke a user-invocable skill directly with `/skill-name`.',
+        '</system-reminder>',
+      ].join('\n')
+    : [
+        '<system-reminder>',
+        'SkillFlux mounted the following skills for this turn:',
+        '', '<available_skills>', ...lines, '</available_skills>', '',
+        'Call `skill` with an exact listed name before acting. The list contains summaries only.',
+        'A user may also invoke a user-invocable skill directly with `/skill-name`.',
+        '</system-reminder>',
+      ].join('\n')
+}
+
+/**
+ * Estimate prompt tokens conservatively without depending on a model-specific
+ * tokenizer. Three UTF-8 bytes per token slightly overestimates typical
+ * English text while staying close to one token per CJK code point.
+ */
+export function estimateTextTokens(value: string): number {
+  return value.length === 0 ? 0 : Math.ceil(Buffer.byteLength(value, 'utf8') / 3)
+}
+
+/** Estimate the largest catalog prompt form (the replacement/update form). */
+export function estimateCatalogTokens(skills: readonly CatalogItem[], maxLength: number): number {
+  if (!Number.isSafeInteger(maxLength) || maxLength < 3) {
+    throw new RangeError('catalog description max length must be an integer greater than or equal to 3')
+  }
+  if (skills.length === 0) return 0
+  return estimateTextTokens(catalogText(sourceEntries(skills, maxLength), true))
 }
 
 function digest(entries: SkillCatalogSource['entries']): string {
@@ -129,28 +171,8 @@ function currentCatalog(messages: readonly UserMessage[]): { message: UserMessag
 }
 
 function catalogMessage(entries: SkillCatalogSource['entries'], update: boolean): UserMessage {
-  const lines = entries.map(entry => `- \`${entry.name}\`: ${escapeText(entry.description)}`)
-  const text = update
-    ? [
-        '<system-reminder>',
-        'The available skill catalog changed. This complete catalog replaces every earlier available-skills list in this session:',
-        '', '<available_skills>', ...lines, '</available_skills>', '',
-        ...(entries.length === 0
-          ? ['No skills are currently mounted through the `skill` tool. Do not use names from earlier catalogs.']
-          : ['Use only names in this replacement catalog. Call `skill` with the exact name before acting.']),
-        'A user may still invoke a user-invocable skill directly with `/skill-name`.',
-        '</system-reminder>',
-      ].join('\n')
-    : [
-        '<system-reminder>',
-        'SkillFlux mounted the following skills for this turn:',
-        '', '<available_skills>', ...lines, '</available_skills>', '',
-        'Call `skill` with an exact listed name before acting. The list contains summaries only.',
-        'A user may also invoke a user-invocable skill directly with `/skill-name`.',
-        '</system-reminder>',
-      ].join('\n')
   return createUserMessage({
-    content: [{ type: 'text', text }],
+    content: [{ type: 'text', text: catalogText(entries, update) }],
     source: { kind: 'skill-catalog', form: 'catalog', ...(update ? { update: true as const } : {}), entries },
   })
 }

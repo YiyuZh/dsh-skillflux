@@ -62,7 +62,7 @@ User task
   -> optional bounded usage-based tie-breaking
   -> optional embedding fallback for unfilled slots
   -> local Registry + persistent cache + skills.sh
-  -> select and mount up to the configured limit (3 by default)
+  -> select and mount within the skill-count and optional catalog-token budgets
   -> Agent calls a mounted Skill
   -> unmount at turn/end
   -> keep downloaded files until explicit cleanup
@@ -80,6 +80,8 @@ already stored in session history.
 - Optionally fill unmatched catalog slots with semantic similarity from a local
   Ollama or OpenAI-compatible embedding endpoint.
 - Limit the model-facing catalog with `maxActiveSkills`.
+- Optionally enforce a conservative estimated-token budget for the Skill
+  catalog prompt.
 - Discover candidates from the DSH Registry, the SkillFlux cache, and
   [skills.sh](https://skills.sh/).
 - Resolve remote candidates to immutable GitHub commit SHAs.
@@ -108,8 +110,10 @@ SkillFlux routes a task in this order:
    and history cannot make an irrelevant candidate cross the threshold.
 6. In `hybrid` mode, use embeddings only when rules and lexical matching leave
    catalog slots unfilled. Semantic results never displace those earlier matches.
-7. Mount the selected names until `maxActiveSkills` is reached. If a candidate
-   can't load, try its same-name fallbacks in candidate-pool order.
+7. Mount the selected names until `maxActiveSkills` is reached. When
+   `catalogTokenBudget` is enabled, skip a candidate that would make the
+   estimated catalog prompt exceed that budget. If a candidate can't load,
+   try its same-name fallbacks in candidate-pool order.
 
 The lexical score is:
 
@@ -140,6 +144,7 @@ remoteDiscovery: automatic   # automatic | on-demand | off
 remoteSearchLimit: 5
 remoteSearchTimeoutMs: 8000
 catalogDescriptionMaxLength: 160
+catalogTokenBudget: 0              # 0 disables; otherwise 64-1000000
 maxSkillFiles: 1000
 maxSkillBytes: 10485760
 installTimeoutMs: 300000
@@ -234,6 +239,26 @@ The boost is capped by `adaptiveMaxBoost`, requires at least
 open to normal routing. Set `usageTracking: false` to disable persistence; in
 that case `adaptiveRouting` must also remain false.
 
+### Catalog context budget
+
+`catalogTokenBudget` is an optional second bound in addition to
+`maxActiveSkills`. The default `0` keeps existing behavior. A nonzero value
+preflights each mount and rejects only the candidate that would exceed the
+budget, allowing later smaller or same-name fallback candidates to continue:
+
+```yaml
+maxActiveSkills: 3
+catalogDescriptionMaxLength: 160
+catalogTokenBudget: 512
+```
+
+The estimate covers the complete replacement-form Skill catalog prompt after
+description truncation. It uses `ceil(UTF-8 bytes / 3)`: intentionally
+conservative for typical English and close to one token per CJK character, but
+it is not a model-specific tokenizer result. `/skillflux status` reports the
+current estimate and `/skillflux explain` marks rejected candidates as
+`budget-skipped`.
+
 ### Approval policies
 
 | Policy | Behavior |
@@ -267,7 +292,8 @@ You can use:
 ```
 
 `explain` shows each candidate's router stage, score, base score, adaptive
-boost, and whether it was selected or successfully mounted.
+boost, and whether it was selected, successfully mounted, or skipped by the
+catalog budget.
 
 Cleanup skips cache entries that are still mounted. At `turn/end`, SkillFlux
 unregisters runtime mounts but retains downloaded files for later reuse.
@@ -307,8 +333,9 @@ Run the versioned routing corpus without an API key or network access:
 corepack pnpm eval
 ```
 
-The suite contains 36 lexical cases, 4 adaptive safety cases, and 8
-provider-independent semantic-vector cases covering English, Chinese,
+The suite contains 36 lexical cases, 4 adaptive safety cases, 8
+provider-independent semantic-vector cases, and 7 catalog-budget cases
+covering English, Chinese,
 normalization, rules, thresholds, capacity, ranking, deduplication, semantic
 top-k, and negative rejection.
 
@@ -334,6 +361,9 @@ final answer from an online model. Read the
   download or manage that model.
 - Semantic fallback considers at most `embeddingCandidateLimit` local
   candidates in current Registry/cache order.
+- Catalog token counts are portable estimates, not exact counts from the
+  configured chat model. They exclude loaded Skill bodies, tool schemas, and
+  other session history.
 - Remote installation supports only public GitHub Skills discovered through
   skills.sh.
 - Unmounting can't remove text already committed to session history.

@@ -2,7 +2,8 @@
 
 `routing-cases.json` is a hand-authored deterministic benchmark for lexical
 and adaptive routing. `semantic-routing-cases.json` checks the embedding ranking contract
-with versioned synthetic vectors. Neither suite calls an LLM, the network, or a
+with versioned synthetic vectors. `catalog-budget-cases.json` checks catalog
+footprint boundaries and stable greedy admission. None of the suites calls an LLM, the network, or a
 remote Skill registry.
 
 The corpus covers:
@@ -37,6 +38,10 @@ is 100.0% for exact order, positive top-one accuracy, and negative rejection.
 The vectors are synthetic: this validates SkillFlux's provider-independent
 cosine ranking and threshold behavior, not the quality of a particular model.
 
+The catalog-budget corpus contains 7 cases covering disabled budgets, exact
+boundaries, ordered admission, CJK text, and description truncation. Its token
+counts use the documented portable estimate rather than a model tokenizer.
+
 Each case contains a stable ID, category, user task, candidate-pool keys, and the
 expected ordered result. Optional fields override the selector limit, score
 threshold, routing rules, adaptive boosts, or expected rule-forced candidates. Add a focused case
@@ -50,7 +55,8 @@ model. Those require a separate, credential-backed end-to-end run.
 
 `routing-cases.json` 是词法与自适应 Router 的人工确定性测评集；
 `semantic-routing-cases.json` 使用版本化合成向量验证 embedding 排序契约。两者
-均不访问 LLM、网络或远程 Skill Registry。确定性部分重点验证中英文匹配、规则优先级、阈值拒绝、
+以及 `catalog-budget-cases.json` 的目录预算边界测评均不访问 LLM、网络或远程
+Skill Registry。确定性部分重点验证中英文匹配、规则优先级、阈值拒绝、
 Selector 返回数量上限、来源排序、同名去重和短名称边界。
 
 运行 `corepack pnpm eval` 后，命令会输出完整顺序准确率、Top-1 准确率、负例

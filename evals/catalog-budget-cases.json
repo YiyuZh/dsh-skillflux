@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "description": "Deterministic catalog footprint and greedy budget benchmark for dsh-skillflux.",
+  "defaults": {
+    "maxDescriptionLength": 160
+  },
+  "candidates": [
+    {
+      "key": "pdf",
+      "name": "pdf-reader",
+      "description": "Read PDF documents and extract text"
+    },
+    {
+      "key": "documents",
+      "name": "document-parser",
+      "description": "Parse structured documents and tables"
+    },
+    {
+      "key": "chinese",
+      "name": "chinese-reader",
+      "description": "读取、分析并总结中文 PDF 报告与合同"
+    },
+    {
+      "key": "verbose",
+      "name": "verbose-skill",
+      "description": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    }
+  ],
+  "cases": [
+    {
+      "id": "disabled-budget-keeps-order",
+      "pool": ["pdf", "documents", "chinese"],
+      "budget": 0,
+      "expected": ["pdf", "documents", "chinese"]
+    },
+    {
+      "id": "below-single-catalog-rejects",
+      "pool": ["pdf"],
+      "budget": 139,
+      "expected": []
+    },
+    {
+      "id": "exact-single-boundary-accepts",
+      "pool": ["pdf"],
+      "budget": 140,
+      "expected": ["pdf"]
+    },
+    {
+      "id": "below-second-boundary-keeps-first",
+      "pool": ["pdf", "documents"],
+      "budget": 158,
+      "expected": ["pdf"]
+    },
+    {
+      "id": "exact-second-boundary-accepts-both",
+      "pool": ["pdf", "documents"],
+      "budget": 159,
+      "expected": ["pdf", "documents"]
+    },
+    {
+      "id": "ordered-greedy-budget-is-stable",
+      "pool": ["chinese", "pdf", "documents"],
+      "budget": 159,
+      "expected": ["chinese"]
+    },
+    {
+      "id": "description-truncation-reduces-footprint",
+      "pool": ["verbose"],
+      "budget": 136,
+      "maxDescriptionLength": 20,
+      "expected": ["verbose"]
+    }
+  ]
+}

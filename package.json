@@ -25,7 +25,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src tests",
     "test": "vitest run",
-    "eval": "vitest run tests/eval.spec.ts tests/embedding-eval.spec.ts --reporter=verbose",
+    "eval": "vitest run tests/eval.spec.ts tests/embedding-eval.spec.ts tests/catalog-budget-eval.spec.ts --reporter=verbose",
     "test:embedding-live": "pnpm build && node scripts/embedding-smoke.mjs",
     "test:coverage": "vitest run --coverage",
     "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm build",
