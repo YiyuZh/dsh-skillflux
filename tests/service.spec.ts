@@ -11,7 +11,7 @@ import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import SkillFluxService, { UsageStore, type SkillFluxConfig } from '../src/index.js'
+import SkillFluxService, { estimateCatalogTokens, UsageStore, type SkillFluxConfig } from '../src/index.js'
 import PublishedSkillFluxService from '../lib/index.js'
 import { candidateId } from '../src/router.js'
 import type { CacheEntry, SkillFluxCandidate } from '../src/types.js'
@@ -92,6 +92,12 @@ describe('SkillFlux service', () => {
   it('rejects adaptive routing when local usage tracking is disabled', async () => {
     await expect(setup({ usageTracking: false, adaptiveRouting: true })).rejects.toThrow(
       'adaptiveRouting requires usageTracking',
+    )
+  })
+
+  it('rejects an invalid nonzero catalog token budget', async () => {
+    await expect(setup({ catalogTokenBudget: 63 })).rejects.toThrow(
+      'catalogTokenBudget must be an integer greater than or equal to 64',
     )
   })
 
@@ -854,6 +860,60 @@ describe('SkillFlux service', () => {
 
     const usage = await context.commands.execute(agent, '/skillflux usage', [], new AbortController().signal)
     expect(usage?.result.text).toContain('uses 1, mounts 1')
+  })
+
+  it('enforces an opt-in catalog token budget and explains skipped candidates', async () => {
+    const descriptions = [
+      { name: 'first-skill', description: 'Analyze PDF documents' },
+      { name: 'second-skill', description: 'Analyze PDF documents' },
+    ]
+    const oneSkillBudget = estimateCatalogTokens(descriptions.slice(0, 1), 160)
+    expect(estimateCatalogTokens(descriptions, 160)).toBeGreaterThan(oneSkillBudget)
+    const context = await setup({
+      maxActiveSkills: 3,
+      routes: [],
+      usageTracking: false,
+      catalogTokenBudget: oneSkillBudget,
+    })
+    for (const skill of descriptions) {
+      context.skills.register({
+        ...skill,
+        whenToUse: 'Analyze PDF documents',
+        source: 'runtime',
+        content: `${skill.name} instructions`,
+      })
+    }
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Analyze this PDF document' }],
+      source: { kind: 'user' },
+    })
+    await propose(context, agent, [user])
+
+    expect(context.skillFlux.mounted(agent).map(skill => skill.name)).toEqual(['first-skill'])
+    expect(context.skillFlux.catalogStats(agent)).toEqual({
+      mountedSkills: 1,
+      estimatedTokens: oneSkillBudget,
+      budget: oneSkillBudget,
+    })
+    expect(context.skillFlux.lastRouting(agent)).toMatchObject([
+      { name: 'first-skill', outcome: 'mounted' },
+      { name: 'second-skill', outcome: 'budget-skipped' },
+    ])
+    const status = await context.commands.execute(agent, '/skillflux status', [], new AbortController().signal)
+    expect(status?.result.text).toContain(`~${oneSkillBudget} estimated tokens; budget ${oneSkillBudget}`)
+
+    await context.tools.execute({
+      callId: CallId('skillflux-budget-search'),
+      name: 'skillflux_search',
+      arguments: { query: 'second-skill', remote: false },
+      agent,
+      signal: new AbortController().signal,
+    })
+    await expect(context.skillFlux.mount(
+      agent,
+      candidateId('registry', 'runtime', '', 'second-skill'),
+    )).rejects.toThrow('exceeds token budget')
   })
 
   it('applies persisted adaptive history only to lexically relevant candidates', async () => {

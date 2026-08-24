@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { remoteCandidateMessage, updateRemoteCandidates } from '../src/catalog.js'
+import {
+  estimateCatalogTokens,
+  estimateTextTokens,
+  remoteCandidateMessage,
+  updateRemoteCandidates,
+} from '../src/catalog.js'
 import type { RemoteCandidate } from '../src/types.js'
 
 const candidate: RemoteCandidate = {
@@ -45,5 +50,24 @@ describe('remote candidate catalog', () => {
   it('does not repeat an already-visible empty replacement', () => {
     const agent = agentWithRemoteHistory([[candidate], []])
     expect(updateRemoteCandidates(agent, [])).toBeUndefined()
+  })
+})
+
+describe('catalog footprint estimation', () => {
+  it('uses a conservative UTF-8 estimate for Latin and CJK text', () => {
+    expect(estimateTextTokens('abcd')).toBe(2)
+    expect(estimateTextTokens('中文')).toBe(2)
+    expect(estimateTextTokens('')).toBe(0)
+  })
+
+  it('includes catalog framing and respects description truncation', () => {
+    const short = [{ name: 'pdf-reader', description: 'Read PDF files' }]
+    const long = [{ name: 'pdf-reader', description: 'x'.repeat(1_000) }]
+    expect(estimateCatalogTokens([], 160)).toBe(0)
+    expect(estimateCatalogTokens(short, 160)).toBeGreaterThan(estimateTextTokens('Read PDF files'))
+    expect(estimateCatalogTokens(long, 20)).toBeLessThan(estimateCatalogTokens(long, 160))
+    expect(estimateCatalogTokens([...short, ...short.map(item => ({ ...item, name: 'pdf-parser' }))], 160))
+      .toBeGreaterThan(estimateCatalogTokens(short, 160))
+    expect(() => estimateCatalogTokens(short, 2)).toThrow('greater than or equal to 3')
   })
 })

@@ -21,6 +21,7 @@ export interface SkillFluxConfig {
   readonly remoteSearchLimit?: number
   readonly remoteSearchTimeoutMs?: number
   readonly catalogDescriptionMaxLength?: number
+  readonly catalogTokenBudget?: number
   readonly maxSkillFiles?: number
   readonly maxSkillBytes?: number
   readonly installTimeoutMs?: number
@@ -50,6 +51,7 @@ export interface ResolvedSkillFluxConfig {
   readonly remoteSearchLimit: number
   readonly remoteSearchTimeoutMs: number
   readonly catalogDescriptionMaxLength: number
+  readonly catalogTokenBudget: number
   readonly maxSkillFiles: number
   readonly maxSkillBytes: number
   readonly installTimeoutMs: number
@@ -142,10 +144,16 @@ export interface RoutingTrace {
   readonly origin: CandidateOrigin
   readonly source: string
   readonly selection: CandidateSelection
-  readonly outcome: 'selected' | 'mounted'
+  readonly outcome: 'selected' | 'mounted' | 'budget-skipped'
   readonly score: number
   readonly baseScore?: number
   readonly adaptiveBoost?: number
+}
+
+export interface CatalogStats {
+  readonly mountedSkills: number
+  readonly estimatedTokens: number
+  readonly budget?: number
 }
 
 export interface SkillUsageIdentity {

@@ -2,6 +2,7 @@ import { Context, Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { SkillDefinition, SkillSummary } from "@deepseek-ai/dsh-skill";
 import { Agent } from "@deepseek-ai/dsh-agent";
+import "@deepseek-ai/dsh-session";
 //#region src/types.d.ts
 type ApprovalPolicy = 'always' | 'session' | 'automatic';
 type RemoteDiscovery = 'automatic' | 'on-demand' | 'off';
@@ -22,6 +23,7 @@ interface SkillFluxConfig {
   readonly remoteSearchLimit?: number;
   readonly remoteSearchTimeoutMs?: number;
   readonly catalogDescriptionMaxLength?: number;
+  readonly catalogTokenBudget?: number;
   readonly maxSkillFiles?: number;
   readonly maxSkillBytes?: number;
   readonly installTimeoutMs?: number;
@@ -50,6 +52,7 @@ interface ResolvedSkillFluxConfig {
   readonly remoteSearchLimit: number;
   readonly remoteSearchTimeoutMs: number;
   readonly catalogDescriptionMaxLength: number;
+  readonly catalogTokenBudget: number;
   readonly maxSkillFiles: number;
   readonly maxSkillBytes: number;
   readonly installTimeoutMs: number;
@@ -134,10 +137,15 @@ interface RoutingTrace {
   readonly origin: CandidateOrigin;
   readonly source: string;
   readonly selection: CandidateSelection;
-  readonly outcome: 'selected' | 'mounted';
+  readonly outcome: 'selected' | 'mounted' | 'budget-skipped';
   readonly score: number;
   readonly baseScore?: number;
   readonly adaptiveBoost?: number;
+}
+interface CatalogStats {
+  readonly mountedSkills: number;
+  readonly estimatedTokens: number;
+  readonly budget?: number;
 }
 interface SkillUsageIdentity {
   readonly candidateId: string;
@@ -185,6 +193,44 @@ declare function selectCandidates(query: string, candidates: readonly SkillFluxC
   readonly routes: readonly RouteRule[];
   readonly boosts?: ReadonlyMap<string, number>;
 }): SkillFluxCandidate[];
+//#endregion
+//#region src/catalog.d.ts
+interface SkillCatalogSource {
+  readonly kind: 'skill-catalog';
+  readonly form: 'catalog';
+  readonly update?: true;
+  readonly entries: readonly {
+    readonly name: string;
+    readonly description: string;
+  }[];
+}
+interface SkillFluxCandidatesSource {
+  readonly kind: 'skillflux-candidates';
+  readonly form: 'catalog';
+  readonly update?: true;
+  readonly entries: readonly {
+    readonly id: string;
+    readonly name: string;
+    readonly source: string;
+    readonly ref: string;
+    readonly installs: number;
+  }[];
+}
+type CatalogItem = Pick<SkillSummary, 'name' | 'description'>;
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'skill-catalog': SkillCatalogSource;
+    'skillflux-candidates': SkillFluxCandidatesSource;
+  }
+}
+/**
+ * Estimate prompt tokens conservatively without depending on a model-specific
+ * tokenizer. Three UTF-8 bytes per token slightly overestimates typical
+ * English text while staying close to one token per CJK code point.
+ */
+declare function estimateTextTokens(value: string): number;
+/** Estimate the largest catalog prompt form (the replacement/update form). */
+declare function estimateCatalogTokens(skills: readonly CatalogItem[], maxLength: number): number;
 //#endregion
 //#region src/skill-file.d.ts
 interface ParsedSkillFile {
@@ -333,6 +379,7 @@ declare class SkillFluxService extends Service {
   unmount(agent: Agent, name?: string): void;
   reload(agent: Agent, name: string, signal?: AbortSignal): Promise<MountedSkill>;
   mounted(agent: Agent): readonly MountedSkill[];
+  catalogStats(agent: Agent): CatalogStats;
   lastRouting(agent: Agent): readonly RoutingTrace[];
   usageRecords(limit?: number): Promise<SkillUsageRecord[]>;
   embeddingStats(): EmbeddingRouterStats | undefined;
@@ -351,6 +398,8 @@ declare class SkillFluxService extends Service {
   private routeTurn;
   private mountCandidate;
   private assertCapacity;
+  private assertCatalogBudget;
+  private catalogFitsBudget;
   private selectLocalCandidates;
   private assertStateCurrent;
   private assertMountCurrent;
@@ -358,11 +407,12 @@ declare class SkillFluxService extends Service {
   private state;
   private cleanupState;
   private rememberRouting;
+  private markRoutingOutcome;
   private trackUsage;
   private cleanupSession;
   private disposeSession;
   private disposeAgent;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryClient, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, routeScore, selectCandidates, tokenize };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryClient, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, routeScore, selectCandidates, tokenize };
 //# sourceMappingURL=index.d.ts.map
