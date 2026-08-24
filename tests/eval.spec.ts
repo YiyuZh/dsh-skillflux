@@ -24,6 +24,7 @@ interface EvalCase {
   readonly limit?: number
   readonly minScore?: number
   readonly routes?: RouteRule[]
+  readonly boosts?: Readonly<Record<string, number>>
 }
 
 interface EvalCorpus {
@@ -142,6 +143,14 @@ function parseCase(value: unknown, index: number): EvalCase {
     if (!Array.isArray(item.routes)) throw new TypeError(`${label}.routes must be an array`)
     routes = item.routes.map((route, routeIndex) => parseRoute(route, `${label}.routes[${routeIndex}]`))
   }
+  let boosts: Record<string, number> | undefined
+  if (item.boosts !== undefined) {
+    const rawBoosts = record(item.boosts, `${label}.boosts`)
+    boosts = {}
+    for (const [key, boost] of Object.entries(rawBoosts)) {
+      boosts[nonEmptyString(key, `${label}.boosts key`)] = integer(boost, `${label}.boosts.${key}`, 0, 20)
+    }
+  }
   return {
     id: nonEmptyString(item.id, `${label}.id`),
     category: nonEmptyString(item.category, `${label}.category`),
@@ -152,6 +161,7 @@ function parseCase(value: unknown, index: number): EvalCase {
     ...(limit === undefined ? {} : { limit }),
     ...(minScore === undefined ? {} : { minScore }),
     ...(routes === undefined ? {} : { routes }),
+    ...(boosts === undefined ? {} : { boosts }),
   }
 }
 
@@ -185,6 +195,9 @@ function validateCorpus(corpus: EvalCorpus): EvalCorpus {
     }
     for (const key of testCase.expectedForced ?? []) {
       if (!testCase.expected.includes(key)) throw new TypeError(`${testCase.id} forces unexpected candidate ${key}`)
+    }
+    for (const key of Object.keys(testCase.boosts ?? {})) {
+      if (!testCase.pool.includes(key)) throw new TypeError(`${testCase.id} boosts ${key} outside its pool`)
     }
     if (testCase.expected.length > (testCase.limit ?? corpus.defaults.limit)) {
       throw new TypeError(`${testCase.id}.expected exceeds its selector limit`)
@@ -342,6 +355,7 @@ describe('routing evaluation corpus', () => {
         limit: testCase.limit ?? corpus.defaults.limit,
         minScore: testCase.minScore ?? corpus.defaults.minScore,
         routes: testCase.routes ?? [],
+        ...(testCase.boosts === undefined ? {} : { boosts: new Map(Object.entries(testCase.boosts)) }),
       })
       return {
         testCase,

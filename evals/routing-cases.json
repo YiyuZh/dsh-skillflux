@@ -577,6 +577,47 @@
       "task": "Statistics",
       "pool": ["when-to-use-statistics"],
       "expected": ["when-to-use-statistics"]
+    },
+    {
+      "id": "adaptive-reorders-equal-relevant-candidates",
+      "category": "adaptive",
+      "task": "Inspect service logs",
+      "pool": ["alpha-log-tool", "beta-log-tool"],
+      "limit": 1,
+      "boosts": { "alpha-log-tool": 6 },
+      "expected": ["alpha-log-tool"]
+    },
+    {
+      "id": "adaptive-cannot-resurrect-irrelevant-candidate",
+      "category": "adaptive",
+      "task": "Book a flight to Tokyo",
+      "pool": ["pdf-registry"],
+      "boosts": { "pdf-registry": 20 },
+      "expected": []
+    },
+    {
+      "id": "adaptive-cannot-cross-default-threshold",
+      "category": "adaptive",
+      "task": "Statistics",
+      "pool": ["description-only-statistics"],
+      "boosts": { "description-only-statistics": 20 },
+      "expected": []
+    },
+    {
+      "id": "adaptive-does-not-displace-rule",
+      "category": "adaptive",
+      "task": "Convert this PDF",
+      "pool": ["pdf-registry", "markdown-converter"],
+      "limit": 1,
+      "routes": [
+        {
+          "matchAll": ["convert", "pdf"],
+          "skills": ["markdown-converter"]
+        }
+      ],
+      "boosts": { "pdf-registry": 20 },
+      "expected": ["markdown-converter"],
+      "expectedForced": ["markdown-converter"]
     }
   ]
 }

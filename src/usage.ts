@@ -1,0 +1,268 @@
+import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
+import type { SkillFluxCandidate, SkillUsageIdentity, SkillUsageRecord } from './types.js'
+
+const USAGE_VERSION = 1
+const MAX_USAGE_FILE_BYTES = 2 * 1024 * 1024
+const MAX_USAGE_RECORDS = 5_000
+const DAY_MS = 24 * 60 * 60 * 1_000
+
+interface UsageDocument {
+  readonly version: 1
+  readonly records: readonly SkillUsageRecord[]
+}
+
+export interface UsageStoreOptions {
+  readonly file: string
+  readonly maxEntries: number
+  readonly now?: () => number
+  readonly warn?: (message: string) => void
+}
+
+export interface AdaptiveUsageOptions {
+  readonly maxBoost: number
+  readonly minUses: number
+  readonly halfLifeDays: number
+}
+
+function boundedString(value: unknown, maximum: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maximum
+}
+
+function count(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function timestamp(value: unknown): value is number | undefined {
+  return value === undefined || count(value)
+}
+
+function validRecord(value: unknown): value is SkillUsageRecord {
+  if (typeof value !== 'object' || value === null) return false
+  const item = value as Record<string, unknown>
+  return boundedString(item.candidateId, 512)
+    && boundedString(item.name, 128)
+    && (item.origin === 'registry' || item.origin === 'cache' || item.origin === 'remote')
+    && boundedString(item.source, 2_048)
+    && count(item.mounts)
+    && count(item.uses)
+    && timestamp(item.lastMountedAt)
+    && timestamp(item.lastUsedAt)
+}
+
+function validDocument(value: unknown): value is UsageDocument {
+  if (typeof value !== 'object' || value === null) return false
+  const document = value as Record<string, unknown>
+  if (document.version !== USAGE_VERSION || !Array.isArray(document.records)) return false
+  if (document.records.length > MAX_USAGE_RECORDS || !document.records.every(validRecord)) return false
+  return new Set(document.records.map(record => record.candidateId)).size === document.records.length
+}
+
+function usageOrder(left: SkillUsageRecord, right: SkillUsageRecord): number {
+  if (left.uses !== right.uses) return right.uses - left.uses
+  if (left.mounts !== right.mounts) return right.mounts - left.mounts
+  if ((left.lastUsedAt ?? 0) !== (right.lastUsedAt ?? 0)) return (right.lastUsedAt ?? 0) - (left.lastUsedAt ?? 0)
+  if ((left.lastMountedAt ?? 0) !== (right.lastMountedAt ?? 0)) {
+    return (right.lastMountedAt ?? 0) - (left.lastMountedAt ?? 0)
+  }
+  return left.candidateId.localeCompare(right.candidateId, 'en')
+}
+
+function evictionOrder(left: SkillUsageRecord, right: SkillUsageRecord): number {
+  const leftRecent = Math.max(left.lastUsedAt ?? 0, left.lastMountedAt ?? 0)
+  const rightRecent = Math.max(right.lastUsedAt ?? 0, right.lastMountedAt ?? 0)
+  if (leftRecent !== rightRecent) return leftRecent - rightRecent
+  if (left.uses !== right.uses) return left.uses - right.uses
+  if (left.mounts !== right.mounts) return left.mounts - right.mounts
+  return left.candidateId.localeCompare(right.candidateId, 'en')
+}
+
+function identityRecord(identity: SkillUsageIdentity): SkillUsageRecord {
+  if (!validRecord({ ...identity, mounts: 0, uses: 0 })) throw new Error('invalid SkillFlux usage identity')
+  return { ...identity, mounts: 0, uses: 0 }
+}
+
+function increment(value: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, value + 1)
+}
+
+export class UsageStore {
+  private readonly now: () => number
+  private records: Map<string, SkillUsageRecord> | undefined
+  private loadTask: Promise<Map<string, SkillUsageRecord>> | undefined
+  private writeQueue: Promise<void> = Promise.resolve()
+
+  constructor(private readonly options: UsageStoreOptions) {
+    if (!Number.isSafeInteger(options.maxEntries) || options.maxEntries < 1 || options.maxEntries > MAX_USAGE_RECORDS) {
+      throw new Error(`usage maxEntries must be between 1 and ${MAX_USAGE_RECORDS}`)
+    }
+    this.now = options.now ?? Date.now
+  }
+
+  async recordMount(identity: SkillUsageIdentity): Promise<void> {
+    await this.enqueue(async records => {
+      const previous = records.get(identity.candidateId) ?? identityRecord(identity)
+      records.set(identity.candidateId, {
+        ...identityRecord(identity),
+        mounts: increment(previous.mounts),
+        uses: previous.uses,
+        ...(previous.lastUsedAt === undefined ? {} : { lastUsedAt: previous.lastUsedAt }),
+        lastMountedAt: this.currentTime(),
+      })
+    })
+  }
+
+  async recordUse(identity: SkillUsageIdentity): Promise<void> {
+    await this.enqueue(async records => {
+      const previous = records.get(identity.candidateId) ?? identityRecord(identity)
+      records.set(identity.candidateId, {
+        ...identityRecord(identity),
+        mounts: previous.mounts,
+        uses: increment(previous.uses),
+        ...(previous.lastMountedAt === undefined ? {} : { lastMountedAt: previous.lastMountedAt }),
+        lastUsedAt: this.currentTime(),
+      })
+    })
+  }
+
+  async list(limit = this.options.maxEntries): Promise<SkillUsageRecord[]> {
+    await this.writeQueue
+    const records = await this.load()
+    return [...records.values()]
+      .sort(usageOrder)
+      .slice(0, Math.max(0, Math.min(limit, this.options.maxEntries)))
+      .map(record => ({ ...record }))
+  }
+
+  async boosts(
+    candidates: readonly SkillFluxCandidate[],
+    options: AdaptiveUsageOptions,
+  ): Promise<ReadonlyMap<string, number>> {
+    if (!Number.isSafeInteger(options.maxBoost) || options.maxBoost < 0 || options.maxBoost > 20) {
+      throw new Error('adaptive maxBoost must be an integer from 0 to 20')
+    }
+    if (!Number.isSafeInteger(options.minUses) || options.minUses < 1 || options.minUses > 1_000) {
+      throw new Error('adaptive minUses must be an integer from 1 to 1000')
+    }
+    if (!Number.isFinite(options.halfLifeDays) || options.halfLifeDays < 0.1 || options.halfLifeDays > 3_650) {
+      throw new Error('adaptive halfLifeDays must be from 0.1 to 3650')
+    }
+    await this.writeQueue
+    const records = await this.load()
+    const result = new Map<string, number>()
+    const now = this.currentTime()
+    for (const candidate of candidates) {
+      const record = records.get(candidate.id)
+      if (record === undefined || record.uses < options.minUses || record.lastUsedAt === undefined) continue
+      const frequency = 1 - Math.exp(-record.uses / 4)
+      const ageDays = Math.max(0, now - record.lastUsedAt) / DAY_MS
+      const recency = 0.5 ** (ageDays / options.halfLifeDays)
+      const boost = Math.round(options.maxBoost * frequency * recency)
+      if (boost > 0) result.set(candidate.id, Math.min(boost, options.maxBoost))
+    }
+    return result
+  }
+
+  async flush(): Promise<void> {
+    await this.writeQueue
+  }
+
+  private async enqueue(update: (records: Map<string, SkillUsageRecord>) => Promise<void>): Promise<void> {
+    const task = this.writeQueue.then(async () => {
+      const records = await this.load()
+      await update(records)
+      this.trim(records)
+      await this.save(records)
+    })
+    this.writeQueue = task.catch(() => undefined)
+    await task
+  }
+
+  private async load(): Promise<Map<string, SkillUsageRecord>> {
+    if (this.records !== undefined) return this.records
+    if (this.loadTask !== undefined) return await this.loadTask
+    this.loadTask = this.readDocument()
+    try {
+      this.records = await this.loadTask
+      this.trim(this.records)
+      return this.records
+    } finally {
+      this.loadTask = undefined
+    }
+  }
+
+  private async readDocument(): Promise<Map<string, SkillUsageRecord>> {
+    try {
+      const metadata = await stat(this.options.file)
+      if (!metadata.isFile() || metadata.size > MAX_USAGE_FILE_BYTES) {
+        this.warn(`SkillFlux usage data is invalid or exceeds ${MAX_USAGE_FILE_BYTES} bytes; starting with empty statistics.`)
+        return new Map()
+      }
+      const parsed = JSON.parse(await readFile(this.options.file, 'utf8')) as unknown
+      if (!validDocument(parsed)) {
+        this.warn('SkillFlux usage data failed validation; starting with empty statistics.')
+        return new Map()
+      }
+      return new Map(parsed.records.map(record => [record.candidateId, { ...record }]))
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Map()
+      this.warn(`SkillFlux usage data could not be read; starting with empty statistics: ${errorMessage(error)}`)
+      return new Map()
+    }
+  }
+
+  private trim(records: Map<string, SkillUsageRecord>): void {
+    const excess = records.size - this.options.maxEntries
+    if (excess <= 0) return
+    for (const record of [...records.values()].sort(evictionOrder).slice(0, excess)) records.delete(record.candidateId)
+  }
+
+  private async save(records: Map<string, SkillUsageRecord>): Promise<void> {
+    const directory = dirname(this.options.file)
+    const temporary = join(directory, `.${basename(this.options.file)}.${randomUUID()}.tmp`)
+    const serialized = this.serializeWithinLimit(records)
+    await mkdir(directory, { recursive: true })
+    try {
+      await writeFile(temporary, serialized, { encoding: 'utf8', flag: 'wx' })
+      await rename(temporary, this.options.file)
+    } catch (error: unknown) {
+      await unlink(temporary).catch(() => undefined)
+      throw error
+    }
+  }
+
+  private serializeWithinLimit(records: Map<string, SkillUsageRecord>): string {
+    const prefix = `{"version":${USAGE_VERSION},"records":[`
+    const suffix = ']}\n'
+    let bytes = Buffer.byteLength(prefix) + Buffer.byteLength(suffix)
+    const kept = new Map<string, string>()
+    for (const record of [...records.values()].sort((left, right) => evictionOrder(right, left))) {
+      const serialized = JSON.stringify(record)
+      const nextBytes = Buffer.byteLength(serialized) + (kept.size === 0 ? 0 : 1)
+      if (bytes + nextBytes > MAX_USAGE_FILE_BYTES) continue
+      kept.set(record.candidateId, serialized)
+      bytes += nextBytes
+    }
+    for (const candidateId of records.keys()) if (!kept.has(candidateId)) records.delete(candidateId)
+    const body = [...kept.entries()]
+      .sort(([left], [right]) => left.localeCompare(right, 'en'))
+      .map(([, serialized]) => serialized)
+      .join(',')
+    return `${prefix}${body}${suffix}`
+  }
+
+  private warn(message: string): void {
+    this.options.warn?.(message)
+  }
+
+  private currentTime(): number {
+    const value = this.now()
+    if (!count(value)) throw new Error('usage clock must return a non-negative safe integer')
+    return value
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}

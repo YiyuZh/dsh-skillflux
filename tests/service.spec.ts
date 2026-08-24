@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { agentEvents, Inbox, type Agent } from '@deepseek-ai/dsh-agent'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
@@ -8,17 +11,21 @@ import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import SkillFluxService, { type SkillFluxConfig } from '../src/index.js'
+import SkillFluxService, { UsageStore, type SkillFluxConfig } from '../src/index.js'
 import PublishedSkillFluxService from '../lib/index.js'
 import { candidateId } from '../src/router.js'
 import type { CacheEntry, SkillFluxCandidate } from '../src/types.js'
 import type { SkillDefinition } from '@deepseek-ai/dsh-skill'
 
 const disposers: Array<() => Promise<void>> = []
+const roots: string[] = []
 
 afterEach(async () => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
   for (const dispose of disposers.splice(0).reverse()) await dispose()
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
 
 async function mount(context: Context, plugin: Parameters<Context['plugin']>[0], config?: unknown): Promise<void> {
@@ -40,6 +47,7 @@ async function setup(
   await mount(context, plugin, {
     maxActiveSkills: 3,
     remoteDiscovery: 'off',
+    usageTracking: false,
     routes: [{ matchAny: ['pdf'], skills: ['skill-1', 'skill-2', 'skill-3', 'skill-4'] }],
     ...overrides,
   })
@@ -81,6 +89,12 @@ async function propose(
 }
 
 describe('SkillFlux service', () => {
+  it('rejects adaptive routing when local usage tracking is disabled', async () => {
+    await expect(setup({ usageTracking: false, adaptiveRouting: true })).rejects.toThrow(
+      'adaptiveRouting requires usageTracking',
+    )
+  })
+
   it('virtualizes a large registry to the configured active catalog', async () => {
     const context = await setup()
     for (let index = 0; index < 100; index += 1) {
@@ -693,6 +707,222 @@ describe('SkillFlux service', () => {
       agent,
       candidateId('registry', 'provider-a', '', 'published-moving-skill'),
     )).rejects.toThrow('provider changed; search again')
+    expect(context.skillFlux.mounted(agent)).toEqual([])
+  })
+
+  it('uses embeddings only to fill lexical routing gaps', async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { input: string[] }
+      return new Response(JSON.stringify({
+        embeddings: request.input.map(text => {
+          if (text.includes('calendar')) return [0, 1]
+          return [1, 0]
+        }),
+      }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const context = await setup({
+      maxActiveSkills: 1,
+      routes: [],
+      routerMode: 'hybrid',
+      embeddingCandidateLimit: 8,
+    })
+    context.skills.register({
+      name: 'ocr-reader',
+      description: 'Extract printed words from images',
+      source: 'runtime',
+      content: 'OCR instructions.',
+    })
+    context.skills.register({
+      name: 'calendar-agent',
+      description: 'Manage calendar meetings and events',
+      source: 'runtime',
+      content: 'Calendar instructions.',
+    })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Make this scanned receipt searchable' }],
+      source: { kind: 'user' },
+    })
+    await propose(context, agent, [user])
+    expect(context.skillFlux.mounted(agent).map(skill => skill.name)).toEqual(['ocr-reader'])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(context.skillFlux.embeddingStats()).toMatchObject({ requests: 1, cacheEntries: 3 })
+  })
+
+  it('does not call embeddings when lexical routing already fills the catalog', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const context = await setup({
+      maxActiveSkills: 1,
+      routes: [],
+      routerMode: 'hybrid',
+    })
+    context.skills.register({
+      name: 'pdf-reader',
+      description: 'Read PDF documents',
+      source: 'runtime',
+      content: 'PDF instructions.',
+    })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Read this PDF' }],
+      source: { kind: 'user' },
+    })
+    await propose(context, agent, [user])
+    expect(context.skillFlux.mounted(agent).map(skill => skill.name)).toEqual(['pdf-reader'])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps a detached explanation of the latest routing decision after turn cleanup', async () => {
+    const context = await setup({ maxActiveSkills: 1, routes: [] })
+    context.skills.register({
+      name: 'pdf-reader',
+      description: 'Read PDF documents',
+      source: 'runtime',
+      content: 'PDF instructions.',
+    })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Read this PDF document' }],
+      source: { kind: 'user' },
+    })
+    await propose(context, agent, [user])
+    const trace = context.skillFlux.lastRouting(agent)
+    expect(trace).toMatchObject([{
+      name: 'pdf-reader',
+      selection: 'lexical',
+      outcome: 'mounted',
+      adaptiveBoost: 0,
+      origin: 'registry',
+    }])
+    expect(trace[0]?.baseScore).toBeGreaterThanOrEqual(8)
+    ;(trace[0] as unknown as { name: string }).name = 'changed'
+    expect(context.skillFlux.lastRouting(agent)[0]?.name).toBe('pdf-reader')
+    const explained = await context.commands.execute(
+      agent,
+      '/skillflux explain',
+      [],
+      new AbortController().signal,
+    )
+    expect(explained?.result).toMatchObject({ kind: 'success' })
+    expect(explained?.result.text).toContain('pdf-reader [lexical, mounted]')
+    const usage = await context.commands.execute(
+      agent,
+      '/skillflux usage',
+      [],
+      new AbortController().signal,
+    )
+    expect(usage?.result.text).toBe('SkillFlux usage tracking is disabled.')
+
+    context.emit(scopeTarget(agent.session, undefined), 'session/event', agent.session, {
+      type: 'turn/end', seq: 1, time: 1, data: { turn: 1, reason: { kind: 'completed' } },
+    })
+    expect(context.skillFlux.mounted(agent)).toEqual([])
+    expect(context.skillFlux.lastRouting(agent)[0]?.name).toBe('pdf-reader')
+  })
+
+  it('persists only bounded candidate usage metadata after successful loads', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-service-usage-'))
+    roots.push(root)
+    vi.stubEnv('DSH_HOME', root)
+    const context = await setup({ maxActiveSkills: 1, routes: [], usageTracking: true })
+    context.skills.register({
+      name: 'pdf-reader',
+      description: 'Read PDF documents',
+      source: 'runtime',
+      content: 'PRIVATE SKILL INSTRUCTIONS',
+    })
+    const agent = fakeAgent(context)
+    const task = 'PRIVATE USER TASK: read this PDF'
+    const user = createUserMessage({ content: [{ type: 'text', text: task }], source: { kind: 'user' } })
+    await propose(context, agent, [user])
+    expect(await context.skillFlux.usageRecords()).toMatchObject([{ mounts: 1, uses: 0, name: 'pdf-reader' }])
+
+    const loaded = await context.tools.execute({
+      callId: CallId('skillflux-usage-load'),
+      name: 'skill',
+      arguments: { name: 'pdf-reader' },
+      agent,
+      signal: new AbortController().signal,
+    })
+    expect(loaded.isError).toBe(false)
+    expect(await context.skillFlux.usageRecords()).toMatchObject([{ mounts: 1, uses: 1, name: 'pdf-reader' }])
+    const raw = await readFile(join(root, 'storages', 'skillflux', 'usage.json'), 'utf8')
+    expect(raw).not.toContain(task)
+    expect(raw).not.toContain('PRIVATE SKILL INSTRUCTIONS')
+
+    const usage = await context.commands.execute(agent, '/skillflux usage', [], new AbortController().signal)
+    expect(usage?.result.text).toContain('uses 1, mounts 1')
+  })
+
+  it('applies persisted adaptive history only to lexically relevant candidates', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-service-adaptive-'))
+    roots.push(root)
+    vi.stubEnv('DSH_HOME', root)
+    const experiencedId = candidateId('registry', 'runtime', '', 'second-skill')
+    const store = new UsageStore({
+      file: join(root, 'storages', 'skillflux', 'usage.json'),
+      maxEntries: 100,
+    })
+    const experienced = {
+      candidateId: experiencedId,
+      name: 'second-skill',
+      origin: 'registry' as const,
+      source: 'runtime',
+    }
+    await store.recordUse(experienced)
+    await store.recordUse(experienced)
+
+    const context = await setup({
+      maxActiveSkills: 1,
+      routes: [],
+      usageTracking: true,
+      adaptiveRouting: true,
+      minRouteScore: 8,
+    })
+    for (const name of ['first-skill', 'second-skill']) {
+      context.skills.register({
+        name,
+        description: 'Analyze PDF documents',
+        whenToUse: 'Analyze PDF documents',
+        source: 'runtime',
+        content: `${name} instructions`,
+      })
+    }
+    context.skills.register({
+      name: 'frequent-travel',
+      description: 'Book airline tickets',
+      source: 'runtime',
+      content: 'Travel instructions',
+    })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Analyze this PDF document' }],
+      source: { kind: 'user' },
+    })
+    await propose(context, agent, [user])
+    expect(context.skillFlux.mounted(agent).map(skill => skill.name)).toEqual(['second-skill'])
+    expect(context.skillFlux.lastRouting(agent)[0]).toMatchObject({
+      name: 'second-skill', selection: 'lexical', outcome: 'mounted', adaptiveBoost: 2,
+    })
+  })
+
+  it('fails open to lexical routing when the embedding endpoint is unavailable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('unavailable', { status: 503 })))
+    const context = await setup({ routes: [], routerMode: 'hybrid' })
+    context.skills.register({
+      name: 'ocr-reader',
+      description: 'Extract printed words from images',
+      source: 'runtime',
+      content: 'OCR instructions.',
+    })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Make this scanned receipt searchable' }],
+      source: { kind: 'user' },
+    })
+    await expect(propose(context, agent, [user])).resolves.toMatchObject({ kind: 'enter' })
     expect(context.skillFlux.mounted(agent)).toEqual([])
   })
 })

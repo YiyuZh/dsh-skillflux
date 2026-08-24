@@ -16,25 +16,35 @@ import {
 import { defineTool, type PreToolDecision, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { SkillCache } from './cache.js'
 import { updateCatalog, updateRemoteCandidates } from './catalog.js'
+import { EmbeddingRouter } from './embedding.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { cacheCandidates, registryCandidates, selectCandidates, tokenize } from './router.js'
+import { UsageStore } from './usage.js'
 import type {
   CacheEntry,
+  EmbeddingRouterStats,
   MountedSkill,
   RemoteCandidate,
   ResolvedSkillFluxConfig,
+  RoutingTrace,
   SkillFluxCandidate,
   SkillFluxConfig,
+  SkillUsageIdentity,
+  SkillUsageRecord,
 } from './types.js'
 
 export type * from './types.js'
 export { normalizeText, routeScore, selectCandidates, tokenize } from './router.js'
 export { parseSkillMarkdown, inspectSkillDirectory } from './skill-file.js'
 export { SkillCache, isLoopbackProxyFailure } from './cache.js'
+export { EmbeddingRouter, type EmbeddingRouterOptions } from './embedding.js'
 export { RemoteDiscoveryClient } from './remote.js'
+export { UsageStore, type AdaptiveUsageOptions, type UsageStoreOptions } from './usage.js'
 
 export const name = 'skillflux'
 const MOUNT_TOOL = 'skillflux_mount'
+const OLLAMA_EMBEDDING_ENDPOINT = 'http://127.0.0.1:11434/api/embed'
+const OPENAI_EMBEDDING_ENDPOINT = 'https://api.openai.com/v1/embeddings'
 const DEFAULTS: ResolvedSkillFluxConfig = {
   maxActiveSkills: 3,
   minRouteScore: 8,
@@ -46,6 +56,21 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   maxSkillFiles: 1_000,
   maxSkillBytes: 10 * 1024 * 1024,
   installTimeoutMs: 300_000,
+  routerMode: 'lexical',
+  embeddingProvider: 'ollama',
+  embeddingEndpoint: OLLAMA_EMBEDDING_ENDPOINT,
+  embeddingModel: 'embeddinggemma',
+  embeddingApiKeyEnv: 'SKILLFLUX_EMBEDDING_API_KEY',
+  embeddingTimeoutMs: 5_000,
+  embeddingCandidateLimit: 128,
+  embeddingCacheSize: 512,
+  minEmbeddingSimilarity: 0.45,
+  usageTracking: true,
+  usageMaxEntries: 1_000,
+  adaptiveRouting: false,
+  adaptiveMaxBoost: 6,
+  adaptiveMinUses: 2,
+  adaptiveHalfLifeDays: 30,
   routes: [],
 }
 
@@ -57,6 +82,7 @@ interface AgentState {
   readonly active: Map<string, MountedSkill>
   readonly disposers: Map<string, () => void>
   readonly candidates: Map<string, SkillFluxCandidate>
+  lastRouting: RoutingTrace[]
 }
 
 class ExpiredAgentStateError extends Error {
@@ -85,8 +111,52 @@ function positiveInteger(name: string, value: number, minimum = 1): number {
   return value
 }
 
+function boundedNumber(name: string, value: number, minimum: number, maximum: number): number {
+  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error(`dsh-skillflux: ${name} must be between ${minimum} and ${maximum}`)
+  }
+  return value
+}
+
+function boundedInteger(name: string, value: number, minimum: number, maximum: number): number {
+  positiveInteger(name, value, minimum)
+  if (value > maximum) throw new Error(`dsh-skillflux: ${name} must be less than or equal to ${maximum}`)
+  return value
+}
+
+function nonEmptyString(name: string, value: string): string {
+  const normalized = value.trim()
+  if (normalized.length === 0) throw new Error(`dsh-skillflux: ${name} must not be empty`)
+  return normalized
+}
+
+function embeddingEndpoint(value: string): string {
+  let endpoint: URL
+  try {
+    endpoint = new URL(nonEmptyString('embeddingEndpoint', value))
+  } catch {
+    throw new Error('dsh-skillflux: embeddingEndpoint must be an absolute URL')
+  }
+  if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
+    throw new Error('dsh-skillflux: embeddingEndpoint must use http or https')
+  }
+  if (endpoint.username.length > 0 || endpoint.password.length > 0 || endpoint.hash.length > 0) {
+    throw new Error('dsh-skillflux: embeddingEndpoint must not contain credentials or a fragment')
+  }
+  return endpoint.toString()
+}
+
+function environmentVariable(value: string): string {
+  const name = nonEmptyString('embeddingApiKeyEnv', value)
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) {
+    throw new Error('dsh-skillflux: embeddingApiKeyEnv must be an environment variable name')
+  }
+  return name
+}
+
 function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
-  return {
+  const embeddingProvider = config.embeddingProvider ?? DEFAULTS.embeddingProvider
+  const resolved: ResolvedSkillFluxConfig = {
     maxActiveSkills: positiveInteger('maxActiveSkills', config.maxActiveSkills ?? DEFAULTS.maxActiveSkills),
     minRouteScore: positiveInteger('minRouteScore', config.minRouteScore ?? DEFAULTS.minRouteScore, 0),
     approvalPolicy: config.approvalPolicy ?? DEFAULTS.approvalPolicy,
@@ -101,8 +171,71 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
     maxSkillFiles: positiveInteger('maxSkillFiles', config.maxSkillFiles ?? DEFAULTS.maxSkillFiles),
     maxSkillBytes: positiveInteger('maxSkillBytes', config.maxSkillBytes ?? DEFAULTS.maxSkillBytes),
     installTimeoutMs: positiveInteger('installTimeoutMs', config.installTimeoutMs ?? DEFAULTS.installTimeoutMs),
+    routerMode: config.routerMode ?? DEFAULTS.routerMode,
+    embeddingProvider,
+    embeddingEndpoint: embeddingEndpoint(config.embeddingEndpoint ?? (embeddingProvider === 'ollama'
+      ? OLLAMA_EMBEDDING_ENDPOINT
+      : OPENAI_EMBEDDING_ENDPOINT)),
+    embeddingModel: nonEmptyString('embeddingModel', config.embeddingModel ?? (embeddingProvider === 'ollama'
+      ? DEFAULTS.embeddingModel
+      : 'text-embedding-3-small')),
+    embeddingApiKeyEnv: environmentVariable(config.embeddingApiKeyEnv ?? DEFAULTS.embeddingApiKeyEnv),
+    embeddingTimeoutMs: boundedInteger(
+      'embeddingTimeoutMs',
+      config.embeddingTimeoutMs ?? DEFAULTS.embeddingTimeoutMs,
+      100,
+      120_000,
+    ),
+    embeddingCandidateLimit: boundedInteger(
+      'embeddingCandidateLimit',
+      config.embeddingCandidateLimit ?? DEFAULTS.embeddingCandidateLimit,
+      1,
+      512,
+    ),
+    embeddingCacheSize: boundedInteger(
+      'embeddingCacheSize',
+      config.embeddingCacheSize ?? DEFAULTS.embeddingCacheSize,
+      1,
+      10_000,
+    ),
+    minEmbeddingSimilarity: boundedNumber(
+      'minEmbeddingSimilarity',
+      config.minEmbeddingSimilarity ?? DEFAULTS.minEmbeddingSimilarity,
+      0,
+      1,
+    ),
+    usageTracking: config.usageTracking ?? DEFAULTS.usageTracking,
+    usageMaxEntries: boundedInteger(
+      'usageMaxEntries',
+      config.usageMaxEntries ?? DEFAULTS.usageMaxEntries,
+      1,
+      5_000,
+    ),
+    adaptiveRouting: config.adaptiveRouting ?? DEFAULTS.adaptiveRouting,
+    adaptiveMaxBoost: boundedInteger(
+      'adaptiveMaxBoost',
+      config.adaptiveMaxBoost ?? DEFAULTS.adaptiveMaxBoost,
+      0,
+      20,
+    ),
+    adaptiveMinUses: boundedInteger(
+      'adaptiveMinUses',
+      config.adaptiveMinUses ?? DEFAULTS.adaptiveMinUses,
+      1,
+      1_000,
+    ),
+    adaptiveHalfLifeDays: boundedNumber(
+      'adaptiveHalfLifeDays',
+      config.adaptiveHalfLifeDays ?? DEFAULTS.adaptiveHalfLifeDays,
+      0.1,
+      3_650,
+    ),
     routes: config.routes ?? DEFAULTS.routes,
   }
+  if (resolved.adaptiveRouting && !resolved.usageTracking) {
+    throw new Error('dsh-skillflux: adaptiveRouting requires usageTracking')
+  }
+  return resolved
 }
 
 function directTask(messages: readonly UserMessage[]): string | undefined {
@@ -208,6 +341,21 @@ export class SkillFluxService extends Service {
     maxSkillFiles: z.number().default(DEFAULTS.maxSkillFiles),
     maxSkillBytes: z.number().default(DEFAULTS.maxSkillBytes),
     installTimeoutMs: z.number().default(DEFAULTS.installTimeoutMs),
+    routerMode: z.union(['lexical', 'hybrid'] as const).default(DEFAULTS.routerMode),
+    embeddingProvider: z.union(['ollama', 'openai-compatible'] as const).default(DEFAULTS.embeddingProvider),
+    embeddingEndpoint: z.string(),
+    embeddingModel: z.string(),
+    embeddingApiKeyEnv: z.string().default(DEFAULTS.embeddingApiKeyEnv),
+    embeddingTimeoutMs: z.number().default(DEFAULTS.embeddingTimeoutMs),
+    embeddingCandidateLimit: z.number().default(DEFAULTS.embeddingCandidateLimit),
+    embeddingCacheSize: z.number().default(DEFAULTS.embeddingCacheSize),
+    minEmbeddingSimilarity: z.number().default(DEFAULTS.minEmbeddingSimilarity),
+    usageTracking: z.boolean().default(DEFAULTS.usageTracking),
+    usageMaxEntries: z.number().default(DEFAULTS.usageMaxEntries),
+    adaptiveRouting: z.boolean().default(DEFAULTS.adaptiveRouting),
+    adaptiveMaxBoost: z.number().default(DEFAULTS.adaptiveMaxBoost),
+    adaptiveMinUses: z.number().default(DEFAULTS.adaptiveMinUses),
+    adaptiveHalfLifeDays: z.number().default(DEFAULTS.adaptiveHalfLifeDays),
     routes: z.array(routeRuleSchema).default([]),
   })
 
@@ -215,6 +363,9 @@ export class SkillFluxService extends Service {
   private readonly runtimeCtx: Context
   private readonly cache: SkillCache
   private readonly remote: RemoteDiscoveryClient
+  private readonly embedding: EmbeddingRouter | undefined
+  private readonly usage: UsageStore | undefined
+  private readonly usageTasks = new Set<Promise<void>>()
   private readonly stateByAgent = new WeakMap<Agent, AgentState>()
   private readonly states = new Set<AgentState>()
   private readonly trustedBySession = new WeakMap<Session, Set<string>>()
@@ -230,6 +381,25 @@ export class SkillFluxService extends Service {
       installTimeoutMs: this.config.installTimeoutMs,
     })
     this.remote = new RemoteDiscoveryClient(this.config.remoteSearchLimit, this.config.remoteSearchTimeoutMs)
+    this.usage = this.config.usageTracking
+      ? new UsageStore({
+          file: dshHomePath('storages', 'skillflux', 'usage.json'),
+          maxEntries: this.config.usageMaxEntries,
+          warn: message => { ctx.logger.warn(message) },
+        })
+      : undefined
+    this.embedding = this.config.routerMode === 'hybrid'
+      ? new EmbeddingRouter({
+          provider: this.config.embeddingProvider,
+          endpoint: this.config.embeddingEndpoint,
+          model: this.config.embeddingModel,
+          apiKeyEnv: this.config.embeddingApiKeyEnv,
+          timeoutMs: this.config.embeddingTimeoutMs,
+          candidateLimit: this.config.embeddingCandidateLimit,
+          cacheSize: this.config.embeddingCacheSize,
+          minSimilarity: this.config.minEmbeddingSimilarity,
+        })
+      : undefined
 
     const skillTool = this.createSkillTool()
     ctx.tools.register(skillTool)
@@ -308,11 +478,14 @@ export class SkillFluxService extends Service {
     const cached = await this.cache.list()
     options.signal?.throwIfAborted()
     const local = dedupeByName([...registryCandidates(installed), ...cacheCandidates(cached)])
-    const selected = selectCandidates(query, local, {
-      limit: this.config.remoteSearchLimit,
-      minScore: this.config.minRouteScore,
-      routes: this.config.routes,
-    })
+    const selected = await this.selectLocalCandidates(
+      query,
+      local,
+      this.config.remoteSearchLimit,
+      this.config.remoteSearchLimit,
+      options.signal,
+    )
+    options.signal?.throwIfAborted()
     if (options.remote !== true || this.config.remoteDiscovery === 'off') return selected
     const remote = await this.remote.search(query, options.signal)
     options.signal?.throwIfAborted()
@@ -362,6 +535,19 @@ export class SkillFluxService extends Service {
     return [...(this.stateByAgent.get(agent)?.active.values() ?? [])]
   }
 
+  lastRouting(agent: Agent): readonly RoutingTrace[] {
+    return (this.stateByAgent.get(agent)?.lastRouting ?? []).map(trace => ({ ...trace }))
+  }
+
+  async usageRecords(limit = 20): Promise<SkillUsageRecord[]> {
+    await Promise.all(this.usageTasks)
+    return await this.usage?.list(limit) ?? []
+  }
+
+  embeddingStats(): EmbeddingRouterStats | undefined {
+    return this.embedding?.stats()
+  }
+
   async listCache(): Promise<CacheEntry[]> {
     return await this.cache.list()
   }
@@ -392,6 +578,7 @@ export class SkillFluxService extends Service {
         const active = this.stateByAgent.get(agent)?.active.get(args.name)
         if (active === undefined) throw new Error(`skill "${args.name}" is not mounted for this turn`)
         if (!isModelInvocable(active.definition)) throw new Error(`skill "${args.name}" is not model-invocable`)
+        this.trackUsage(this.usage?.recordUse(usageIdentity(active)))
         return skillResult(active.definition)
       },
       presentCall: args => ({ card: 'generic', title: `Load skill ${args.name}`, kind: 'read', rawInput: args.name }),
@@ -424,6 +611,9 @@ export class SkillFluxService extends Service {
                   ref: { type: 'string' },
                   installs: { type: 'integer' },
                   score: { type: 'integer', required: true },
+                  selection: { type: 'string' },
+                  baseScore: { type: 'integer' },
+                  adaptiveBoost: { type: 'integer' },
                 },
               },
             },
@@ -452,6 +642,9 @@ export class SkillFluxService extends Service {
             ...('ref' in candidate ? { ref: candidate.ref } : {}),
             ...('installs' in candidate && candidate.installs !== undefined ? { installs: candidate.installs } : {}),
             score: candidate.score,
+            ...(candidate.selection === undefined ? {} : { selection: candidate.selection }),
+            ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
+            ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
           })),
         }
       },
@@ -529,7 +722,7 @@ export class SkillFluxService extends Service {
     ctx.commands.register({
       name: 'skillflux',
       description: 'inspect SkillFlux mounts and manage its persistent cache',
-      input: { hint: 'status | cache list | cache clean <cache-id|all>' },
+      input: { hint: 'status | explain | usage | cache list | cache clean <cache-id|all>' },
       handler: async invocation => await this.executeCommand(invocation),
     })
   }
@@ -538,11 +731,42 @@ export class SkillFluxService extends Service {
     const parts = invocation.rawInput.trim().split(/\s+/u).filter(Boolean)
     if (parts.length === 1 && parts[0] === 'status') {
       const mounted = this.mounted(invocation.agent)
+      const stats = this.embeddingStats()
+      const router = this.config.routerMode === 'lexical'
+        ? 'Router: lexical.'
+        : `Router: hybrid (${this.config.embeddingProvider}, ${this.config.embeddingModel}); embedding requests ${stats?.requests ?? 0}, cache ${stats?.cacheEntries ?? 0}/${this.config.embeddingCacheSize}.`
+      const telemetry = `Usage tracking: ${this.config.usageTracking ? 'on' : 'off'}; adaptive routing: ${this.config.adaptiveRouting ? 'on' : 'off'}.`
       return {
         kind: 'success',
-        text: mounted.length === 0
+        text: `${router}\n${telemetry}\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
-          : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`,
+          : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
+      }
+    }
+    if (parts.length === 1 && parts[0] === 'explain') {
+      const traces = this.lastRouting(invocation.agent)
+      return {
+        kind: 'success',
+        text: traces.length === 0
+          ? 'SkillFlux: no routing decision has been recorded.'
+          : `SkillFlux routing decision:\n${traces.map(trace => {
+              const base = trace.baseScore === undefined ? '' : `, base=${trace.baseScore}`
+              const boost = trace.adaptiveBoost === undefined ? '' : `, boost=${trace.adaptiveBoost}`
+              return `- ${trace.name} [${trace.selection}, ${trace.outcome}] score=${trace.score}${base}${boost} (${trace.origin}, ${trace.source})`
+            }).join('\n')}`,
+      }
+    }
+    if (parts.length === 1 && parts[0] === 'usage') {
+      const records = await this.usageRecords(20)
+      return {
+        kind: 'success',
+        text: !this.config.usageTracking
+          ? 'SkillFlux usage tracking is disabled.'
+          : records.length === 0
+            ? 'SkillFlux has no usage statistics yet.'
+            : `SkillFlux usage (top ${records.length}):\n${records.map(record =>
+                `- ${record.name} (${record.origin}, ${record.source}): uses ${record.uses}, mounts ${record.mounts}, last used ${formatTimestamp(record.lastUsedAt)}`)
+              .join('\n')}`,
       }
     }
     if (parts.length === 2 && parts[0] === 'cache' && parts[1] === 'list') {
@@ -567,7 +791,7 @@ export class SkillFluxService extends Service {
         text: `Removed ${result.removed.length} cache entr${result.removed.length === 1 ? 'y' : 'ies'}${result.skipped.length === 0 ? '.' : `; skipped active: ${result.skipped.join(', ')}.`}`,
       }
     }
-    return { kind: 'error', text: 'Usage: /skillflux status | cache list | cache clean <cache-id|all>' }
+    return { kind: 'error', text: 'Usage: /skillflux status | explain | usage | cache list | cache clean <cache-id|all>' }
   }
 
   private async routeTurn(
@@ -597,18 +821,29 @@ export class SkillFluxService extends Service {
       fallbacksByName.set(candidate.name, fallbacks)
     }
     const local = dedupeByName(localPool)
-    const selected = selectCandidates(task, local, {
-      // Keep ranked fallbacks available: a corrupt top candidate must not
-      // consume one of the bounded active slots for the entire turn.
-      limit: local.length,
-      minScore: this.config.minRouteScore,
-      routes: this.config.routes,
-    })
+    // Keep a few differently named fallbacks available: a corrupt top candidate
+    // must not consume one of the bounded active slots for the entire turn.
+    const selected = await this.selectLocalCandidates(
+      task,
+      local,
+      Math.min(local.length, this.config.maxActiveSkills * 3),
+      this.config.maxActiveSkills,
+      signal,
+    )
+    signal.throwIfAborted()
+    this.assertStateCurrent(state, generation)
+    state.lastRouting = selected.map(candidate => routingTrace(candidate, turn))
     for (const candidate of selected) {
       if (state.active.size >= this.config.maxActiveSkills) break
       for (const fallback of fallbacksByName.get(candidate.name) ?? []) {
         try {
-          await this.mountCandidate(state, fallback, signal, generation)
+          await this.mountCandidate(state, {
+            ...fallback,
+            ...(candidate.selection === undefined ? {} : { selection: candidate.selection }),
+            ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
+            ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
+            score: candidate.score,
+          }, signal, generation)
           break
         } catch (error: unknown) {
           signal.throwIfAborted()
@@ -674,8 +909,20 @@ export class SkillFluxService extends Service {
       const raced = state.active.get(definition.name)
       if (raced !== undefined) return raced
       this.assertCapacity(state, definition.name)
-      const mounted: MountedSkill = { name: candidate.name, origin: 'registry', source: definition.source, definition }
+      const mounted: MountedSkill = {
+        candidateId: candidate.id,
+        name: candidate.name,
+        origin: 'registry',
+        source: definition.source,
+        selection: candidate.selection ?? 'manual',
+        score: candidate.score,
+        ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
+        ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
+        definition,
+      }
       state.active.set(candidate.name, mounted)
+      this.rememberRouting(state, mounted)
+      this.trackUsage(this.usage?.recordMount(usageIdentity(mounted)))
       return mounted
     }
 
@@ -721,13 +968,20 @@ export class SkillFluxService extends Service {
     }
     state.disposers.set(definition.name, dispose)
     const mounted: MountedSkill = {
+      candidateId: candidate.id,
       name: definition.name,
       origin: candidate.origin,
       source: candidate.source,
       cacheId: entry.manifest.cacheId,
+      selection: candidate.selection ?? 'manual',
+      score: candidate.score,
+      ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
+      ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
       definition,
     }
     state.active.set(definition.name, mounted)
+    this.rememberRouting(state, mounted)
+    this.trackUsage(this.usage?.recordMount(usageIdentity(mounted)))
     if (candidate.origin === 'remote' && this.config.approvalPolicy === 'session') {
       let trusted = this.trustedBySession.get(state.agent.session)
       if (trusted === undefined) {
@@ -743,6 +997,48 @@ export class SkillFluxService extends Service {
     if (state.active.has(name)) return
     if (state.active.size >= this.config.maxActiveSkills) {
       throw new Error(`cannot mount skill "${name}": the ${this.config.maxActiveSkills}-skill turn limit is reached`)
+    }
+  }
+
+  private async selectLocalCandidates(
+    query: string,
+    candidates: readonly SkillFluxCandidate[],
+    limit: number,
+    semanticTrigger: number,
+    signal?: AbortSignal,
+  ): Promise<SkillFluxCandidate[]> {
+    if (limit <= 0 || candidates.length === 0) return []
+    let boosts: ReadonlyMap<string, number> | undefined
+    if (this.config.adaptiveRouting && this.usage !== undefined) {
+      try {
+        boosts = await this.usage.boosts(candidates, {
+          maxBoost: this.config.adaptiveMaxBoost,
+          minUses: this.config.adaptiveMinUses,
+          halfLifeDays: this.config.adaptiveHalfLifeDays,
+        })
+        signal?.throwIfAborted()
+      } catch (error: unknown) {
+        signal?.throwIfAborted()
+        this.runtimeCtx.logger.warn(`SkillFlux adaptive routing failed open: ${errorMessage(error)}`)
+      }
+    }
+    const lexical = selectCandidates(query, candidates, {
+      limit,
+      minScore: this.config.minRouteScore,
+      routes: this.config.routes,
+      ...(boosts === undefined ? {} : { boosts }),
+    })
+    if (this.embedding === undefined || lexical.length >= semanticTrigger || lexical.length >= limit) return lexical
+    const selectedNames = new Set(lexical.map(candidate => candidate.name))
+    const remaining = candidates.filter(candidate => !selectedNames.has(candidate.name))
+    try {
+      const semantic = await this.embedding.rank(query, remaining, limit - lexical.length, signal)
+      signal?.throwIfAborted()
+      return [...lexical, ...semantic]
+    } catch (error: unknown) {
+      signal?.throwIfAborted()
+      this.runtimeCtx.logger.warn(`SkillFlux embedding routing failed open: ${errorMessage(error)}`)
+      return lexical
     }
   }
 
@@ -763,6 +1059,7 @@ export class SkillFluxService extends Service {
       this.cleanupState(state, false)
       state.turn = turn
       state.candidates.clear()
+      state.lastRouting = []
     }
     return state
   }
@@ -777,6 +1074,7 @@ export class SkillFluxService extends Service {
         active: new Map(),
         disposers: new Map(),
         candidates: new Map(),
+        lastRouting: [],
       }
       this.stateByAgent.set(agent, state)
       this.states.add(state)
@@ -799,6 +1097,35 @@ export class SkillFluxService extends Service {
       this.states.delete(state)
       this.stateByAgent.delete(state.agent)
     }
+  }
+
+  private rememberRouting(state: AgentState, mounted: MountedSkill): void {
+    const trace: RoutingTrace = {
+      ...(state.turn === undefined ? {} : { turn: state.turn }),
+      candidateId: mounted.candidateId,
+      name: mounted.name,
+      origin: mounted.origin,
+      source: mounted.source,
+      selection: mounted.selection,
+      outcome: 'mounted',
+      score: mounted.score,
+      ...(mounted.baseScore === undefined ? {} : { baseScore: mounted.baseScore }),
+      ...(mounted.adaptiveBoost === undefined ? {} : { adaptiveBoost: mounted.adaptiveBoost }),
+    }
+    const index = state.lastRouting.findIndex(item => item.candidateId === trace.candidateId)
+    if (index === -1) state.lastRouting.push(trace)
+    else state.lastRouting[index] = trace
+  }
+
+  private trackUsage(operation: Promise<void> | undefined): void {
+    if (operation === undefined) return
+    let tracked: Promise<void>
+    tracked = operation
+      .catch((error: unknown) => {
+        this.runtimeCtx.logger.warn(`SkillFlux usage tracking failed open: ${errorMessage(error)}`)
+      })
+      .finally(() => { this.usageTasks.delete(tracked) })
+    this.usageTasks.add(tracked)
   }
 
   private cleanupSession(session: Session): void {
@@ -838,6 +1165,34 @@ function automaticDiscoveryQuery(task: string): string {
     .filter(token => token.length >= 2 && token.length <= 32 && !/^(?:sk|key|token)-?[a-z0-9]{12,}$/u.test(token))
     .slice(0, 12)
     .join(' ')
+}
+
+function routingTrace(candidate: SkillFluxCandidate, turn?: number): RoutingTrace {
+  return {
+    ...(turn === undefined ? {} : { turn }),
+    candidateId: candidate.id,
+    name: candidate.name,
+    origin: candidate.origin,
+    source: candidate.source,
+    selection: candidate.selection ?? 'manual',
+    outcome: 'selected',
+    score: candidate.score,
+    ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
+    ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
+  }
+}
+
+function usageIdentity(mounted: MountedSkill): SkillUsageIdentity {
+  return {
+    candidateId: mounted.candidateId,
+    name: mounted.name,
+    origin: mounted.origin,
+    source: mounted.source,
+  }
+}
+
+function formatTimestamp(value: number | undefined): string {
+  return value === undefined ? 'never' : new Date(value).toISOString()
 }
 
 function errorMessage(error: unknown): string {

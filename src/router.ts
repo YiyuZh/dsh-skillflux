@@ -96,7 +96,12 @@ function candidateOrder(left: SkillFluxCandidate, right: SkillFluxCandidate): nu
 export function selectCandidates(
   query: string,
   candidates: readonly SkillFluxCandidate[],
-  options: { readonly limit: number; readonly minScore: number; readonly routes: readonly RouteRule[] },
+  options: {
+    readonly limit: number
+    readonly minScore: number
+    readonly routes: readonly RouteRule[]
+    readonly boosts?: ReadonlyMap<string, number>
+  },
 ): SkillFluxCandidate[] {
   const byName = new Map(candidates.map(candidate => [candidate.name, candidate]))
   const selected: SkillFluxCandidate[] = []
@@ -106,7 +111,13 @@ export function selectCandidates(
     for (const name of rule.skills) {
       const match = byName.get(name)
       if (match !== undefined && !seen.has(name)) {
-        selected.push({ ...match, score: Number.MAX_SAFE_INTEGER })
+        selected.push({
+          ...match,
+          score: Number.MAX_SAFE_INTEGER,
+          selection: 'rule',
+          baseScore: Number.MAX_SAFE_INTEGER,
+          adaptiveBoost: 0,
+        })
         seen.add(name)
       }
       if (selected.length >= options.limit) return selected
@@ -114,8 +125,18 @@ export function selectCandidates(
   }
   const scored = candidates
     .filter(candidate => !seen.has(candidate.name))
-    .map(candidate => ({ ...candidate, score: routeScore(query, candidate) }))
-    .filter(candidate => candidate.score >= options.minScore)
+    .map(candidate => {
+      const baseScore = routeScore(query, candidate)
+      const adaptiveBoost = baseScore < options.minScore ? 0 : (options.boosts?.get(candidate.id) ?? 0)
+      return {
+        ...candidate,
+        score: baseScore + adaptiveBoost,
+        selection: 'lexical' as const,
+        baseScore,
+        adaptiveBoost,
+      }
+    })
+    .filter(candidate => candidate.baseScore >= options.minScore)
     .sort(candidateOrder)
   for (const candidate of scored) {
     if (seen.has(candidate.name)) continue

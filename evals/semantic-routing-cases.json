@@ -1,0 +1,85 @@
+[
+  {
+    "id": "semantic-ocr-en",
+    "query": "Make this scanned receipt searchable",
+    "queryVector": [1, 0, 0, 0, 0, 0],
+    "candidates": [
+      { "name": "ocr-reader", "description": "Extract printed words from images", "vector": [0.98, 0.05, 0, 0, 0, 0] },
+      { "name": "calendar-agent", "description": "Manage meetings and events", "vector": [0, 1, 0, 0, 0, 0] }
+    ],
+    "expected": ["ocr-reader"]
+  },
+  {
+    "id": "semantic-translation-zh",
+    "query": "把这份合同转换成自然的法语",
+    "queryVector": [0, 1, 0, 0, 0, 0],
+    "candidates": [
+      { "name": "legal-translator", "description": "Translate legal documents across languages", "vector": [0, 0.99, 0.02, 0, 0, 0] },
+      { "name": "contract-auditor", "description": "Inspect contract obligations", "vector": [0, 0.2, 0.9, 0, 0, 0] }
+    ],
+    "expected": ["legal-translator"]
+  },
+  {
+    "id": "semantic-web-performance",
+    "query": "Why does this page feel sluggish to visitors?",
+    "queryVector": [0, 0, 1, 0, 0, 0],
+    "candidates": [
+      { "name": "web-vitals", "description": "Diagnose browser loading and interaction performance", "vector": [0, 0, 0.97, 0.02, 0, 0] },
+      { "name": "ui-designer", "description": "Design polished application interfaces", "vector": [0, 0, 0.25, 0.8, 0, 0] }
+    ],
+    "expected": ["web-vitals"]
+  },
+  {
+    "id": "semantic-incident-response",
+    "query": "Production is unhealthy after the rollout",
+    "queryVector": [0, 0, 0, 1, 0, 0],
+    "candidates": [
+      { "name": "incident-commander", "description": "Coordinate outages and service recovery", "vector": [0, 0, 0, 0.98, 0.02, 0] },
+      { "name": "release-writer", "description": "Prepare release notes", "vector": [0, 0, 0, 0.1, 0.8, 0] }
+    ],
+    "expected": ["incident-commander"]
+  },
+  {
+    "id": "semantic-data-analysis-zh",
+    "query": "找出销售表格中的异常趋势",
+    "queryVector": [0, 0, 0, 0, 1, 0],
+    "candidates": [
+      { "name": "spreadsheet-analyst", "description": "Analyze tabular business data and anomalies", "vector": [0, 0, 0, 0, 0.99, 0.01] },
+      { "name": "sales-writer", "description": "Write personalized sales messages", "vector": [0, 0, 0, 0, 0.15, 0.9] }
+    ],
+    "expected": ["spreadsheet-analyst"]
+  },
+  {
+    "id": "semantic-top-two",
+    "query": "Extract a table from a scanned invoice",
+    "queryVector": [0.75, 0, 0, 0, 0.65, 0],
+    "limit": 2,
+    "candidates": [
+      { "name": "ocr-reader", "description": "Extract printed words from images", "vector": [1, 0, 0, 0, 0, 0] },
+      { "name": "spreadsheet-analyst", "description": "Analyze tabular business data", "vector": [0, 0, 0, 0, 1, 0] },
+      { "name": "calendar-agent", "description": "Manage meetings", "vector": [0, 1, 0, 0, 0, 0] }
+    ],
+    "expected": ["ocr-reader", "spreadsheet-analyst"]
+  },
+  {
+    "id": "semantic-negative-rejection",
+    "query": "Tell me a short joke",
+    "queryVector": [0, 0, 0, 0, 0, 1],
+    "candidates": [
+      { "name": "ocr-reader", "description": "Extract printed words from images", "vector": [1, 0, 0, 0, 0, 0] },
+      { "name": "calendar-agent", "description": "Manage meetings", "vector": [0, 1, 0, 0, 0, 0] }
+    ],
+    "expected": []
+  },
+  {
+    "id": "semantic-stable-tie",
+    "query": "Inspect a document",
+    "queryVector": [1, 0],
+    "limit": 2,
+    "candidates": [
+      { "name": "reader-b", "description": "Inspect documents", "source": "z/repo", "vector": [1, 0] },
+      { "name": "reader-a", "description": "Inspect documents", "source": "a/repo", "vector": [1, 0] }
+    ],
+    "expected": ["reader-a", "reader-b"]
+  }
+]
