@@ -57,6 +57,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 ```text
 用户任务
   -> 有序规则 + 确定性词法 Router
+  -> 可选的有界使用历史排序
   -> 可选的 embedding 语义补位
   -> 本地 Registry + 持久缓存 + skills.sh
   -> 按配置上限选择并挂载 Skill（默认 3 个）
@@ -71,6 +72,8 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 ## 功能
 
 - 先按配置规则路由，再用确定性的英文单词和中文二元词评分。
+- 可选根据成功加载记录，为已经通过词法相关性阈值的候选提供少量、随时间衰减
+  的排序加分。
 - 可选使用本地 Ollama 或 OpenAI-compatible embedding 服务，为尚未填满的目录
   位置补充语义相近 Skill。
 - 使用 `maxActiveSkills` 限制模型可见目录。
@@ -81,7 +84,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 - 每次加载前使用 SHA-256 manifest 校验缓存内容。
 - 支持每次远程挂载审批、仓库会话内首次审批和自动审批三种策略。
 - 提供加载、搜索和挂载 Skill 的模型工具。
-- 提供查看状态和清理缓存的 `/skillflux` 用户命令。
+- 提供查看状态、路由解释、使用统计和清理缓存的 `/skillflux` 用户命令。
 
 ## 路由规则
 
@@ -93,9 +96,11 @@ SkillFlux 按以下顺序处理任务：
 3. 按配置顺序应用匹配的 `routes`。
 4. 对剩余的名称代表候选进行确定性词法评分，并拒绝低于 `minRouteScore` 的
    候选。
-5. 在 `hybrid` 模式下，仅当规则和词法结果未填满目录时才使用 embedding；语义
+5. 启用 `adaptiveRouting` 后，仅对已经通过 `minRouteScore` 的候选增加有界、随
+   时间衰减的使用历史分。规则始终优先，历史不会让无关候选越过相关性阈值。
+6. 在 `hybrid` 模式下，仅当规则和词法结果未填满目录时才使用 embedding；语义
    结果不会替换前面已经命中的规则或词法结果。
-6. 依次挂载选中名称，直到达到 `maxActiveSkills`。如果首选候选加载失败，则按
+7. 依次挂载选中名称，直到达到 `maxActiveSkills`。如果首选候选加载失败，则按
    候选池顺序尝试同名 fallback。
 
 词法评分如下：
@@ -137,6 +142,12 @@ embeddingTimeoutMs: 5000
 embeddingCandidateLimit: 128
 embeddingCacheSize: 512
 minEmbeddingSimilarity: 0.45
+usageTracking: true
+usageMaxEntries: 1000
+adaptiveRouting: false
+adaptiveMaxBoost: 6
+adaptiveMinUses: 2
+adaptiveHalfLifeDays: 30
 routes: []
 ```
 
@@ -182,6 +193,30 @@ embeddingApiKeyEnv: SKILLFLUX_EMBEDDING_API_KEY
 在有界内存 LRU 中，插件停止后自动释放。端点不可用、响应异常、超时或模型维度
 变化时，Router 会自动回退到词法结果。
 
+### 使用统计与自适应路由
+
+使用统计按精确 candidate ID 记录成功挂载和成功的 `skill({ name })` 加载。
+统计默认开启，自适应路由默认关闭：
+
+```yaml
+usageTracking: true
+adaptiveRouting: true
+adaptiveMaxBoost: 6
+adaptiveMinUses: 2
+adaptiveHalfLifeDays: 30
+```
+
+记录通过原子替换写入 `$DSH_HOME/storages/skillflux/usage.json`（通常是
+`~/.dsh/storages/skillflux/usage.json`），并受 `usageMaxEntries` 限制。
+文件还有 2 MiB 的硬上限；达到任一上限时优先淘汰最近最少使用的记录。
+SkillFlux 只保存 candidate ID、Skill 名称、来源类型、来源、计数和时间戳；不会
+保存任务文本、Skill 指令或资源。
+
+加分不超过 `adaptiveMaxBoost`，至少成功加载 `adaptiveMinUses` 次后才生效，
+连续 `adaptiveHalfLifeDays` 未使用时减半。统计读写失败只会回退到普通路由，
+不会中断 Agent。设置 `usageTracking: false` 可关闭持久化，此时
+`adaptiveRouting` 也必须保持关闭。
+
 ### 审批策略
 
 | 策略 | 行为 |
@@ -204,10 +239,15 @@ embeddingApiKeyEnv: SKILLFLUX_EMBEDDING_API_KEY
 
 ```text
 /skillflux status
+/skillflux explain
+/skillflux usage
 /skillflux cache list
 /skillflux cache clean <cache-id>
 /skillflux cache clean all
 ```
+
+`explain` 会展示候选的 Router 阶段、总分、基础分、自适应加分，以及它只是被
+选中还是已经成功挂载。
 
 清理时会跳过仍在挂载的缓存。到达 `turn/end` 时，SkillFlux 注销运行时挂载，
 但保留下载文件供下次复用。
@@ -227,6 +267,8 @@ embeddingApiKeyEnv: SKILLFLUX_EMBEDDING_API_KEY
 - Hybrid 路由最多向配置的 embedding endpoint 发送 1,000 个字符的直接任务，
   以及每个候选最多 1,000 个字符的名称、`whenToUse` 和 description；不会发送
   Skill 正文或资源。
+- 使用统计不包含任务文本或 Skill 内容，并限制在 DSH 存储目录中的
+  `usageMaxEntries` 条记录以内。
 - 可选的 `GITHUB_TOKEN` 或 `GH_TOKEN` 只用于 GitHub API 限流，不会持久化。
 
 Skill 本质上仍是交给 Agent 的外部指令，可能包含恶意内容。审批是信任决策，
@@ -240,9 +282,9 @@ Skill 本质上仍是交给 Agent 的外部指令，可能包含恶意内容。�
 corepack pnpm eval
 ```
 
-测评包含 36 个词法场景和 8 个与 Provider 无关的语义向量场景，覆盖英文、中文、
-文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、语义 Top-K 和
-负例拒绝。
+测评包含 36 个词法场景、4 个自适应安全场景和 8 个与 Provider 无关的语义向量
+场景，覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、
+同名去重、语义 Top-K 和负例拒绝。
 
 | 指标 | 当前基线 |
 | --- | ---: |
@@ -282,7 +324,7 @@ corepack pnpm pack --dry-run
 `SKILLFLUX_EMBEDDING_PROVIDER` 覆盖默认值。
 
 测试覆盖路由、DSH 目录虚拟化、显式调用、远程响应校验、缓存完整性、生命周期
-清理和 Bundle patch。提交修改前请阅读
+清理、有界使用存储、自适应阈值安全和 Bundle patch。提交修改前请阅读
 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证

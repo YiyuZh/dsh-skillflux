@@ -59,6 +59,7 @@ the official `skill` Registry and `skill-filesystem` provider active.
 ```text
 User task
   -> ordered rules + deterministic lexical router
+  -> optional bounded usage-based tie-breaking
   -> optional embedding fallback for unfilled slots
   -> local Registry + persistent cache + skills.sh
   -> select and mount up to the configured limit (3 by default)
@@ -74,6 +75,8 @@ already stored in session history.
 ## Capabilities
 
 - Route by ordered rules, then deterministic English and Chinese lexical scores.
+- Optionally use successful Skill loads as a small, decaying ranking boost for
+  candidates that already pass the lexical relevance threshold.
 - Optionally fill unmatched catalog slots with semantic similarity from a local
   Ollama or OpenAI-compatible embedding endpoint.
 - Limit the model-facing catalog with `maxActiveSkills`.
@@ -85,7 +88,8 @@ already stored in session history.
 - Support per-remote-mount, per-repository/session, and automatic approval
   policies.
 - Expose model tools for loading, searching, and mounting Skills.
-- Expose `/skillflux` commands for runtime status and cache cleanup.
+- Expose `/skillflux` commands for status, routing explanations, usage, and
+  cache cleanup.
 
 ## Routing behavior
 
@@ -99,9 +103,12 @@ SkillFlux routes a task in this order:
 3. Apply matching `routes` in configuration order.
 4. Score the remaining name representatives with deterministic lexical
    matching and reject scores below `minRouteScore`.
-5. In `hybrid` mode, use embeddings only when rules and lexical matching leave
+5. When `adaptiveRouting` is enabled, add a bounded, time-decaying usage boost
+   only to candidates that already passed `minRouteScore`. Rules keep priority,
+   and history cannot make an irrelevant candidate cross the threshold.
+6. In `hybrid` mode, use embeddings only when rules and lexical matching leave
    catalog slots unfilled. Semantic results never displace those earlier matches.
-6. Mount the selected names until `maxActiveSkills` is reached. If a candidate
+7. Mount the selected names until `maxActiveSkills` is reached. If a candidate
    can't load, try its same-name fallbacks in candidate-pool order.
 
 The lexical score is:
@@ -145,6 +152,12 @@ embeddingTimeoutMs: 5000
 embeddingCandidateLimit: 128
 embeddingCacheSize: 512
 minEmbeddingSimilarity: 0.45
+usageTracking: true
+usageMaxEntries: 1000
+adaptiveRouting: false
+adaptiveMaxBoost: 6
+adaptiveMinUses: 2
+adaptiveHalfLifeDays: 30
 routes: []
 ```
 
@@ -193,6 +206,34 @@ never stores that value. Candidate vectors are kept in a bounded in-memory LRU
 and disappear when the plugin stops. An unavailable, malformed, timed-out, or
 reconfigured embedding endpoint fails open to the lexical result.
 
+### Usage statistics and adaptive routing
+
+Usage tracking records successful mounts and successful `skill({ name })`
+loads by exact candidate ID. It is enabled by default, while adaptive routing
+is opt-in:
+
+```yaml
+usageTracking: true
+adaptiveRouting: true
+adaptiveMaxBoost: 6
+adaptiveMinUses: 2
+adaptiveHalfLifeDays: 30
+```
+
+Records are stored atomically in
+`$DSH_HOME/storages/skillflux/usage.json` (normally
+`~/.dsh/storages/skillflux/usage.json`) and bounded by `usageMaxEntries`.
+The file also has a hard 2 MiB limit; least-recently-useful records are evicted
+first when either bound is reached.
+SkillFlux stores only the candidate ID, Skill name, origin, source, counters,
+and timestamps. It does not store task text, Skill instructions, or resources.
+
+The boost is capped by `adaptiveMaxBoost`, requires at least
+`adaptiveMinUses` successful loads, and halves after
+`adaptiveHalfLifeDays` without use. A telemetry read or write failure falls
+open to normal routing. Set `usageTracking: false` to disable persistence; in
+that case `adaptiveRouting` must also remain false.
+
 ### Approval policies
 
 | Policy | Behavior |
@@ -218,10 +259,15 @@ You can use:
 
 ```text
 /skillflux status
+/skillflux explain
+/skillflux usage
 /skillflux cache list
 /skillflux cache clean <cache-id>
 /skillflux cache clean all
 ```
+
+`explain` shows each candidate's router stage, score, base score, adaptive
+boost, and whether it was selected or successfully mounted.
 
 Cleanup skips cache entries that are still mounted. At `turn/end`, SkillFlux
 unregisters runtime mounts but retains downloaded files for later reuse.
@@ -244,6 +290,8 @@ unregisters runtime mounts but retains downloaded files for later reuse.
 - Hybrid routing sends at most 1,000 characters of the direct task and at most
   1,000 characters of each candidate's name, `whenToUse`, and description to
   the configured embedding endpoint. It never sends Skill bodies or resources.
+- Usage records never include task text or Skill content and are bounded to
+  `usageMaxEntries` entries in the DSH storage directory.
 - `GITHUB_TOKEN` or `GH_TOKEN` is optional and used only for GitHub API rate
   limits; SkillFlux doesn't persist it.
 
@@ -259,9 +307,10 @@ Run the versioned routing corpus without an API key or network access:
 corepack pnpm eval
 ```
 
-The suite contains 36 lexical cases and 8 provider-independent semantic-vector
-cases covering English, Chinese, normalization, rules, thresholds, capacity,
-ranking, deduplication, semantic top-k, and negative rejection.
+The suite contains 36 lexical cases, 4 adaptive safety cases, and 8
+provider-independent semantic-vector cases covering English, Chinese,
+normalization, rules, thresholds, capacity, ranking, deduplication, semantic
+top-k, and negative rejection.
 
 | Metric | Current baseline |
 | --- | ---: |
@@ -306,8 +355,9 @@ the defaults with `SKILLFLUX_EMBEDDING_MODEL`, `SKILLFLUX_EMBEDDING_ENDPOINT`,
 and `SKILLFLUX_EMBEDDING_PROVIDER` when testing another endpoint.
 
 The test suite covers routing, DSH catalog virtualization, explicit invocation,
-remote response validation, cache integrity, lifecycle cleanup, and the bundle
-patch. Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
+remote response validation, cache integrity, lifecycle cleanup, bounded usage
+storage, adaptive-threshold safety, and the bundle patch. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
 
 ## License
 

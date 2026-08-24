@@ -5,6 +5,7 @@ export type RemoteDiscovery = 'automatic' | 'on-demand' | 'off'
 export type CandidateOrigin = 'registry' | 'cache' | 'remote'
 export type RouterMode = 'lexical' | 'hybrid'
 export type EmbeddingProvider = 'ollama' | 'openai-compatible'
+export type CandidateSelection = 'rule' | 'lexical' | 'embedding' | 'manual'
 
 export interface RouteRule {
   matchAll?: string[]
@@ -32,6 +33,12 @@ export interface SkillFluxConfig {
   readonly embeddingCandidateLimit?: number
   readonly embeddingCacheSize?: number
   readonly minEmbeddingSimilarity?: number
+  readonly usageTracking?: boolean
+  readonly usageMaxEntries?: number
+  readonly adaptiveRouting?: boolean
+  readonly adaptiveMaxBoost?: number
+  readonly adaptiveMinUses?: number
+  readonly adaptiveHalfLifeDays?: number
   readonly routes?: RouteRule[]
 }
 
@@ -55,6 +62,12 @@ export interface ResolvedSkillFluxConfig {
   readonly embeddingCandidateLimit: number
   readonly embeddingCacheSize: number
   readonly minEmbeddingSimilarity: number
+  readonly usageTracking: boolean
+  readonly usageMaxEntries: number
+  readonly adaptiveRouting: boolean
+  readonly adaptiveMaxBoost: number
+  readonly adaptiveMinUses: number
+  readonly adaptiveHalfLifeDays: number
   readonly routes: readonly RouteRule[]
 }
 
@@ -65,7 +78,13 @@ export interface EmbeddingRouterStats {
   readonly cacheEntries: number
 }
 
-export interface RegistryCandidate {
+export interface CandidateRoutingMetadata {
+  readonly selection?: CandidateSelection
+  readonly baseScore?: number
+  readonly adaptiveBoost?: number
+}
+
+export interface RegistryCandidate extends CandidateRoutingMetadata {
   readonly id: string
   readonly origin: 'registry'
   readonly name: string
@@ -76,7 +95,7 @@ export interface RegistryCandidate {
   readonly summary: SkillSummary
 }
 
-export interface CachedCandidate {
+export interface CachedCandidate extends CandidateRoutingMetadata {
   readonly id: string
   readonly origin: 'cache'
   readonly name: string
@@ -89,7 +108,7 @@ export interface CachedCandidate {
   readonly installs?: number
 }
 
-export interface RemoteCandidate {
+export interface RemoteCandidate extends CandidateRoutingMetadata {
   readonly id: string
   readonly origin: 'remote'
   readonly name: string
@@ -104,11 +123,43 @@ export interface RemoteCandidate {
 export type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate
 
 export interface MountedSkill {
+  readonly candidateId: string
   readonly name: string
   readonly origin: CandidateOrigin
   readonly source: string
   readonly cacheId?: string
+  readonly selection: CandidateSelection
+  readonly score: number
+  readonly baseScore?: number
+  readonly adaptiveBoost?: number
   readonly definition: SkillDefinition
+}
+
+export interface RoutingTrace {
+  readonly turn?: number
+  readonly candidateId: string
+  readonly name: string
+  readonly origin: CandidateOrigin
+  readonly source: string
+  readonly selection: CandidateSelection
+  readonly outcome: 'selected' | 'mounted'
+  readonly score: number
+  readonly baseScore?: number
+  readonly adaptiveBoost?: number
+}
+
+export interface SkillUsageIdentity {
+  readonly candidateId: string
+  readonly name: string
+  readonly origin: CandidateOrigin
+  readonly source: string
+}
+
+export interface SkillUsageRecord extends SkillUsageIdentity {
+  readonly mounts: number
+  readonly uses: number
+  readonly lastMountedAt?: number
+  readonly lastUsedAt?: number
 }
 
 export interface CacheManifest {

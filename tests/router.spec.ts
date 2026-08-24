@@ -93,4 +93,35 @@ describe('router', () => {
     const selected = selectCandidates('read pdf', [cache, registry], { limit: 2, minScore: 1, routes: [] })
     expect(selected[0]?.origin).toBe('registry')
   })
+
+  it('uses bounded history only after candidates pass the lexical threshold', () => {
+    const first = candidate('first', 'Analyze PDF documents')
+    const second = candidate('second', 'Analyze PDF documents')
+    const irrelevant = candidate('frequent-but-irrelevant', 'Book airline tickets')
+    const selected = selectCandidates('analyze pdf', [first, second, irrelevant], {
+      limit: 3,
+      minScore: 6,
+      routes: [],
+      boosts: new Map([
+        [second.id, 6],
+        [irrelevant.id, 1_000],
+      ]),
+    })
+
+    expect(selected.map(item => item.name)).toEqual(['second', 'first'])
+    expect(selected[0]).toMatchObject({ selection: 'lexical', adaptiveBoost: 6 })
+    expect(selected.some(item => item.name === irrelevant.name)).toBe(false)
+  })
+
+  it('does not let adaptive boosts alter explicit route priority', () => {
+    const routed = candidate('routed', 'Create diagrams')
+    const frequent = candidate('frequent', 'Create diagrams')
+    const selected = selectCandidates('diagram request', [frequent, routed], {
+      limit: 1,
+      minScore: 1,
+      routes: [{ matchAny: ['diagram'], skills: ['routed'] }],
+      boosts: new Map([[frequent.id, 20]]),
+    })
+    expect(selected).toMatchObject([{ name: 'routed', selection: 'rule', adaptiveBoost: 0 }])
+  })
 })

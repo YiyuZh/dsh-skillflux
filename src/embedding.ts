@@ -180,7 +180,10 @@ export class EmbeddingRouter {
       .filter(item => item.similarity >= this.options.minSimilarity)
       .sort((left, right) => right.similarity - left.similarity || stableCandidateOrder(left.candidate, right.candidate))
       .slice(0, limit)
-      .map(({ candidate, similarity }) => ({ ...candidate, score: Math.round(similarity * 100) }))
+      .map(({ candidate, similarity }) => {
+        const score = Math.round(similarity * 100)
+        return { ...candidate, score, selection: 'embedding', baseScore: score, adaptiveBoost: 0 }
+      })
   }
 
   private cached(key: string): Vector | undefined {
