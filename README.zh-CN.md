@@ -397,6 +397,9 @@ embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测
 
 ## 开发与测试
 
+外部协作者请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，其中包含 fork、topic
+branch、离线质量门禁、GitHub 联网冒烟测试、评测集更新和 PR 审查流程。
+
 ```bash
 corepack pnpm install
 corepack pnpm check

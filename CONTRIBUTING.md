@@ -16,6 +16,63 @@ corepack pnpm eval
 corepack pnpm pack --dry-run
 ```
 
+## Contributor workflow
+
+Open an issue before a large architectural change so the scope and compatibility
+target can be agreed before implementation. Small fixes can go directly to a
+focused pull request.
+
+1. Fork `YiyuZh/dsh-skillflux`, clone your fork, and keep the original repository
+   as `upstream`:
+
+   ```bash
+   git clone https://github.com/<your-account>/dsh-skillflux.git
+   cd dsh-skillflux
+   git remote add upstream https://github.com/YiyuZh/dsh-skillflux.git
+   git fetch upstream
+   git switch -c feat/<short-name> upstream/main
+   ```
+
+   Collaborators with write access may clone the original repository and push a
+   topic branch there instead. Changes should still go through a pull request.
+
+2. Install the pinned toolchain and make the change in `src/`. Add focused unit
+   tests in `tests/` and update the applicable checked-in corpus under `evals/`.
+   Do not hand-edit `lib/`; `pnpm build` regenerates it from `src/`.
+
+3. Run the local quality gate:
+
+   ```bash
+   corepack enable
+   corepack pnpm install --frozen-lockfile
+   corepack pnpm check
+   corepack pnpm eval
+   corepack pnpm pack --dry-run
+   ```
+
+4. For remote-discovery changes, also run a real online smoke test. GitHub Code
+   Search is enabled by default but requires `GITHUB_TOKEN` or `GH_TOKEN` in the
+   test process. For example, in PowerShell:
+
+   ```powershell
+   $env:GH_TOKEN = gh auth token
+   $env:SKILLFLUX_REQUIRE_GITHUB = '1'
+   corepack pnpm test:discovery-live
+   ```
+
+   Never paste a token into source, configuration, fixtures, logs, or the pull
+   request. A remote provider outage should be reported separately from an
+   offline unit-test failure.
+
+5. Commit the source, tests, documentation, evaluation fixtures, and regenerated
+   `lib/` output, then push the topic branch and open a pull request against
+   `main`. The pull request should explain the behavior change, compatibility
+   impact, tests run, and any remaining limitations.
+
+6. Address review findings on the same branch. The repository CI reruns
+   typecheck, lint, tests, evaluations, build, and package-content validation.
+   A maintainer merges after the review is resolved and CI passes.
+
 ## Design constraints
 
 - Keep the official `ctx.skills` service as the source of truth.

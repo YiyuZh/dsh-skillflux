@@ -439,6 +439,10 @@ final answer from an online model. Read the
 
 ## Development
 
+External contributors should follow [CONTRIBUTING.md](CONTRIBUTING.md) for the
+fork, topic-branch, offline quality-gate, live GitHub discovery test, evaluation,
+and pull-request review workflow.
+
 ```bash
 corepack pnpm install
 corepack pnpm check
