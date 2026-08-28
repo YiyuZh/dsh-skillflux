@@ -15,6 +15,12 @@ const trustedOwners = (process.env.SKILLFLUX_TRUSTED_OWNERS ?? '')
   .split(',')
   .map(owner => owner.trim())
   .filter(Boolean)
+const blockedOwners = (process.env.SKILLFLUX_BLOCKED_OWNERS ?? '')
+  .split(',')
+  .map(owner => owner.trim())
+  .filter(Boolean)
+const trustPolicy = process.env.SKILLFLUX_TRUST_POLICY?.trim() || 'community'
+assert(['open', 'community', 'corroborated', 'trusted'].includes(trustPolicy), 'invalid SKILLFLUX_TRUST_POLICY')
 const root = await mkdtemp(join(tmpdir(), 'skillflux-discovery-smoke-'))
 try {
   const cache = new RemoteDiscoveryCache({
@@ -29,7 +35,9 @@ try {
     providers: tokenAvailable ? ['skills.sh', 'github'] : ['skills.sh'],
     minQualityScore: 35,
     recentActivityDays: 30,
+    trustPolicy,
     trustedOwners,
+    blockedOwners,
     cache,
   })
   const startedAt = Date.now()
@@ -40,6 +48,10 @@ try {
     assert.match(candidate.ref, /^[0-9a-f]{40}$/u)
     assert(candidate.qualityScore >= 35)
     assert(candidate.relevanceScore > 0)
+    assert.equal(candidate.qualityBreakdown.total, candidate.qualityScore)
+    assert(Array.isArray(candidate.qualitySignals))
+    assert(Array.isArray(candidate.qualityWarnings))
+    if (trustPolicy !== 'open') assert.notEqual(candidate.trustLevel, 'unverified')
   }
 
   const cacheStartedAt = Date.now()
@@ -66,6 +78,10 @@ try {
       stars: candidate.stars,
       recentlyActive: candidate.recentlyActive,
       trustedSource: candidate.trustedSource,
+      trustLevel: candidate.trustLevel,
+      qualityBreakdown: candidate.qualityBreakdown,
+      qualitySignals: candidate.qualitySignals,
+      qualityWarnings: candidate.qualityWarnings,
       ...(candidate.path === undefined ? {} : { path: candidate.path }),
       ref: candidate.ref.slice(0, 12),
     })),

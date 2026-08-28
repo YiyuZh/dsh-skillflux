@@ -22,15 +22,18 @@ import { estimateCatalogTokens, updateCatalog, updateRemoteCandidates } from './
 import { EmbeddingRouter } from './embedding.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { RemoteDiscoveryCache } from './remote-cache.js'
+import { remoteTrustPolicyAllows } from './remote-governance.js'
 import { cacheCandidates, registryCandidates, selectCandidates, tokenize } from './router.js'
 import { UsageStore } from './usage.js'
 import type {
   CacheEntry,
+  CachedCandidate,
   CatalogStats,
   EmbeddingRouterStats,
   MountedSkill,
   RemoteCandidate,
   RemoteDiscoveryCacheStats,
+  RemoteTrustLevel,
   ResolvedSkillFluxConfig,
   RoutingTrace,
   SkillFluxCandidate,
@@ -43,6 +46,11 @@ export type * from './types.js'
 export { normalizeText, routeScore, selectCandidates, tokenize } from './router.js'
 export { estimateCatalogTokens, estimateTextTokens } from './catalog.js'
 export { parseSkillMarkdown, inspectSkillDirectory } from './skill-file.js'
+export {
+  verifyUniqueRemoteSkill,
+  type RemoteCandidateVerifier,
+  type VerifiedRemoteSkill,
+} from './remote-source.js'
 export { SkillCache, isLoopbackProxyFailure, type CacheInventoryStats } from './cache.js'
 export {
   planCachePrune,
@@ -59,6 +67,15 @@ export {
   type RemoteDiscoveryOptions,
   type RemoteQualityInput,
 } from './remote.js'
+export {
+  compareRemoteCandidates,
+  compareRemoteTrust,
+  deduplicateRemoteCandidates,
+  remoteQualityEvidence,
+  remoteTrustPolicyAllows,
+  type RemoteEvidenceInput,
+  type RemoteQualityEvidence,
+} from './remote-governance.js'
 export {
   RemoteDiscoveryCache,
   remoteDiscoveryCacheState,
@@ -83,7 +100,9 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   remoteMinQualityScore: 35,
   remoteMinStars: 0,
   remoteRecentActivityDays: 30,
+  remoteTrustPolicy: 'community',
   remoteTrustedOwners: [],
+  remoteBlockedOwners: [],
   remoteCacheTtlMs: 5 * 60_000,
   remoteCacheStaleIfErrorMs: 24 * 60 * 60_000,
   remoteCacheMaxEntries: 100,
@@ -189,14 +208,75 @@ function remoteProviders(values: ResolvedSkillFluxConfig['remoteProviders']): Re
   return providers
 }
 
-function remoteTrustedOwners(values: readonly string[]): readonly string[] {
+function remoteOwners(name: 'remoteTrustedOwners' | 'remoteBlockedOwners', values: readonly string[]): readonly string[] {
   const owners = values.map(value => value.trim()).filter(value => value.length > 0)
   for (const owner of owners) {
     if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u.test(owner)) {
-      throw new Error(`dsh-skillflux: invalid GitHub owner "${owner}" in remoteTrustedOwners`)
+      throw new Error(`dsh-skillflux: invalid GitHub owner "${owner}" in ${name}`)
     }
   }
   return [...new Set(owners.map(owner => owner.toLocaleLowerCase('en-US')))]
+    .sort((left, right) => left.localeCompare(right, 'en'))
+}
+
+function repositoryOwner(source: string): string {
+  return source.split('/')[0]?.toLocaleLowerCase('en-US') ?? ''
+}
+
+/**
+ * Re-evaluate persisted evidence against the current owner configuration.
+ * Legacy cache manifests are treated as community evidence because their
+ * immutable commit and complete installed-directory hash are still known.
+ */
+function currentCandidateTrust(
+  candidate: CachedCandidate | RemoteCandidate,
+  config: ResolvedSkillFluxConfig,
+): RemoteTrustLevel {
+  const owner = repositoryOwner(candidate.source)
+  if (config.remoteTrustedOwners.includes(owner)) return 'trusted'
+  const sources = new Set(candidate.discoverySources ?? [])
+  const contentPinned = candidate.origin === 'cache' || candidate.skillFileHash !== undefined
+  // Legacy cache entries have no label, but they still have an immutable ref
+  // and installed-directory hash. Keep the documented conservative fallback.
+  if (candidate.origin === 'cache' && candidate.trustLevel === undefined) return 'community'
+  if (candidate.trustLevel === 'corroborated') return 'corroborated'
+  if (candidate.trustLevel === 'community') return 'community'
+  // An explicit persisted `unverified` label may come from an `open` install.
+  // Once installed, pinned-source and complete-directory verification establish
+  // the same minimum provenance used for community evidence.
+  return sources.size >= 2 && contentPinned
+    ? 'corroborated'
+    : contentPinned
+      ? 'community'
+      : 'unverified'
+}
+
+function candidateGovernanceReason(
+  candidate: SkillFluxCandidate,
+  config: ResolvedSkillFluxConfig,
+): string | undefined {
+  if (candidate.origin === 'registry') return undefined
+  const owner = repositoryOwner(candidate.source)
+  if (config.remoteBlockedOwners.includes(owner)) {
+    return `repository owner "${owner}" is blocked by remoteBlockedOwners`
+  }
+  const trustLevel = currentCandidateTrust(candidate, config)
+  if (!remoteTrustPolicyAllows(trustLevel, config.remoteTrustPolicy)) {
+    return `candidate evidence level "${trustLevel}" does not satisfy remoteTrustPolicy "${config.remoteTrustPolicy}"`
+  }
+  return undefined
+}
+
+function governedCacheCandidates(
+  entries: readonly CacheEntry[],
+  config: ResolvedSkillFluxConfig,
+): CachedCandidate[] {
+  return cacheCandidates(entries).flatMap((candidate): CachedCandidate[] => {
+    if (candidate.origin !== 'cache') return []
+    if (candidateGovernanceReason(candidate, config) !== undefined) return []
+    const trustLevel = currentCandidateTrust(candidate, config)
+    return [{ ...candidate, trustLevel }]
+  })
 }
 
 function nonEmptyString(name: string, value: string): string {
@@ -257,7 +337,15 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
       1,
       3_650,
     ),
-    remoteTrustedOwners: remoteTrustedOwners(config.remoteTrustedOwners ?? DEFAULTS.remoteTrustedOwners),
+    remoteTrustPolicy: config.remoteTrustPolicy ?? DEFAULTS.remoteTrustPolicy,
+    remoteTrustedOwners: remoteOwners(
+      'remoteTrustedOwners',
+      config.remoteTrustedOwners ?? DEFAULTS.remoteTrustedOwners,
+    ),
+    remoteBlockedOwners: remoteOwners(
+      'remoteBlockedOwners',
+      config.remoteBlockedOwners ?? DEFAULTS.remoteBlockedOwners,
+    ),
     remoteCacheTtlMs: boundedInteger(
       'remoteCacheTtlMs',
       config.remoteCacheTtlMs ?? DEFAULTS.remoteCacheTtlMs,
@@ -368,6 +456,11 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
   if (resolved.adaptiveRouting && !resolved.usageTracking) {
     throw new Error('dsh-skillflux: adaptiveRouting requires usageTracking')
   }
+  const blockedOwners = new Set(resolved.remoteBlockedOwners)
+  const conflictingOwner = resolved.remoteTrustedOwners.find(owner => blockedOwners.has(owner))
+  if (conflictingOwner !== undefined) {
+    throw new Error(`dsh-skillflux: GitHub owner "${conflictingOwner}" cannot be both trusted and blocked`)
+  }
   return resolved
 }
 
@@ -474,7 +567,10 @@ export class SkillFluxService extends Service {
     remoteMinQualityScore: z.number().default(DEFAULTS.remoteMinQualityScore),
     remoteMinStars: z.number().default(DEFAULTS.remoteMinStars),
     remoteRecentActivityDays: z.number().default(DEFAULTS.remoteRecentActivityDays),
+    remoteTrustPolicy: z.union(['open', 'community', 'corroborated', 'trusted'] as const)
+      .default(DEFAULTS.remoteTrustPolicy),
     remoteTrustedOwners: z.array(z.string()).default([]),
+    remoteBlockedOwners: z.array(z.string()).default([]),
     remoteCacheTtlMs: z.number().default(DEFAULTS.remoteCacheTtlMs),
     remoteCacheStaleIfErrorMs: z.number().default(DEFAULTS.remoteCacheStaleIfErrorMs),
     remoteCacheMaxEntries: z.number().default(DEFAULTS.remoteCacheMaxEntries),
@@ -551,7 +647,9 @@ export class SkillFluxService extends Service {
       minQualityScore: this.config.remoteMinQualityScore,
       minStars: this.config.remoteMinStars,
       recentActivityDays: this.config.remoteRecentActivityDays,
+      trustPolicy: this.config.remoteTrustPolicy,
       trustedOwners: this.config.remoteTrustedOwners,
+      blockedOwners: this.config.remoteBlockedOwners,
       cache: discoveryCache,
     })
     this.usage = this.config.usageTracking
@@ -657,7 +755,7 @@ export class SkillFluxService extends Service {
     const installed = snapshot.skills.filter(isModelInvocable)
     const cached = await this.cache.list()
     options.signal?.throwIfAborted()
-    const local = dedupeByName([...registryCandidates(installed), ...cacheCandidates(cached)])
+    const local = dedupeByName([...registryCandidates(installed), ...governedCacheCandidates(cached, this.config)])
     const selected = await this.selectLocalCandidates(
       query,
       local,
@@ -845,6 +943,21 @@ export class SkillFluxService extends Service {
                   license: { type: 'string' },
                   recentlyActive: { type: 'boolean' },
                   trustedSource: { type: 'boolean' },
+                  trustLevel: { type: 'string' },
+                  qualityBreakdown: {
+                    type: 'object', additionalProperties: false,
+                    properties: {
+                      relevance: { type: 'integer', required: true },
+                      adoption: { type: 'integer', required: true },
+                      repository: { type: 'integer', required: true },
+                      freshness: { type: 'integer', required: true },
+                      trust: { type: 'integer', required: true },
+                      provenance: { type: 'integer', required: true },
+                      total: { type: 'integer', required: true },
+                    },
+                  },
+                  qualitySignals: { type: 'array', items: { type: 'string' } },
+                  qualityWarnings: { type: 'array', items: { type: 'string' } },
                   path: { type: 'string' },
                   score: { type: 'integer', required: true },
                   selection: { type: 'string' },
@@ -887,6 +1000,10 @@ export class SkillFluxService extends Service {
               ...(candidate.license === undefined ? {} : { license: candidate.license }),
               recentlyActive: candidate.recentlyActive,
               trustedSource: candidate.trustedSource,
+              trustLevel: candidate.trustLevel,
+              qualityBreakdown: candidate.qualityBreakdown,
+              qualitySignals: [...candidate.qualitySignals],
+              qualityWarnings: [...candidate.qualityWarnings],
               ...(candidate.path === undefined ? {} : { path: candidate.path }),
             }),
             score: candidate.score,
@@ -933,6 +1050,8 @@ export class SkillFluxService extends Service {
       if (agent === undefined || typeof id !== 'string') return { kind: 'deny', reason: 'invalid SkillFlux mount request' }
       const candidate = this.stateByAgent.get(agent)?.candidates.get(id)
       if (candidate === undefined) return { kind: 'deny', reason: 'SkillFlux candidate id is unknown or expired' }
+      const governanceReason = candidateGovernanceReason(candidate, this.config)
+      if (governanceReason !== undefined) return { kind: 'deny', reason: `SkillFlux mount denied: ${governanceReason}` }
       if (candidate.origin !== 'remote' || this.config.approvalPolicy === 'automatic') return downstream
       const trusted = this.trustedBySession.get(agent.session)
       if (this.config.approvalPolicy === 'session' && trusted?.has(candidate.source) === true) return downstream
@@ -990,7 +1109,7 @@ export class SkillFluxService extends Service {
       const catalogBudget = catalog.budget === undefined ? 'off' : String(catalog.budget)
       const discovery = `Remote discovery: ${this.config.remoteDiscovery}; providers ${this.config.remoteProviders
         .map(provider => provider === 'github' && !this.remote.githubSearchEnabled ? 'github (token unavailable)' : provider)
-        .join(', ')}; quality >= ${this.config.remoteMinQualityScore}; stars >= ${this.config.remoteMinStars}; recent window ${this.config.remoteRecentActivityDays} days.`
+        .join(', ')}; evidence policy ${this.config.remoteTrustPolicy}; quality >= ${this.config.remoteMinQualityScore}; stars >= ${this.config.remoteMinStars}; recent window ${this.config.remoteRecentActivityDays} days; ${this.config.remoteBlockedOwners.length} blocked owner(s).`
       const discoveryCacheStatus = discoveryCache === undefined
         ? 'Remote discovery cache: unavailable.'
         : `Remote discovery cache: ${discoveryCache.enabled ? 'on' : 'off'}; ${discoveryCache.entries}/${this.config.remoteCacheMaxEntries} entries; hits ${discoveryCache.hits}, misses ${discoveryCache.misses}, stale fallbacks ${discoveryCache.staleHits}.`
@@ -1096,7 +1215,7 @@ export class SkillFluxService extends Service {
     this.assertStateCurrent(state, generation)
     const localPool = [
       ...registryCandidates(snapshot.skills.filter(isModelInvocable)),
-      ...cacheCandidates(cached),
+      ...governedCacheCandidates(cached, this.config),
     ].filter(candidate => !explicit.has(candidate.name))
     const fallbacksByName = new Map<string, SkillFluxCandidate[]>()
     for (const candidate of localPool) {
@@ -1194,6 +1313,8 @@ export class SkillFluxService extends Service {
   ): Promise<MountedSkill> {
     signal?.throwIfAborted()
     this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
+    const governanceReason = candidateGovernanceReason(candidate, this.config)
+    if (governanceReason !== undefined) throw new Error(`SkillFlux mount denied: ${governanceReason}`)
     const current = state.active.get(candidate.name)
     if (current !== undefined) return current
     this.assertCapacity(state, candidate.name)
@@ -1242,6 +1363,12 @@ export class SkillFluxService extends Service {
         cacheSignal?.throwIfAborted()
         this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
         if (cached === undefined) throw new Error(`cache entry "${candidate.cacheId}" no longer exists`)
+        const currentCachedCandidate = cacheCandidates([cached])[0]
+        if (currentCachedCandidate === undefined) throw new Error(`cache entry "${candidate.cacheId}" is invalid`)
+        const currentGovernanceReason = candidateGovernanceReason(currentCachedCandidate, this.config)
+        if (currentGovernanceReason !== undefined) {
+          throw new Error(`SkillFlux mount denied: ${currentGovernanceReason}`)
+        }
         entry = cached
       } else {
         entry = await this.cache.install(candidate, cacheSignal)

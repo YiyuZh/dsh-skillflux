@@ -91,7 +91,8 @@ already stored in session history.
   [skills.sh](https://skills.sh/), and authenticated GitHub `SKILL.md` code
   search.
 - Re-rank remote matches by task relevance, marketplace adoption, repository
-  activity, stars, forks, license metadata, and configured trusted owners.
+  activity, stars, forks, license metadata, content provenance, and configured
+  owner policy. Every result carries an explainable evidence level and warnings.
 - Resolve remote candidates to immutable GitHub commit SHAs.
 - Register cached Skills through the current Agent's `ctx.skills` scope.
 - Verify cached content with a SHA-256 manifest before every load.
@@ -153,7 +154,10 @@ Remote discovery is live, not a bundled catalog:
 3. GitHub repository metadata supplies the immutable HEAD commit, stars,
    forks, license, archive state, owner type, and last push time.
 4. SkillFlux rejects zero-relevance, archived, disabled, below-star, and
-   below-quality candidates, then returns the highest-quality matches.
+   below-quality candidates, then applies the configured evidence policy.
+5. Exact duplicate candidate identities are collapsed. Equal root `SKILL.md`
+   hashes in different repositories remain separate because adjacent resources
+   may differ; they are not treated as independent provider corroboration.
 
 The quality score is capped at 100. Relevance is a gate and the largest single
 component, so a famous but unrelated repository cannot outrank an exact new
@@ -167,12 +171,31 @@ match merely because it has more stars.
 | GitHub forks | 5 |
 | Repository activity, with the configured recent window worth most | 10 |
 | Trusted owner, organization ownership, and license metadata | 15 |
+| Cross-source discovery and a pinned GitHub content preview | 8 |
 
 `remoteRecentActivityDays` defaults to 30. Activity inside that window receives
 the full freshness contribution; older maintained projects decay gradually
 instead of being discarded. Add owners you have independently vetted to
 `remoteTrustedOwners`; being an organization or having many stars is not itself
 treated as verification.
+
+Each candidate is labeled `unverified`, `community`, `corroborated`, or
+`trusted`. The default `remoteTrustPolicy: community` accepts a directly
+previewed and content-pinned GitHub Skill even when it is new and has few stars,
+but exposes `low-adoption`, missing-license, stale-activity, and source-coverage
+warnings. `corroborated` requires both a pinned content preview and discovery by
+multiple providers. `trusted` means only that the repository owner appears in
+your explicit `remoteTrustedOwners` list; it is not a security certification.
+Use `remoteBlockedOwners` for an explicit deny list. An owner cannot be both
+trusted and blocked.
+
+These controls are re-applied to installed SkillFlux cache entries on every
+search, automatic route, and mount. Removing an owner from
+`remoteTrustedOwners` therefore revokes its stored `trusted` label; adding it to
+`remoteBlockedOwners` prevents reuse after a restart. Legacy cache manifests
+without an evidence label are treated as `community` because their immutable
+commit and installed-directory hash are known, but they do not satisfy
+`corroborated` or `trusted` policies.
 
 GitHub code search requires authentication. Start DSH from a shell that exposes
 one of the standard variables, for example in PowerShell:
@@ -199,6 +222,10 @@ active discovery/ranking configuration. User task text, tokens, and Skill bodies
 are not persisted. Candidate metadata remains pinned to the commit originally
 validated, so stale fallback affects ranking freshness rather than source
 integrity or approval identity.
+
+The evidence-aware cache document is versioned. Older ranking-cache formats
+are discarded and rebuilt online instead of being interpreted under newer
+trust semantics.
 
 The cache is stored atomically at
 `$DSH_HOME/storages/skillflux/remote-discovery.json`, limited to 100 entries by
@@ -250,7 +277,9 @@ remoteSearchTimeoutMs: 30000
 remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
 remoteRecentActivityDays: 30
+remoteTrustPolicy: community  # open | community | corroborated | trusted
 remoteTrustedOwners: []       # e.g. [anthropics, openai, vercel-labs]
+remoteBlockedOwners: []
 remoteCacheTtlMs: 300000                  # 0 disables
 remoteCacheStaleIfErrorMs: 86400000       # additional stale window
 remoteCacheMaxEntries: 100
@@ -391,7 +420,8 @@ The model can use:
 
 - `skill({ name })` to load instructions for a Skill already mounted this turn.
 - `skillflux_search({ query, remote? })` to search installed, cached, and
-  immutable remote candidates.
+  immutable remote candidates. Remote results include score components,
+  evidence level, positive signals, and warnings.
 - `skillflux_mount({ candidateId })` to mount a candidate from the current
   SkillFlux discovery state.
 
@@ -423,11 +453,22 @@ available until a later policy run or explicit cleanup removes them.
   authenticated GitHub `SKILL.md` code search.
 - GitHub-discovered `SKILL.md` files are bounded to 256 KiB and must pass the
   same supported frontmatter parser before they become candidates.
-- The SHA-256 hash of a GitHub search preview must match the `SKILL.md` selected
-  by the installer, preventing a same-name Skill elsewhere in the repository
-  from silently replacing the reviewed match.
+- Before every new installation, SkillFlux enumerates up to 512 `SKILL.md`
+  files at the pinned commit through the GitHub tree API and requires exactly
+  one usable Skill with the requested name. This applies to skills.sh-only
+  results as well as GitHub Code Search results.
+- The verified source SHA-256 must match both a prior GitHub search preview (if
+  present) and the `SKILL.md` selected by the installer. Same-name files at
+  multiple repository paths are therefore rejected even when their root bytes
+  match, because adjacent resources may differ.
+- Equal root-file hashes across repositories are not collapsed or described as
+  mirrors without a complete Skill-directory hash.
 - Archived and disabled repositories are rejected. Repository popularity,
   activity, and license metadata are ranking evidence, not a security verdict.
+- `remoteTrustPolicy` is an evidence threshold, not a malware scanner. A
+  `trusted` label reflects only the current locally configured owner allowlist;
+  the threshold and blocked-owner list also govern reuse from the installed
+  SkillFlux cache.
 - Each remote result is resolved to a 40-character commit SHA before SkillFlux
   creates its candidate ID.
 - Installation downloads that immutable GitHub codeload archive through the
@@ -466,11 +507,11 @@ corepack pnpm eval
 
 The suite contains 36 lexical cases, 4 adaptive safety cases, 8
 provider-independent semantic-vector cases, 7 catalog-budget cases, 8
-remote-quality pairwise cases, 7 remote-cache policy cases, and 7 installed-cache
-governance cases covering English, Chinese, normalization, rules, thresholds,
-capacity, ranking, deduplication, semantic top-k, context budgets, freshness,
-trust, adoption, cache expiry, value-aware eviction, active-mount protection,
-and negative rejection.
+remote-quality pairwise cases, 8 remote evidence-governance cases, 7 remote-cache
+policy cases, and 7 installed-cache governance cases covering English, Chinese,
+normalization, rules, thresholds, capacity, ranking, content deduplication,
+semantic top-k, context budgets, freshness, evidence policy, adoption, cache
+expiry, value-aware eviction, active-mount protection, and negative rejection.
 
 | Metric | Current baseline |
 | --- | ---: |
@@ -482,6 +523,7 @@ and negative rejection.
 | Semantic positive Top-1 | 100.0% |
 | Semantic negative rejection | 100.0% |
 | Remote-quality pairwise ordering | 100.0% |
+| Remote evidence-governance boundaries | 100.0% |
 | Remote-cache policy boundaries | 100.0% |
 | Installed-cache governance boundaries | 100.0% |
 
@@ -532,8 +574,9 @@ corepack pnpm pack --dry-run
 when `GITHUB_TOKEN` or `GH_TOKEN` is present, and verifies that the identical
 second query is served from the persistent discovery cache. Override the task with
 `SKILLFLUX_DISCOVERY_QUERY`, add comma-separated trusted owners with
-`SKILLFLUX_TRUSTED_OWNERS`, or set `SKILLFLUX_REQUIRE_GITHUB=1` to fail when the
-GitHub provider is unavailable.
+`SKILLFLUX_TRUSTED_OWNERS`, blocked owners with `SKILLFLUX_BLOCKED_OWNERS`, or
+override the smoke-test evidence threshold with `SKILLFLUX_TRUST_POLICY`. Set
+`SKILLFLUX_REQUIRE_GITHUB=1` to fail when the GitHub provider is unavailable.
 
 `test:embedding-live` expects the configured Ollama model to exist. Override
 the defaults with `SKILLFLUX_EMBEDDING_MODEL`, `SKILLFLUX_EMBEDDING_ENDPOINT`,

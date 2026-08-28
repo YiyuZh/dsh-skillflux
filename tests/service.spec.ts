@@ -17,7 +17,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import type { LockOptions } from 'proper-lockfile'
 import SkillFluxService, { estimateCatalogTokens, UsageStore, type SkillFluxConfig } from '../src/index.js'
 import PublishedSkillFluxService from '../lib/index.js'
-import { candidateId } from '../src/router.js'
+import { cacheCandidates, candidateId } from '../src/router.js'
 import type { CacheEntry, RemoteCandidate, SkillFluxCandidate } from '../src/types.js'
 import type { SkillDefinition } from '@deepseek-ai/dsh-skill'
 
@@ -116,7 +116,9 @@ describe('SkillFlux service', () => {
       remoteMinQualityScore: 60,
       remoteMinStars: 25,
       remoteRecentActivityDays: 30,
+      remoteTrustPolicy: 'corroborated',
       remoteTrustedOwners: ['Anthropics', 'openai'],
+      remoteBlockedOwners: ['Known-Bad'],
       remoteCacheTtlMs: 60_000,
       remoteCacheStaleIfErrorMs: 600_000,
       remoteCacheMaxEntries: 25,
@@ -126,16 +128,171 @@ describe('SkillFlux service', () => {
       remoteMinQualityScore: 60,
       remoteMinStars: 25,
       remoteRecentActivityDays: 30,
+      remoteTrustPolicy: 'corroborated',
       remoteTrustedOwners: ['anthropics', 'openai'],
+      remoteBlockedOwners: ['known-bad'],
       remoteCacheTtlMs: 60_000,
       remoteCacheStaleIfErrorMs: 600_000,
       remoteCacheMaxEntries: 25,
     })
+    const status = await context.commands.execute(
+      fakeAgent(context),
+      '/skillflux status',
+      [],
+      new AbortController().signal,
+    )
+    expect(status?.result.text).toContain('evidence policy corroborated')
+    expect(status?.result.text).toContain('1 blocked owner(s)')
     await expect(setup({ remoteProviders: [] })).rejects.toThrow('remoteProviders must contain at least one')
     await expect(setup({ remoteMinQualityScore: 101 })).rejects.toThrow('remoteMinQualityScore')
     await expect(setup({ remoteTrustedOwners: ['bad/owner'] })).rejects.toThrow('invalid GitHub owner')
+    await expect(setup({ remoteBlockedOwners: ['bad/owner'] })).rejects.toThrow('invalid GitHub owner')
+    await expect(setup({ remoteTrustedOwners: ['same'], remoteBlockedOwners: ['SAME'] }))
+      .rejects.toThrow('cannot be both trusted and blocked')
     await expect(setup({ remoteCacheTtlMs: -1 })).rejects.toThrow('remoteCacheTtlMs')
     await expect(setup({ remoteCacheMaxEntries: 1_001 })).rejects.toThrow('remoteCacheMaxEntries')
+  })
+
+  it('reapplies current owner and evidence policy to cached Skills after restart and before mount', async () => {
+    const source = 'once-trusted/repo'
+    const entry: CacheEntry = {
+      directory: '/cache/policy-skill',
+      manifest: {
+        version: 1,
+        cacheId: '1'.repeat(24),
+        source,
+        ref: '2'.repeat(40),
+        skillId: 'policy-skill',
+        name: 'policy-skill',
+        description: 'Handle policy documents',
+        trustLevel: 'trusted',
+        discoverySources: ['github'],
+        installedAt: '2026-08-28T00:00:00.000Z',
+        fileCount: 1,
+        totalBytes: 100,
+        contentHash: '3'.repeat(64),
+      },
+    }
+    const useEntries = (context: Context, entries: readonly CacheEntry[]) => {
+      const cache = (context.skillFlux as unknown as { cache: { list: () => Promise<readonly CacheEntry[]> } }).cache
+      cache.list = async () => entries
+    }
+
+    const trusted = await setup({ routes: [], remoteTrustPolicy: 'trusted', remoteTrustedOwners: ['once-trusted'] })
+    useEntries(trusted, [entry])
+    expect(await trusted.skillFlux.discover(fakeAgent(trusted), 'policy-skill')).toMatchObject([
+      { source, origin: 'cache', trustLevel: 'trusted' },
+    ])
+
+    // A new service instance represents a restart with a stricter current
+    // configuration. Persisted `trusted` is downgraded when its owner is no
+    // longer explicitly trusted.
+    const revoked = await setup({ routes: [], remoteTrustPolicy: 'trusted' })
+    useEntries(revoked, [entry])
+    expect(await revoked.skillFlux.discover(fakeAgent(revoked), 'policy-skill')).toEqual([])
+
+    const blocked = await setup({ routes: [], remoteBlockedOwners: ['once-trusted'] })
+    useEntries(blocked, [entry])
+    const blockedAgent = fakeAgent(blocked)
+    expect(await blocked.skillFlux.discover(blockedAgent, 'policy-skill')).toEqual([])
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Use policy-skill for this policy document' }],
+      source: { kind: 'user' },
+    })
+    await propose(blocked, blockedAgent, [user])
+    expect(blocked.skillFlux.mounted(blockedAgent)).toEqual([])
+
+    const blockedInternals = blocked.skillFlux as unknown as {
+      cache: { get: ReturnType<typeof vi.fn> }
+      state: (agent: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+    }
+    blockedInternals.cache.get = vi.fn(async () => entry)
+    const rawCandidate = cacheCandidates([entry])[0]!
+    blockedInternals.state(blockedAgent).candidates.set(rawCandidate.id, rawCandidate)
+    await expect(blocked.skillFlux.mount(blockedAgent, rawCandidate.id)).rejects.toThrow('remoteBlockedOwners')
+    expect(blockedInternals.cache.get).not.toHaveBeenCalled()
+
+    const { trustLevel: _legacyTrust, ...legacyManifest } = entry.manifest
+    const legacyEntry: CacheEntry = { ...entry, manifest: legacyManifest }
+    const legacyCommunity = await setup({ routes: [], remoteTrustPolicy: 'community' })
+    useEntries(legacyCommunity, [legacyEntry])
+    expect(await legacyCommunity.skillFlux.discover(fakeAgent(legacyCommunity), 'policy-skill')).toMatchObject([
+      { origin: 'cache', trustLevel: 'community' },
+    ])
+    const legacyCorroborated = await setup({ routes: [], remoteTrustPolicy: 'corroborated' })
+    useEntries(legacyCorroborated, [legacyEntry])
+    expect(await legacyCorroborated.skillFlux.discover(fakeAgent(legacyCorroborated), 'policy-skill')).toEqual([])
+
+    const openInstalled: CacheEntry = {
+      ...entry,
+      manifest: {
+        ...entry.manifest,
+        trustLevel: 'unverified',
+        sourcePath: 'skills/policy-skill/SKILL.md',
+        sourceSkillFileHash: '4'.repeat(64),
+      },
+    }
+    const communityRestart = await setup({ routes: [], remoteTrustPolicy: 'community' })
+    const restartCache = (communityRestart.skillFlux as unknown as {
+      cache: {
+        list: () => Promise<CacheEntry[]>
+        get: () => Promise<CacheEntry>
+        load: () => Promise<SkillDefinition>
+        createActiveLease: () => Promise<() => Promise<void>>
+      }
+    }).cache
+    restartCache.list = async () => [openInstalled]
+    restartCache.get = async () => openInstalled
+    restartCache.load = async () => ({
+      name: openInstalled.manifest.name,
+      description: openInstalled.manifest.description,
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'runtime',
+      provider: 'skillflux-cache',
+      content: 'Verified open-policy installation.',
+    })
+    restartCache.createActiveLease = async () => async () => undefined
+    const restartAgent = fakeAgent(communityRestart)
+    const restartUser = createUserMessage({
+      content: [{ type: 'text', text: 'Handle this policy document with policy-skill' }],
+      source: { kind: 'user' },
+    })
+    await propose(communityRestart, restartAgent, [restartUser])
+    expect(communityRestart.skillFlux.mounted(restartAgent)).toMatchObject([
+      { name: 'policy-skill', origin: 'cache', source },
+    ])
+  })
+
+  it('releases the cache process lock after remote source verification times out', async () => {
+    const context = await setup({ routes: [], cacheAutoPrune: false, installTimeoutMs: 25 })
+    const agent = fakeAgent(context)
+    const candidate: RemoteCandidate = {
+      id: 'verification-timeout', origin: 'remote', name: 'timeout-skill',
+      description: 'Remote verification timeout fixture', source: 'owner/repo', ref: '4'.repeat(40),
+      score: 70, skillId: 'timeout-skill', installs: 0, discoverySources: ['skills.sh'],
+      qualityScore: 70, relevanceScore: 100, stars: 1, forks: 0, recentlyActive: true,
+      trustedSource: false, trustLevel: 'community',
+      qualityBreakdown: { relevance: 55, adoption: 0, repository: 1, freshness: 10, trust: 2, provenance: 0, total: 68 },
+      qualitySignals: ['recent-activity'], qualityWarnings: ['single-source', 'content-not-previewed'],
+    }
+    const internals = context.skillFlux as unknown as {
+      cache: { options: { verifyCandidate: () => Promise<never> } }
+      state: (target: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+      acquireCacheLease: () => Promise<() => Promise<void>>
+    }
+    internals.cache.options.verifyCandidate = async () => await new Promise(() => undefined)
+    internals.state(agent).candidates.set(candidate.id, candidate)
+    await expect(context.skillFlux.mount(agent, candidate.id)).rejects.toMatchObject({ name: 'TimeoutError' })
+
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const release = await Promise.race([
+      internals.acquireCacheLease(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => { reject(new Error('cache process lock was not released')) }, 1_000)
+      }),
+    ])
+    if (timeout !== undefined) clearTimeout(timeout)
+    await release()
   })
 
   it('reports and clears the persistent remote discovery cache', async () => {
@@ -358,6 +515,10 @@ describe('SkillFlux service', () => {
       forks: 0,
       recentlyActive: true,
       trustedSource: false,
+      trustLevel: 'community',
+      qualityBreakdown: { relevance: 50, adoption: 0, repository: 0, freshness: 0, trust: 0, provenance: 0, total: 50 },
+      qualitySignals: ['content-pinned'],
+      qualityWarnings: [],
     }
     const entry: CacheEntry = {
       directory: '/cache/auto-skill',

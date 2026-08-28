@@ -208,15 +208,20 @@ describe('persistent cache', () => {
     const root = await mkdtemp(join(tmpdir(), 'skillflux-cache-abort-commit-'))
     roots.push(root)
     const controller = new AbortController()
+    const downloadedMarkdown = '---\nname: demo\ndescription: Abort commit fixture\n---\nStop before commit.\n'
     const cache = new SkillCache({
       root,
       maxFiles: 10,
       maxBytes: 10_000,
       installTimeoutMs: 1_000,
+      verifyCandidate: async () => ({
+        path: 'skills/demo/SKILL.md',
+        skillFileHash: createHash('sha256').update(downloadedMarkdown).digest('hex'),
+      }),
       runInstaller: async invocation => {
         const directory = join(invocation.cwd, '.agents', 'skills', 'demo')
         await mkdir(directory, { recursive: true })
-        await writeFile(join(directory, 'SKILL.md'), '---\nname: demo\ndescription: Abort commit fixture\n---\nStop before commit.\n')
+        await writeFile(join(directory, 'SKILL.md'), downloadedMarkdown)
       },
       beforeInstallCommit: async () => { controller.abort(new Error('cache coordination compromised')) },
     })
@@ -237,6 +242,10 @@ describe('persistent cache', () => {
       forks: 0,
       recentlyActive: true,
       trustedSource: false,
+      trustLevel: 'community',
+      qualityBreakdown: { relevance: 50, adoption: 0, repository: 0, freshness: 0, trust: 0, provenance: 0, total: 50 },
+      qualitySignals: ['content-pinned'],
+      qualityWarnings: [],
     }
     await expect(cache.install(candidate, controller.signal)).rejects.toThrow('cache coordination compromised')
     expect(await cache.list()).toEqual([])
@@ -265,6 +274,10 @@ describe('persistent cache', () => {
       license: 'MIT',
       recentlyActive: true,
       trustedSource: false,
+      trustLevel: 'community',
+      qualityBreakdown: { relevance: 55, adoption: 4, repository: 5, freshness: 4, trust: 0, provenance: 4, total: 72 },
+      qualitySignals: ['content-pinned'],
+      qualityWarnings: [],
       skillFileHash: createHash('sha256').update(downloadedMarkdown).digest('hex'),
     }
     const invocations: Array<{ args: readonly string[]; cwd: string; timeoutMs: number }> = []
@@ -273,6 +286,10 @@ describe('persistent cache', () => {
       maxFiles: 10,
       maxBytes: 10_000,
       installTimeoutMs: 1_234,
+      verifyCandidate: async () => ({
+        path: 'skills/demo/SKILL.md',
+        skillFileHash: candidate.skillFileHash!,
+      }),
       runInstaller: async invocation => {
         invocations.push({ args: invocation.args, cwd: invocation.cwd, timeoutMs: invocation.timeoutMs })
         if (invocations.length === 1) throw { stderr: 'Failed to connect to localhost port 7890: refused' }
@@ -291,12 +308,14 @@ describe('persistent cache', () => {
     expect(invocations[1]?.timeoutMs).toBe(1_234)
     expect(installed.manifest).toMatchObject({
       source: 'owner/repo', ref: candidate.ref, skillId: 'demo', name: 'demo', installs: 42,
+      trustLevel: 'community', sourcePath: 'skills/demo/SKILL.md',
+      sourceSkillFileHash: candidate.skillFileHash,
     })
-    expect(cacheCandidates([installed])[0]).toMatchObject({ name: 'demo', installs: 42 })
+    expect(cacheCandidates([installed])[0]).toMatchObject({ name: 'demo', installs: 42, trustLevel: 'community' })
     expect((await cache.load(installed)).content).toContain('Use the remote demo')
   })
 
-  it('rejects an installed SKILL.md that differs from its GitHub search preview', async () => {
+  it('rejects an installed SKILL.md that differs from its unique pinned source', async () => {
     const root = await mkdtemp(join(tmpdir(), 'skillflux-cache-preview-'))
     roots.push(root)
     const candidate: RemoteCandidate = {
@@ -316,6 +335,10 @@ describe('persistent cache', () => {
       forks: 5,
       recentlyActive: true,
       trustedSource: false,
+      trustLevel: 'community',
+      qualityBreakdown: { relevance: 55, adoption: 0, repository: 5, freshness: 6, trust: 0, provenance: 4, total: 70 },
+      qualitySignals: ['content-pinned'],
+      qualityWarnings: [],
       skillFileHash: '0'.repeat(64),
     }
     const cache = new SkillCache({
@@ -323,12 +346,49 @@ describe('persistent cache', () => {
       maxFiles: 10,
       maxBytes: 10_000,
       installTimeoutMs: 1_000,
+      verifyCandidate: async () => ({ path: 'skills/demo/SKILL.md', skillFileHash: candidate.skillFileHash! }),
       runInstaller: async invocation => {
         const downloaded = join(invocation.cwd, '.agents', 'skills', 'demo')
         await mkdir(downloaded, { recursive: true })
         await writeFile(join(downloaded, 'SKILL.md'), '---\nname: demo\ndescription: Changed\n---\nChanged.\n')
       },
     })
-    await expect(cache.install(candidate)).rejects.toThrow('does not match the GitHub search preview')
+    await expect(cache.install(candidate)).rejects.toThrow('does not match the unique pinned GitHub source')
+  })
+
+  it('times out a non-cooperative verifier and remains usable for the next install', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-cache-verifier-timeout-'))
+    roots.push(root)
+    const downloadedMarkdown = '---\nname: demo\ndescription: Timeout recovery\n---\nRecover after timeout.\n'
+    const sourceHash = createHash('sha256').update(downloadedMarkdown).digest('hex')
+    let verifierHangs = true
+    const cache = new SkillCache({
+      root,
+      maxFiles: 10,
+      maxBytes: 10_000,
+      installTimeoutMs: 25,
+      verifyCandidate: async () => verifierHangs
+        ? await new Promise(() => undefined)
+        : { path: 'skills/demo/SKILL.md', skillFileHash: sourceHash },
+      runInstaller: async invocation => {
+        const downloaded = join(invocation.cwd, '.agents', 'skills', 'demo')
+        await mkdir(downloaded, { recursive: true })
+        await writeFile(join(downloaded, 'SKILL.md'), downloadedMarkdown)
+      },
+    })
+    const candidate: RemoteCandidate = {
+      id: 'remote-timeout', origin: 'remote', name: 'demo', description: 'Timeout recovery',
+      source: 'owner/repo', ref: 'f'.repeat(40), score: 70, skillId: 'demo', installs: 0,
+      discoverySources: ['skills.sh'], qualityScore: 70, relevanceScore: 100, stars: 1, forks: 0,
+      recentlyActive: true, trustedSource: false, trustLevel: 'community',
+      qualityBreakdown: { relevance: 55, adoption: 0, repository: 1, freshness: 10, trust: 2, provenance: 0, total: 68 },
+      qualitySignals: ['recent-activity'], qualityWarnings: ['single-source', 'content-not-previewed'],
+    }
+    await expect(cache.install(candidate)).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(await cache.list()).toEqual([])
+    verifierHangs = false
+    await expect(cache.install(candidate)).resolves.toMatchObject({
+      manifest: { name: 'demo', sourcePath: 'skills/demo/SKILL.md', sourceSkillFileHash: sourceHash },
+    })
   })
 })

@@ -98,6 +98,8 @@ Keep changes focused and add tests for behavior or security boundaries. Router
 changes should add or update a case in
 [`evals/routing-cases.json`](evals/routing-cases.json). Remote quality changes
 should update [`evals/remote-quality-cases.json`](evals/remote-quality-cases.json).
+Evidence-level, owner-policy, or content-deduplication changes should update
+[`evals/remote-governance-cases.json`](evals/remote-governance-cases.json).
 Discovery cache policy changes should update
 [`evals/remote-cache-cases.json`](evals/remote-cache-cases.json).
 Installed cache governance changes should update

@@ -85,8 +85,8 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 - 可选使用保守的 token 估算预算限制 Skill 目录提示。
 - 从 DSH Registry、SkillFlux 缓存、[skills.sh](https://skills.sh/) 和经过
   身份验证的 GitHub `SKILL.md` Code Search 发现候选。
-- 根据任务相关性、市场安装量、仓库活跃度、stars、forks、license 元数据及配置的
-  可信 owner，对远程结果重新排序。
+- 根据任务相关性、市场安装量、仓库活跃度、stars、forks、license、内容来源及
+  owner 策略重新排序，并为每个结果输出可解释的证据等级和告警。
 - 将远程候选固定到不可变的 GitHub commit SHA。
 - 通过当前 Agent 的 `ctx.skills` scope 注册缓存 Skill。
 - 每次加载前使用 SHA-256 manifest 校验缓存内容。
@@ -138,7 +138,10 @@ SkillFlux 按以下顺序处理任务：
 3. GitHub 仓库元数据提供不可变 HEAD commit、stars、forks、license、归档状态、
    owner 类型和最近 push 时间。
 4. SkillFlux 拒绝零相关、已归档、已禁用、低于 stars 门槛或低于质量门槛的结果，
-   再返回质量最高的候选。
+   再应用配置的证据策略。
+5. 只有 candidate identity 完全相同的重复项会折叠。不同仓库即使根 `SKILL.md`
+   哈希相同也会保留，因为相邻资源可能不同；它们也不会被算成独立 provider 交叉
+   验证。
 
 质量分最高为 100。相关性既是准入门槛，也是权重最大的单项，因此高 star 但不
 相关的仓库不会仅凭热度压过精确匹配的新 Skill。
@@ -151,10 +154,25 @@ SkillFlux 按以下顺序处理任务：
 | GitHub forks | 5 |
 | 仓库活跃度，配置的近期窗口权重最高 | 10 |
 | 可信 owner、组织归属和 license 元数据 | 15 |
+| 跨来源发现与固定的 GitHub 内容预览 | 8 |
 
 `remoteRecentActivityDays` 默认是 30。窗口内活跃可获得完整 freshness 加分；更老但
 仍维护的项目会逐步衰减，而不是直接淘汰。只有经过你独立验证的 owner 才应加入
 `remoteTrustedOwners`；组织账号或高 stars 本身不等于可信认证。
+
+每个候选会标记为 `unverified`、`community`、`corroborated` 或 `trusted`。
+默认的 `remoteTrustPolicy: community` 会保留相关性高、已直接预览并固定内容的
+GitHub Skill，即使它刚创建、stars 很少，同时明确暴露 `low-adoption`、缺少
+license、活动陈旧和来源覆盖不足等告警。`corroborated` 要求内容已固定且被多个
+provider 发现；`trusted` 只表示 owner 在本地 `remoteTrustedOwners` 名单中，
+不是安全认证。`remoteBlockedOwners` 是显式拒绝名单；同一 owner 不能同时可信和
+拒绝。
+
+这些策略会在每次搜索、自动路由和挂载时重新应用到已安装的 SkillFlux 缓存。把
+owner 从 `remoteTrustedOwners` 移除会撤销缓存中的旧 `trusted` 标签；加入
+`remoteBlockedOwners` 后，即使重启也不能复用。没有证据标签的旧版缓存 manifest
+因已知不可变 commit 和安装目录哈希而按 `community` 处理，但不能通过
+`corroborated` 或 `trusted` 门槛。
 
 GitHub Code Search 需要身份验证。请从带有标准环境变量的 shell 启动 DSH，例如
 PowerShell：
@@ -176,6 +194,9 @@ dsh web
 缓存 key 是“有界归一化查询 + 当前发现与排序配置”的 SHA-256 指纹，不保存用户
 任务原文、token 或 Skill 正文。候选仍固定在最初验证过的 commit，因此 stale
 回退只影响排名证据的新鲜度，不改变源码完整性或审批对象。
+
+证据感知的缓存文档带有版本号；旧排序缓存不会套用新的信任语义，而是丢弃并通过
+在线查询重建。
 
 缓存通过原子替换写入
 `$DSH_HOME/storages/skillflux/remote-discovery.json`，默认最多 100 条，并有
@@ -220,7 +241,9 @@ remoteSearchTimeoutMs: 30000
 remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
 remoteRecentActivityDays: 30
+remoteTrustPolicy: community  # open | community | corroborated | trusted
 remoteTrustedOwners: []       # 例如 [anthropics, openai, vercel-labs]
+remoteBlockedOwners: []
 remoteCacheTtlMs: 300000                  # 0 表示关闭
 remoteCacheStaleIfErrorMs: 86400000       # TTL 后的额外 stale 窗口
 remoteCacheMaxEntries: 100
@@ -349,7 +372,8 @@ catalogTokenBudget: 512
 模型可以使用：
 
 - `skill({ name })`：加载当前回合已经挂载的 Skill 指令。
-- `skillflux_search({ query, remote? })`：搜索本地、缓存和不可变远程候选。
+- `skillflux_search({ query, remote? })`：搜索本地、缓存和不可变远程候选；远程
+  结果包含评分分项、证据等级、正向信号和告警。
 - `skillflux_mount({ candidateId })`：挂载当前 SkillFlux 发现状态中的候选。
 
 用户可以使用：
@@ -378,10 +402,17 @@ catalogTokenBudget: 512
   公共 GitHub 仓库。
 - GitHub 发现的 `SKILL.md` 限制为 256 KiB，并且必须先通过同一套 frontmatter
   parser，才能成为候选。
-- 安装器最终选中的 `SKILL.md` 必须与 GitHub 搜索预览的 SHA-256 一致，防止仓库
-  内其他同名 Skill 静默替换已展示的结果。
+- 每次新安装前，SkillFlux 都会通过 GitHub tree API 枚举固定 commit 中最多 512 个
+  `SKILL.md`，并要求目标名称只对应一个可用 Skill；skills.sh-only 与 GitHub Code
+  Search 结果都执行该检查。
+- 已验证源文件的 SHA-256 必须同时匹配之前的 GitHub 搜索预览（若有）和安装器最终
+  选中的 `SKILL.md`。因此同一仓库多个路径中的同名文件即使根文件字节相同也会因
+  歧义被拒绝，因为相邻资源仍可能不同。
+- 没有完整 Skill 目录哈希时，跨仓库相同根文件哈希不会被折叠或称为镜像。
 - 已归档和已禁用仓库会被拒绝。热度、活跃度和 license 只是排序证据，不是安全
   审计结论。
+- `remoteTrustPolicy` 是证据门槛，不是恶意代码扫描器；`trusted` 只反映当前本地
+  配置的 owner 白名单，证据门槛与拒绝名单也会治理已安装 SkillFlux 缓存的复用。
 - 每个远程结果先解析为 40 位 commit SHA，再生成 candidate ID。
 - 通过固定的 `skills@1.5.23` CLI 下载该 SHA 对应的不可变 GitHub codeload
   归档。
@@ -415,8 +446,8 @@ corepack pnpm eval
 ```
 
 测评包含 36 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
-场景、7 个目录预算场景、8 个远程质量两两对比场景、7 个远程缓存策略场景和
-7 个已安装缓存治理场景，
+场景、7 个目录预算场景、8 个远程质量两两对比场景、8 个远程证据治理场景、
+7 个远程缓存策略场景和 7 个已安装缓存治理场景，
 覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、
 语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期、价值淘汰、
 活动挂载保护和负例拒绝。
@@ -431,6 +462,7 @@ corepack pnpm eval
 | 语义正例 Top-1 | 100.0% |
 | 语义负例拒绝率 | 100.0% |
 | 远程质量两两排序正确率 | 100.0% |
+| 远程证据治理边界正确率 | 100.0% |
 | 远程缓存策略边界正确率 | 100.0% |
 | 已安装缓存治理边界正确率 | 100.0% |
 
@@ -474,7 +506,9 @@ corepack pnpm pack --dry-run
 `GH_TOKEN` 时还会测试 GitHub Code Search，并验证第二次相同查询由持久发现缓存
 直接返回。可用 `SKILLFLUX_DISCOVERY_QUERY`
 替换任务，用 `SKILLFLUX_TRUSTED_OWNERS` 传入逗号分隔的可信 owner，或设置
-`SKILLFLUX_REQUIRE_GITHUB=1`，让 GitHub provider 不可用时测试直接失败。
+`SKILLFLUX_BLOCKED_OWNERS` 提供拒绝 owner；`SKILLFLUX_TRUST_POLICY` 可覆盖
+smoke test 的证据门槛。设置 `SKILLFLUX_REQUIRE_GITHUB=1`，可让 GitHub
+provider 不可用时测试直接失败。
 
 `test:embedding-live` 要求配置的 Ollama 模型已经存在。测试其他 endpoint 时可通过
 `SKILLFLUX_EMBEDDING_MODEL`、`SKILLFLUX_EMBEDDING_ENDPOINT` 和
