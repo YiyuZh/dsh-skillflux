@@ -70,7 +70,7 @@ User task
   -> select and mount within the skill-count and optional catalog-token budgets
   -> Agent calls a mounted Skill
   -> unmount at turn/end
-  -> keep downloaded files until explicit cleanup
+  -> retain or prune downloaded files by age, size, and observed value
 ```
 
 A mount is scoped to the receiving Agent. Unmounting removes the runtime
@@ -95,6 +95,8 @@ already stored in session history.
 - Resolve remote candidates to immutable GitHub commit SHAs.
 - Register cached Skills through the current Agent's `ctx.skills` scope.
 - Verify cached content with a SHA-256 manifest before every load.
+- Automatically prune idle and low-value installed Skill cache entries while
+  protecting active and in-flight mounts.
 - Support per-remote-mount, per-repository/session, and automatic approval
   policies.
 - Expose model tools for loading, searching, and mounting Skills.
@@ -202,6 +204,37 @@ The cache is stored atomically at
 `$DSH_HOME/storages/skillflux/remote-discovery.json`, limited to 100 entries by
 default, and hard-capped at 4 MiB. Set `remoteCacheTtlMs: 0` to disable it.
 
+### Installed Skill cache governance
+
+Downloaded Skills live separately under `$DSH_HOME/cache/skillflux`. After a
+remote Skill mounts successfully, SkillFlux evaluates this installed cache and
+checks it again after that session's turn releases its mounts. It removes
+entries that have been idle for 90 days by default. If the remaining pool still
+exceeds 100 entries or 512 MiB, it evicts the lowest-value entries first using
+successful Skill tool uses, mounts, last activity, quality score, and adoption as
+deterministic evidence.
+
+Usage from the initial remote candidate and later cached candidate is aggregated
+by immutable cache ID. This joins their changing candidate IDs without sharing
+value between different commits of the same Skill. Legacy records without a
+cache ID apply only to the newest matching repository/Skill version. Updates to
+the shared usage file are locked and merged across Harness processes. Active
+mounts and concurrent cache loads are protected across Service instances and
+Harness processes that share a `DSH_HOME`. Lease heartbeats bound orphan-marker
+retention if a crashed process ID is reused, while a process-local live-lease
+registry lets hot-reloaded Service instances reclaim retired markers. Automatic
+governance failures only log a warning; a compromised coordination lock fails
+the current cache operation instead of continuing without mutual exclusion.
+
+Run `/skillflux cache prune` to apply the same policy immediately. Set
+`cacheAutoPrune: false` to disable automatic runs, or `cacheMaxIdleDays: 0` to
+disable age-based eviction while retaining entry and byte limits. When
+`usageTracking` is off, governance conservatively falls back to installation
+time and immutable discovery metadata because no local usage evidence exists.
+Directories with an invalid manifest are excluded from automatic deletion,
+reported by `/skillflux status`, and can be removed explicitly with
+`/skillflux cache clean all`.
+
 ## Configuration
 
 SkillFlux accepts these plugin options:
@@ -221,6 +254,10 @@ remoteTrustedOwners: []       # e.g. [anthropics, openai, vercel-labs]
 remoteCacheTtlMs: 300000                  # 0 disables
 remoteCacheStaleIfErrorMs: 86400000       # additional stale window
 remoteCacheMaxEntries: 100
+cacheAutoPrune: true
+cacheMaxEntries: 100
+cacheMaxTotalBytes: 536870912              # 512 MiB across installed Skills
+cacheMaxIdleDays: 90                       # 0 disables idle eviction
 catalogDescriptionMaxLength: 160
 catalogTokenBudget: 0              # 0 disables; otherwise 64-1000000
 maxSkillFiles: 1000
@@ -365,6 +402,7 @@ You can use:
 /skillflux explain
 /skillflux usage
 /skillflux cache list
+/skillflux cache prune
 /skillflux cache clean <cache-id>
 /skillflux cache clean all
 /skillflux discovery-cache status
@@ -375,8 +413,9 @@ You can use:
 boost, and whether it was selected, successfully mounted, or skipped by the
 catalog budget.
 
-Cleanup skips cache entries that are still mounted. At `turn/end`, SkillFlux
-unregisters runtime mounts but retains downloaded files for later reuse.
+Cleanup and governance skip cache entries that are mounted or being loaded. At
+`turn/end`, SkillFlux unregisters runtime mounts; installed files remain
+available until a later policy run or explicit cleanup removes them.
 
 ## Security and trust
 
@@ -405,6 +444,8 @@ unregisters runtime mounts but retains downloaded files for later reuse.
   the configured embedding endpoint. It never sends Skill bodies or resources.
 - Usage records never include task text or Skill content and are bounded to
   `usageMaxEntries` entries in the DSH storage directory.
+- Installed-cache governance reads only those bounded usage counters plus
+  immutable cache metadata; it never inspects or stores task text.
 - The remote discovery cache persists only a query/configuration fingerprint and
   bounded, validated candidate metadata. It never stores the query text or API
   credentials.
@@ -425,10 +466,11 @@ corepack pnpm eval
 
 The suite contains 36 lexical cases, 4 adaptive safety cases, 8
 provider-independent semantic-vector cases, 7 catalog-budget cases, 8
-remote-quality pairwise cases, and 7 remote-cache policy cases covering English,
-Chinese, normalization, rules, thresholds, capacity, ranking, deduplication,
-semantic top-k, context budgets, freshness, trust, adoption, cache expiry, and
-negative rejection.
+remote-quality pairwise cases, 7 remote-cache policy cases, and 7 installed-cache
+governance cases covering English, Chinese, normalization, rules, thresholds,
+capacity, ranking, deduplication, semantic top-k, context budgets, freshness,
+trust, adoption, cache expiry, value-aware eviction, active-mount protection,
+and negative rejection.
 
 | Metric | Current baseline |
 | --- | ---: |
@@ -441,6 +483,7 @@ negative rejection.
 | Semantic negative rejection | 100.0% |
 | Remote-quality pairwise ordering | 100.0% |
 | Remote-cache policy boundaries | 100.0% |
+| Installed-cache governance boundaries | 100.0% |
 
 These results verify the deterministic router and vector-ranking contracts
 against checked-in inputs. The semantic vectors are synthetic, so these results
@@ -465,8 +508,9 @@ final answer from an online model. Read the
   evidence for the configured window, though every candidate remains pinned to
   its previously validated immutable commit.
 - Unmounting can't remove text already committed to session history.
-- A new upstream commit creates a new immutable cache entry. Old entries remain
-  until explicit cleanup.
+- A new upstream commit creates a new immutable cache entry. Value-aware
+  governance may retain multiple versions until they become idle or exceed a
+  configured limit.
 
 ## Development
 
@@ -478,6 +522,7 @@ and pull-request review workflow.
 corepack pnpm install
 corepack pnpm check
 corepack pnpm eval
+corepack pnpm test:cache-governance-live
 corepack pnpm test:discovery-live
 corepack pnpm test:embedding-live
 corepack pnpm pack --dry-run

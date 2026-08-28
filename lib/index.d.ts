@@ -31,6 +31,11 @@ interface SkillFluxConfig {
   readonly remoteCacheTtlMs?: number;
   readonly remoteCacheStaleIfErrorMs?: number;
   readonly remoteCacheMaxEntries?: number;
+  readonly cacheAutoPrune?: boolean;
+  readonly cacheMaxEntries?: number;
+  readonly cacheMaxTotalBytes?: number;
+  /** Zero disables idle-time eviction. */
+  readonly cacheMaxIdleDays?: number;
   readonly catalogDescriptionMaxLength?: number;
   readonly catalogTokenBudget?: number;
   readonly maxSkillFiles?: number;
@@ -68,6 +73,10 @@ interface ResolvedSkillFluxConfig {
   readonly remoteCacheTtlMs: number;
   readonly remoteCacheStaleIfErrorMs: number;
   readonly remoteCacheMaxEntries: number;
+  readonly cacheAutoPrune: boolean;
+  readonly cacheMaxEntries: number;
+  readonly cacheMaxTotalBytes: number;
+  readonly cacheMaxIdleDays: number;
   readonly catalogDescriptionMaxLength: number;
   readonly catalogTokenBudget: number;
   readonly maxSkillFiles: number;
@@ -192,6 +201,8 @@ interface SkillUsageIdentity {
   readonly name: string;
   readonly origin: CandidateOrigin;
   readonly source: string;
+  /** Present for remote and cached mounts after immutable installation. */
+  readonly cacheId?: string;
 }
 interface SkillUsageRecord extends SkillUsageIdentity {
   readonly mounts: number;
@@ -221,6 +232,87 @@ interface CacheManifest {
 interface CacheEntry {
   readonly manifest: CacheManifest;
   readonly directory: string;
+}
+//#endregion
+//#region src/cache-governance.d.ts
+type CachePruneReason = 'idle' | 'entry-limit' | 'byte-limit' | 'entry-and-byte-limit';
+interface CacheUsageEvidence {
+  readonly source: string;
+  readonly name: string;
+  /** Exact immutable cache version. Omitted only by legacy usage records. */
+  readonly cacheId?: string;
+  readonly mounts: number;
+  readonly uses: number;
+  readonly lastMountedAt?: number;
+  readonly lastUsedAt?: number;
+}
+interface CachePrunePolicy {
+  readonly maxEntries: number;
+  readonly maxTotalBytes: number;
+  /** Zero disables idle-time eviction. */
+  readonly maxIdleMs: number;
+}
+interface CachePruneDecision {
+  readonly cacheId: string;
+  readonly reason: CachePruneReason;
+}
+interface CachePrunePlan {
+  readonly decisions: readonly CachePruneDecision[];
+  readonly protected: readonly string[];
+  readonly beforeEntries: number;
+  readonly beforeBytes: number;
+  readonly afterEntries: number;
+  readonly afterBytes: number;
+}
+declare function planCachePrune(entries: readonly CacheEntry[], evidence: readonly CacheUsageEvidence[], policy: CachePrunePolicy, active?: ReadonlySet<string>, now?: number): CachePrunePlan;
+//#endregion
+//#region src/cache.d.ts
+declare function isLoopbackProxyFailure(error: unknown): boolean;
+interface CacheManagerOptions {
+  readonly root: string;
+  readonly maxFiles: number;
+  readonly maxBytes: number;
+  readonly installTimeoutMs: number;
+  readonly runInstaller?: SkillInstaller;
+  readonly removeLeaseMarker?: (file: string, directory: string) => Promise<void>;
+  readonly beforeInstallCommit?: () => Promise<void>;
+  readonly beforeLeaseDirectoryRead?: (directory: string) => Promise<void>;
+}
+interface SkillInstallerInvocation {
+  readonly executable: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
+  readonly env: NodeJS.ProcessEnv;
+}
+type SkillInstaller = (invocation: SkillInstallerInvocation) => Promise<void>;
+interface CacheInventoryStats {
+  readonly entries: number;
+  readonly totalBytes: number;
+  readonly invalidEntries: number;
+}
+declare class SkillCache {
+  private readonly options;
+  readonly root: string;
+  private readonly entriesRoot;
+  private readonly stagingRoot;
+  private readonly leasesRoot;
+  constructor(options: CacheManagerOptions);
+  list(): Promise<CacheEntry[]>;
+  get(id: string): Promise<CacheEntry | undefined>;
+  find(source: string, ref: string, skillId: string): Promise<CacheEntry | undefined>;
+  load(entry: CacheEntry, signal?: AbortSignal): Promise<SkillDefinition>;
+  install(candidate: RemoteCandidate, signal?: AbortSignal): Promise<CacheEntry>;
+  clean(selector: string, active?: ReadonlySet<string>, signal?: AbortSignal): Promise<{
+    removed: string[];
+    skipped: string[];
+  }>;
+  stats(): Promise<CacheInventoryStats>;
+  prune(policy: CachePrunePolicy, evidence?: readonly CacheUsageEvidence[], active?: ReadonlySet<string>, now?: number, signal?: AbortSignal): Promise<CachePrunePlan>;
+  createActiveLease(cacheId: string): Promise<() => Promise<void>>;
+  activeLeaseIds(signal?: AbortSignal): Promise<Set<string>>;
+  private read;
 }
 //#endregion
 //#region src/router.d.ts
@@ -295,42 +387,6 @@ interface TreeLimits {
 }
 declare function parseSkillMarkdown(raw: string, directory: string): SkillDefinition;
 declare function inspectSkillDirectory(directory: string, limits: TreeLimits, signal?: AbortSignal): Promise<ParsedSkillFile>;
-//#endregion
-//#region src/cache.d.ts
-declare function isLoopbackProxyFailure(error: unknown): boolean;
-interface CacheManagerOptions {
-  readonly root: string;
-  readonly maxFiles: number;
-  readonly maxBytes: number;
-  readonly installTimeoutMs: number;
-  readonly runInstaller?: SkillInstaller;
-}
-interface SkillInstallerInvocation {
-  readonly executable: string;
-  readonly args: readonly string[];
-  readonly cwd: string;
-  readonly timeoutMs: number;
-  readonly signal?: AbortSignal;
-  readonly env: NodeJS.ProcessEnv;
-}
-type SkillInstaller = (invocation: SkillInstallerInvocation) => Promise<void>;
-declare class SkillCache {
-  private readonly options;
-  readonly root: string;
-  private readonly entriesRoot;
-  private readonly stagingRoot;
-  constructor(options: CacheManagerOptions);
-  list(): Promise<CacheEntry[]>;
-  get(id: string): Promise<CacheEntry | undefined>;
-  find(source: string, ref: string, skillId: string): Promise<CacheEntry | undefined>;
-  load(entry: CacheEntry, signal?: AbortSignal): Promise<SkillDefinition>;
-  install(candidate: RemoteCandidate, signal?: AbortSignal): Promise<CacheEntry>;
-  clean(selector: string, active?: ReadonlySet<string>): Promise<{
-    removed: string[];
-    skipped: string[];
-  }>;
-  private read;
-}
 //#endregion
 //#region src/embedding.d.ts
 interface EmbeddingRouterOptions {
@@ -456,20 +512,20 @@ interface AdaptiveUsageOptions {
 declare class UsageStore {
   private readonly options;
   private readonly now;
-  private records;
-  private loadTask;
   private writeQueue;
   constructor(options: UsageStoreOptions);
   recordMount(identity: SkillUsageIdentity): Promise<void>;
   recordUse(identity: SkillUsageIdentity): Promise<void>;
   list(limit?: number): Promise<SkillUsageRecord[]>;
+  cacheEvidence(): Promise<CacheUsageEvidence[]>;
   boosts(candidates: readonly SkillFluxCandidate[], options: AdaptiveUsageOptions): Promise<ReadonlyMap<string, number>>;
   flush(): Promise<void>;
   private enqueue;
-  private load;
+  private readLatest;
   private readDocument;
   private trim;
   private save;
+  private withFileLock;
   private serializeWithinLimit;
   private warn;
   private currentTime;
@@ -492,9 +548,20 @@ declare class SkillFluxService extends Service {
   private readonly embedding;
   private readonly usage;
   private readonly usageTasks;
+  private cacheLeaseCount;
+  private cacheMaintenancePending;
+  private readonly cacheLeaseWaiters;
+  private readonly cacheIdleWaiters;
+  private readonly activeLeaseTasks;
+  private readonly pendingActiveLeaseCleanups;
+  private readonly cacheProcessLock;
+  private cacheMaintenanceQueue;
+  private autoPruneTask;
+  private autoPruneRequested;
   private readonly stateByAgent;
   private readonly states;
   private readonly trustedBySession;
+  private readonly cachePruneSessions;
   constructor(ctx: Context, config?: SkillFluxConfig);
   discover(agent: Agent, query: string, options?: {
     readonly remote?: boolean;
@@ -509,12 +576,14 @@ declare class SkillFluxService extends Service {
   usageRecords(limit?: number): Promise<SkillUsageRecord[]>;
   embeddingStats(): EmbeddingRouterStats | undefined;
   listCache(): Promise<CacheEntry[]>;
+  cacheStats(): Promise<CacheInventoryStats>;
   discoveryCacheStats(): Promise<RemoteDiscoveryCacheStats | undefined>;
   clearDiscoveryCache(): Promise<number>;
   cleanCache(selector: string): Promise<{
     removed: string[];
     skipped: string[];
   }>;
+  pruneCache(): Promise<CachePrunePlan>;
   private createSkillTool;
   private createSearchTool;
   private createMountTool;
@@ -536,10 +605,20 @@ declare class SkillFluxService extends Service {
   private rememberRouting;
   private markRoutingOutcome;
   private trackUsage;
+  private activeCacheIds;
+  private acquireCacheLease;
+  private releaseLocalCacheLease;
+  private acquireCacheProcessLock;
+  private runCacheMaintenance;
+  private trackActiveLeaseCleanup;
+  private retryPendingActiveLeaseCleanups;
+  private retryActiveLeaseCleanup;
+  private scheduleAutoPrune;
   private cleanupSession;
   private disposeSession;
   private disposeAgent;
+  private scheduleSessionCachePrune;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteQualityInput, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, remoteDiscoveryCacheState, remoteQualityScore, routeScore, selectCandidates, tokenize };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteQualityInput, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityScore, routeScore, selectCandidates, tokenize };
 //# sourceMappingURL=index.d.ts.map

@@ -29,6 +29,11 @@ export interface SkillFluxConfig {
   readonly remoteCacheTtlMs?: number
   readonly remoteCacheStaleIfErrorMs?: number
   readonly remoteCacheMaxEntries?: number
+  readonly cacheAutoPrune?: boolean
+  readonly cacheMaxEntries?: number
+  readonly cacheMaxTotalBytes?: number
+  /** Zero disables idle-time eviction. */
+  readonly cacheMaxIdleDays?: number
   readonly catalogDescriptionMaxLength?: number
   readonly catalogTokenBudget?: number
   readonly maxSkillFiles?: number
@@ -67,6 +72,10 @@ export interface ResolvedSkillFluxConfig {
   readonly remoteCacheTtlMs: number
   readonly remoteCacheStaleIfErrorMs: number
   readonly remoteCacheMaxEntries: number
+  readonly cacheAutoPrune: boolean
+  readonly cacheMaxEntries: number
+  readonly cacheMaxTotalBytes: number
+  readonly cacheMaxIdleDays: number
   readonly catalogDescriptionMaxLength: number
   readonly catalogTokenBudget: number
   readonly maxSkillFiles: number
@@ -202,6 +211,8 @@ export interface SkillUsageIdentity {
   readonly name: string
   readonly origin: CandidateOrigin
   readonly source: string
+  /** Present for remote and cached mounts after immutable installation. */
+  readonly cacheId?: string
 }
 
 export interface SkillUsageRecord extends SkillUsageIdentity {

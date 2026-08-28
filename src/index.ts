@@ -1,5 +1,7 @@
 import { Service, type Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { mkdir } from 'node:fs/promises'
+import { lock, type LockOptions } from 'proper-lockfile'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
@@ -14,7 +16,8 @@ import {
   type SkillInvocationSource,
 } from '@deepseek-ai/dsh-skill'
 import { defineTool, type PreToolDecision, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
-import { SkillCache } from './cache.js'
+import { SkillCache, type CacheInventoryStats } from './cache.js'
+import type { CachePrunePlan } from './cache-governance.js'
 import { estimateCatalogTokens, updateCatalog, updateRemoteCandidates } from './catalog.js'
 import { EmbeddingRouter } from './embedding.js'
 import { RemoteDiscoveryClient } from './remote.js'
@@ -40,7 +43,15 @@ export type * from './types.js'
 export { normalizeText, routeScore, selectCandidates, tokenize } from './router.js'
 export { estimateCatalogTokens, estimateTextTokens } from './catalog.js'
 export { parseSkillMarkdown, inspectSkillDirectory } from './skill-file.js'
-export { SkillCache, isLoopbackProxyFailure } from './cache.js'
+export { SkillCache, isLoopbackProxyFailure, type CacheInventoryStats } from './cache.js'
+export {
+  planCachePrune,
+  type CachePruneDecision,
+  type CachePrunePlan,
+  type CachePrunePolicy,
+  type CachePruneReason,
+  type CacheUsageEvidence,
+} from './cache-governance.js'
 export { EmbeddingRouter, type EmbeddingRouterOptions } from './embedding.js'
 export {
   RemoteDiscoveryClient,
@@ -76,6 +87,10 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   remoteCacheTtlMs: 5 * 60_000,
   remoteCacheStaleIfErrorMs: 24 * 60 * 60_000,
   remoteCacheMaxEntries: 100,
+  cacheAutoPrune: true,
+  cacheMaxEntries: 100,
+  cacheMaxTotalBytes: 512 * 1024 * 1024,
+  cacheMaxIdleDays: 90,
   catalogDescriptionMaxLength: 160,
   catalogTokenBudget: 0,
   maxSkillFiles: 1_000,
@@ -160,6 +175,13 @@ function catalogTokenBudget(value: number): number {
   if (value === 0) return value
   return boundedInteger('catalogTokenBudget', value, 64, 1_000_000)
 }
+
+interface CacheProcessLockRelease {
+  (): Promise<void>
+  readonly signal: AbortSignal
+}
+
+type CacheLockFunction = (file: string, options?: LockOptions) => Promise<() => Promise<void>>
 
 function remoteProviders(values: ResolvedSkillFluxConfig['remoteProviders']): ResolvedSkillFluxConfig['remoteProviders'] {
   const providers = [...new Set(values)]
@@ -253,6 +275,25 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
       config.remoteCacheMaxEntries ?? DEFAULTS.remoteCacheMaxEntries,
       1,
       1_000,
+    ),
+    cacheAutoPrune: config.cacheAutoPrune ?? DEFAULTS.cacheAutoPrune,
+    cacheMaxEntries: boundedInteger(
+      'cacheMaxEntries',
+      config.cacheMaxEntries ?? DEFAULTS.cacheMaxEntries,
+      1,
+      10_000,
+    ),
+    cacheMaxTotalBytes: boundedInteger(
+      'cacheMaxTotalBytes',
+      config.cacheMaxTotalBytes ?? DEFAULTS.cacheMaxTotalBytes,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    cacheMaxIdleDays: boundedInteger(
+      'cacheMaxIdleDays',
+      config.cacheMaxIdleDays ?? DEFAULTS.cacheMaxIdleDays,
+      0,
+      3_650,
     ),
     catalogDescriptionMaxLength: positiveInteger(
       'catalogDescriptionMaxLength',
@@ -437,6 +478,10 @@ export class SkillFluxService extends Service {
     remoteCacheTtlMs: z.number().default(DEFAULTS.remoteCacheTtlMs),
     remoteCacheStaleIfErrorMs: z.number().default(DEFAULTS.remoteCacheStaleIfErrorMs),
     remoteCacheMaxEntries: z.number().default(DEFAULTS.remoteCacheMaxEntries),
+    cacheAutoPrune: z.boolean().default(DEFAULTS.cacheAutoPrune),
+    cacheMaxEntries: z.number().default(DEFAULTS.cacheMaxEntries),
+    cacheMaxTotalBytes: z.number().default(DEFAULTS.cacheMaxTotalBytes),
+    cacheMaxIdleDays: z.number().default(DEFAULTS.cacheMaxIdleDays),
     catalogDescriptionMaxLength: z.number().default(DEFAULTS.catalogDescriptionMaxLength),
     catalogTokenBudget: z.number().default(DEFAULTS.catalogTokenBudget),
     maxSkillFiles: z.number().default(DEFAULTS.maxSkillFiles),
@@ -467,9 +512,20 @@ export class SkillFluxService extends Service {
   private readonly embedding: EmbeddingRouter | undefined
   private readonly usage: UsageStore | undefined
   private readonly usageTasks = new Set<Promise<void>>()
+  private cacheLeaseCount = 0
+  private cacheMaintenancePending = false
+  private readonly cacheLeaseWaiters = new Set<() => void>()
+  private readonly cacheIdleWaiters = new Set<() => void>()
+  private readonly activeLeaseTasks = new Set<Promise<void>>()
+  private readonly pendingActiveLeaseCleanups = new Set<() => Promise<void>>()
+  private readonly cacheProcessLock: CacheLockFunction = lock
+  private cacheMaintenanceQueue: Promise<void> = Promise.resolve()
+  private autoPruneTask: Promise<void> | undefined
+  private autoPruneRequested = false
   private readonly stateByAgent = new WeakMap<Agent, AgentState>()
   private readonly states = new Set<AgentState>()
   private readonly trustedBySession = new WeakMap<Session, Set<string>>()
+  private readonly cachePruneSessions = new WeakSet<Session>()
 
   constructor(ctx: Context, config: SkillFluxConfig = {}) {
     super(ctx, 'skillFlux')
@@ -574,12 +630,19 @@ export class SkillFluxService extends Service {
     })
 
     ctx.on('session/event', (session, event) => {
-      if (event.type === 'turn/end') this.cleanupSession(session)
+      if (event.type !== 'turn/end') return
+      this.cleanupSession(session)
+      this.scheduleSessionCachePrune(session)
     })
     ctx.on('session/disposed', session => { this.disposeSession(session) })
     ctx.on('agent/disposed', ({ agent }) => { this.disposeAgent(agent) })
-    ctx.effect(() => () => {
+    ctx.effect(() => async () => {
       for (const state of this.states) this.cleanupState(state, true)
+      await Promise.all(this.usageTasks)
+      await this.usage?.flush()
+      while (this.activeLeaseTasks.size > 0) await Promise.all(this.activeLeaseTasks)
+      await this.retryPendingActiveLeaseCleanups()
+      await this.autoPruneTask
     })
   }
 
@@ -691,6 +754,10 @@ export class SkillFluxService extends Service {
     return await this.cache.list()
   }
 
+  async cacheStats(): Promise<CacheInventoryStats> {
+    return await this.cache.stats()
+  }
+
   async discoveryCacheStats(): Promise<RemoteDiscoveryCacheStats | undefined> {
     return await this.remote.discoveryCacheStats()
   }
@@ -700,11 +767,23 @@ export class SkillFluxService extends Service {
   }
 
   async cleanCache(selector: string): Promise<{ removed: string[]; skipped: string[] }> {
-    const activeIds = new Set<string>()
-    for (const state of this.states) {
-      for (const item of state.active.values()) if (item.cacheId !== undefined) activeIds.add(item.cacheId)
-    }
-    return await this.cache.clean(selector, activeIds)
+    return await this.runCacheMaintenance(async signal =>
+      await this.cache.clean(selector, this.activeCacheIds(), signal))
+  }
+
+  async pruneCache(): Promise<CachePrunePlan> {
+    return await this.runCacheMaintenance(async signal => {
+      signal.throwIfAborted()
+      await Promise.all(this.usageTasks)
+      signal.throwIfAborted()
+      const evidence = await this.usage?.cacheEvidence() ?? []
+      signal.throwIfAborted()
+      return await this.cache.prune({
+        maxEntries: this.config.cacheMaxEntries,
+        maxTotalBytes: this.config.cacheMaxTotalBytes,
+        maxIdleMs: this.config.cacheMaxIdleDays * 24 * 60 * 60_000,
+      }, evidence, this.activeCacheIds(), Date.now(), signal)
+    })
   }
 
   private createSkillTool() {
@@ -891,7 +970,7 @@ export class SkillFluxService extends Service {
     ctx.commands.register({
       name: 'skillflux',
       description: 'inspect SkillFlux mounts and manage its persistent cache',
-      input: { hint: 'status | explain | usage | cache list | cache clean <cache-id|all> | discovery-cache status | discovery-cache clean' },
+      input: { hint: 'status | explain | usage | cache list | cache prune | cache clean <cache-id|all> | discovery-cache status | discovery-cache clean' },
       handler: async invocation => await this.executeCommand(invocation),
     })
   }
@@ -902,6 +981,7 @@ export class SkillFluxService extends Service {
       const mounted = this.mounted(invocation.agent)
       const stats = this.embeddingStats()
       const discoveryCache = await this.discoveryCacheStats()
+      const installedCache = await this.cacheStats()
       const catalog = this.catalogStats(invocation.agent)
       const router = this.config.routerMode === 'lexical'
         ? 'Router: lexical.'
@@ -914,9 +994,12 @@ export class SkillFluxService extends Service {
       const discoveryCacheStatus = discoveryCache === undefined
         ? 'Remote discovery cache: unavailable.'
         : `Remote discovery cache: ${discoveryCache.enabled ? 'on' : 'off'}; ${discoveryCache.entries}/${this.config.remoteCacheMaxEntries} entries; hits ${discoveryCache.hits}, misses ${discoveryCache.misses}, stale fallbacks ${discoveryCache.staleHits}.`
+      const idlePolicy = this.config.cacheMaxIdleDays === 0 ? 'off' : `${this.config.cacheMaxIdleDays} days`
+      const invalidCacheStatus = installedCache.invalidEntries === 0 ? '' : `; invalid entries ${installedCache.invalidEntries} (use cache clean all)`
+      const installedCacheStatus = `Installed Skill cache: ${installedCache.entries}/${this.config.cacheMaxEntries} entries, ${installedCache.totalBytes}/${this.config.cacheMaxTotalBytes} bytes; auto prune ${this.config.cacheAutoPrune ? 'on' : 'off'}; idle limit ${idlePolicy}${invalidCacheStatus}.`
       return {
         kind: 'success',
-        text: `${router}\n${telemetry}\n${discovery}\n${discoveryCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
+        text: `${router}\n${telemetry}\n${discovery}\n${discoveryCacheStatus}\n${installedCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
           : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
       }
@@ -969,6 +1052,16 @@ export class SkillFluxService extends Service {
         text: `Removed ${result.removed.length} cache entr${result.removed.length === 1 ? 'y' : 'ies'}${result.skipped.length === 0 ? '.' : `; skipped active: ${result.skipped.join(', ')}.`}`,
       }
     }
+    if (parts.length === 2 && parts[0] === 'cache' && parts[1] === 'prune') {
+      const plan = await this.pruneCache()
+      const reasons = new Map<string, number>()
+      for (const decision of plan.decisions) reasons.set(decision.reason, (reasons.get(decision.reason) ?? 0) + 1)
+      const reasonText = [...reasons.entries()].map(([reason, count]) => `${reason}: ${count}`).join(', ')
+      return {
+        kind: 'success',
+        text: `SkillFlux cache prune removed ${plan.decisions.length} entr${plan.decisions.length === 1 ? 'y' : 'ies'}${reasonText.length === 0 ? '' : ` (${reasonText})`}; ${plan.afterEntries} entries and ${plan.afterBytes} bytes remain${plan.protected.length === 0 ? '.' : `; protected active: ${plan.protected.join(', ')}.`}`,
+      }
+    }
     if (parts.length === 2 && parts[0] === 'discovery-cache' && parts[1] === 'status') {
       const stats = await this.discoveryCacheStats()
       return {
@@ -982,7 +1075,7 @@ export class SkillFluxService extends Service {
       const removed = await this.clearDiscoveryCache()
       return { kind: 'success', text: `Removed ${removed} remote discovery cache entr${removed === 1 ? 'y' : 'ies'}.` }
     }
-    return { kind: 'error', text: 'Usage: /skillflux status | explain | usage | cache list | cache clean <cache-id|all> | discovery-cache status | discovery-cache clean' }
+    return { kind: 'error', text: 'Usage: /skillflux status | explain | usage | cache list | cache prune | cache clean <cache-id|all> | discovery-cache status | discovery-cache clean' }
   }
 
   private async routeTurn(
@@ -1136,72 +1229,127 @@ export class SkillFluxService extends Service {
       return mounted
     }
 
-    let entry: CacheEntry
-    if (candidate.origin === 'cache') {
-      const cached = await this.cache.get(candidate.cacheId)
-      signal?.throwIfAborted()
-      this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-      if (cached === undefined) throw new Error(`cache entry "${candidate.cacheId}" no longer exists`)
-      entry = cached
-    } else {
-      entry = await this.cache.install(candidate, signal)
-      signal?.throwIfAborted()
-      this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-    }
-    const definition = await this.cache.load(entry, signal)
-    signal?.throwIfAborted()
-    this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-    if (!isModelInvocable(definition)) throw new Error(`skill "${definition.name}" is not model-invocable`)
-    const raced = state.active.get(definition.name)
-    if (raced !== undefined) return raced
-    this.assertCapacity(state, definition.name)
-    this.assertCatalogBudget(state, definition)
-    this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-    const dispose = state.agent.ctx.skills.register({
-      name: definition.name,
-      description: definition.description,
-      ...(definition.whenToUse === undefined ? {} : { whenToUse: definition.whenToUse }),
-      invocation: definition.invocation,
-      source: 'runtime',
-      provider: 'skillflux-cache',
-      ...(definition.resourceBase === undefined ? {} : { resourceBase: definition.resourceBase }),
-      ...(definition.path === undefined ? {} : { path: definition.path }),
-      ...(definition.metadata === undefined ? {} : { metadata: definition.metadata }),
-      content: definition.content,
-    })
+    const releaseLease = await this.acquireCacheLease()
+    const cacheSignal = releaseLease.signal === undefined
+      ? signal
+      : signal === undefined
+        ? releaseLease.signal
+        : AbortSignal.any([signal, releaseLease.signal])
     try {
+      let entry: CacheEntry
+      if (candidate.origin === 'cache') {
+        const cached = await this.cache.get(candidate.cacheId)
+        cacheSignal?.throwIfAborted()
+        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
+        if (cached === undefined) throw new Error(`cache entry "${candidate.cacheId}" no longer exists`)
+        entry = cached
+      } else {
+        entry = await this.cache.install(candidate, cacheSignal)
+        cacheSignal?.throwIfAborted()
+        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
+      }
+      const definition = await this.cache.load(entry, cacheSignal)
+      cacheSignal?.throwIfAborted()
       this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-    } catch (error: unknown) {
-      try { dispose() } catch (disposeError: unknown) {
-        this.runtimeCtx.logger.warn(`SkillFlux stale mount rollback failed: ${errorMessage(disposeError)}`)
+      if (!isModelInvocable(definition)) throw new Error(`skill "${definition.name}" is not model-invocable`)
+      const raced = state.active.get(definition.name)
+      if (raced !== undefined) {
+        await releaseLease()
+        cacheSignal?.throwIfAborted()
+        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
+        if (state.active.get(raced.name) !== raced) throw new ExpiredAgentStateError()
+        return raced
       }
-      throw error
-    }
-    state.disposers.set(definition.name, dispose)
-    const mounted: MountedSkill = {
-      candidateId: candidate.id,
-      name: definition.name,
-      origin: candidate.origin,
-      source: candidate.source,
-      cacheId: entry.manifest.cacheId,
-      selection: candidate.selection ?? 'manual',
-      score: candidate.score,
-      ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
-      ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
-      definition,
-    }
-    state.active.set(definition.name, mounted)
-    this.rememberRouting(state, mounted)
-    this.trackUsage(this.usage?.recordMount(usageIdentity(mounted)))
-    if (candidate.origin === 'remote' && this.config.approvalPolicy === 'session') {
-      let trusted = this.trustedBySession.get(state.agent.session)
-      if (trusted === undefined) {
-        trusted = new Set()
-        this.trustedBySession.set(state.agent.session, trusted)
+      this.assertCapacity(state, definition.name)
+      this.assertCatalogBudget(state, definition)
+      this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
+      const releaseActiveLease = await this.cache.createActiveLease(entry.manifest.cacheId)
+      try {
+        cacheSignal?.throwIfAborted()
+        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
+      } catch (error: unknown) {
+        await this.trackActiveLeaseCleanup(releaseActiveLease)
+        throw error
       }
-      trusted.add(candidate.source)
+      let dispose: () => void
+      try {
+        dispose = state.agent.ctx.skills.register({
+          name: definition.name,
+          description: definition.description,
+          ...(definition.whenToUse === undefined ? {} : { whenToUse: definition.whenToUse }),
+          invocation: definition.invocation,
+          source: 'runtime',
+          provider: 'skillflux-cache',
+          ...(definition.resourceBase === undefined ? {} : { resourceBase: definition.resourceBase }),
+          ...(definition.path === undefined ? {} : { path: definition.path }),
+          ...(definition.metadata === undefined ? {} : { metadata: definition.metadata }),
+          content: definition.content,
+        })
+      } catch (error: unknown) {
+        await this.trackActiveLeaseCleanup(releaseActiveLease)
+        throw error
+      }
+      let activeCleanupTask: Promise<void> | undefined
+      let runtimeDisposed = false
+      const disposeMounted = () => {
+        if (runtimeDisposed) return
+        runtimeDisposed = true
+        try {
+          dispose()
+        } finally {
+          activeCleanupTask = this.trackActiveLeaseCleanup(releaseActiveLease)
+        }
+      }
+      state.disposers.set(definition.name, disposeMounted)
+      const mounted: MountedSkill = {
+        candidateId: candidate.id,
+        name: definition.name,
+        origin: candidate.origin,
+        source: candidate.source,
+        cacheId: entry.manifest.cacheId,
+        selection: candidate.selection ?? 'manual',
+        score: candidate.score,
+        ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
+        ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
+        definition,
+      }
+      state.active.set(definition.name, mounted)
+      try {
+        await releaseLease()
+        cacheSignal?.throwIfAborted()
+        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
+        if (state.active.get(mounted.name) !== mounted) throw new ExpiredAgentStateError()
+      } catch (error: unknown) {
+        if (state.active.get(mounted.name) === mounted) {
+          state.active.delete(mounted.name)
+          if (state.disposers.get(mounted.name) === disposeMounted) state.disposers.delete(mounted.name)
+          try {
+            disposeMounted()
+          } catch (disposeError: unknown) {
+            this.runtimeCtx.logger.warn(`SkillFlux cancelled mount rollback failed: ${errorMessage(disposeError)}`)
+          }
+          if (activeCleanupTask !== undefined) await activeCleanupTask
+        }
+        throw error
+      }
+      this.rememberRouting(state, mounted)
+      this.trackUsage(this.usage?.recordMount(usageIdentity(mounted)))
+      if (candidate.origin === 'remote') {
+        this.cachePruneSessions.add(state.agent.session)
+        this.scheduleAutoPrune()
+        if (this.config.approvalPolicy === 'session') {
+          let trusted = this.trustedBySession.get(state.agent.session)
+          if (trusted === undefined) {
+            trusted = new Set()
+            this.trustedBySession.set(state.agent.session, trusted)
+          }
+          trusted.add(candidate.source)
+        }
+      }
+      return mounted
+    } finally {
+      await releaseLease()
     }
-    return mounted
   }
 
   private assertCapacity(state: AgentState, name: string): void {
@@ -1368,6 +1516,180 @@ export class SkillFluxService extends Service {
     this.usageTasks.add(tracked)
   }
 
+  private activeCacheIds(): Set<string> {
+    const activeIds = new Set<string>()
+    for (const state of this.states) {
+      for (const item of state.active.values()) if (item.cacheId !== undefined) activeIds.add(item.cacheId)
+    }
+    return activeIds
+  }
+
+  private async acquireCacheLease(): Promise<CacheProcessLockRelease> {
+    while (this.cacheMaintenancePending) {
+      await new Promise<void>(resolve => { this.cacheLeaseWaiters.add(resolve) })
+    }
+    this.cacheLeaseCount += 1
+    let releaseProcessLock: CacheProcessLockRelease
+    try {
+      releaseProcessLock = await this.acquireCacheProcessLock()
+    } catch (error: unknown) {
+      this.releaseLocalCacheLease()
+      throw error
+    }
+    let releaseTask: Promise<void> | undefined
+    const release = async () => {
+      releaseTask ??= (async () => {
+        try {
+          await releaseProcessLock()
+        } finally {
+          this.releaseLocalCacheLease()
+        }
+      })()
+      await releaseTask
+    }
+    return Object.assign(release, { signal: releaseProcessLock.signal })
+  }
+
+  private releaseLocalCacheLease(): void {
+    this.cacheLeaseCount = Math.max(0, this.cacheLeaseCount - 1)
+    if (this.cacheLeaseCount !== 0) return
+    for (const resolve of this.cacheIdleWaiters) resolve()
+    this.cacheIdleWaiters.clear()
+  }
+
+  private async acquireCacheProcessLock(): Promise<CacheProcessLockRelease> {
+    await mkdir(this.cache.root, { recursive: true })
+    const stale = Math.max(10_000, this.config.installTimeoutMs * 2)
+    const controller = new AbortController()
+    let compromised: Error | undefined
+    const releaseFileLock = await this.cacheProcessLock(this.cache.root, {
+      realpath: false,
+      stale,
+      update: Math.max(1_000, Math.min(10_000, Math.floor(stale / 2))),
+      retries: {
+        retries: Math.ceil((this.config.installTimeoutMs + 30_000) / 250),
+        factor: 1,
+        minTimeout: 250,
+        maxTimeout: 250,
+        randomize: true,
+      },
+      onCompromised: error => {
+        compromised = error
+        controller.abort(error)
+      },
+    })
+    let releaseTask: Promise<void> | undefined
+    const release = async () => {
+      releaseTask ??= (async () => {
+        let releaseError: unknown
+        try {
+          await releaseFileLock()
+        } catch (error: unknown) {
+          releaseError = error
+        }
+        if (compromised !== undefined) {
+          throw new Error(`SkillFlux cache process lock was compromised: ${errorMessage(compromised)}`, {
+            cause: compromised,
+          })
+        }
+        if (releaseError !== undefined) throw releaseError
+      })()
+      await releaseTask
+    }
+    return Object.assign(release, { signal: controller.signal })
+  }
+
+  private async runCacheMaintenance<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const task = this.cacheMaintenanceQueue.then(async () => {
+      this.cacheMaintenancePending = true
+      if (this.cacheLeaseCount > 0) {
+        await new Promise<void>(resolve => { this.cacheIdleWaiters.add(resolve) })
+      }
+      await this.retryPendingActiveLeaseCleanups()
+      let releaseProcessLock: CacheProcessLockRelease | undefined
+      try {
+        releaseProcessLock = await this.acquireCacheProcessLock()
+        releaseProcessLock.signal.throwIfAborted()
+        const result = await operation(releaseProcessLock.signal)
+        releaseProcessLock.signal.throwIfAborted()
+        await releaseProcessLock()
+        return result
+      } finally {
+        try {
+          if (releaseProcessLock !== undefined) await releaseProcessLock()
+        } finally {
+          this.cacheMaintenancePending = false
+          for (const resolve of this.cacheLeaseWaiters) resolve()
+          this.cacheLeaseWaiters.clear()
+        }
+      }
+    })
+    this.cacheMaintenanceQueue = task.then(() => undefined, () => undefined)
+    return await task
+  }
+
+  private trackActiveLeaseCleanup(operation: () => Promise<void>): Promise<void> {
+    this.pendingActiveLeaseCleanups.add(operation)
+    let tracked: Promise<void>
+    tracked = this.retryActiveLeaseCleanup(operation)
+      .then(() => { this.pendingActiveLeaseCleanups.delete(operation) })
+      .catch((error: unknown) => {
+        this.runtimeCtx.logger.warn(`SkillFlux active cache lease cleanup failed: ${errorMessage(error)}`)
+      })
+      .finally(() => { this.activeLeaseTasks.delete(tracked) })
+    this.activeLeaseTasks.add(tracked)
+    return tracked
+  }
+
+  private async retryPendingActiveLeaseCleanups(): Promise<void> {
+    while (this.activeLeaseTasks.size > 0) await Promise.all(this.activeLeaseTasks)
+    for (const operation of this.pendingActiveLeaseCleanups) {
+      try {
+        await this.retryActiveLeaseCleanup(operation)
+        this.pendingActiveLeaseCleanups.delete(operation)
+      } catch (error: unknown) {
+        this.runtimeCtx.logger.warn(`SkillFlux pending active cache lease cleanup failed: ${errorMessage(error)}`)
+      }
+    }
+  }
+
+  private async retryActiveLeaseCleanup(operation: () => Promise<void>): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await operation()
+        return
+      } catch (error: unknown) {
+        lastError = error
+        if (attempt < 2) await new Promise<void>(resolve => { setTimeout(resolve, 25 * (attempt + 1)) })
+      }
+    }
+    throw lastError
+  }
+
+  private scheduleAutoPrune(): void {
+    if (!this.config.cacheAutoPrune) return
+    this.autoPruneRequested = true
+    if (this.autoPruneTask !== undefined) return
+    const task = (async () => {
+      while (this.autoPruneRequested) {
+        this.autoPruneRequested = false
+        try {
+          const plan = await this.pruneCache()
+          if (plan.decisions.length > 0) {
+            this.runtimeCtx.logger.info(`SkillFlux cache governance removed ${plan.decisions.length} low-value entr${plan.decisions.length === 1 ? 'y' : 'ies'}.`)
+          }
+        } catch (error: unknown) {
+          this.runtimeCtx.logger.warn(`SkillFlux automatic cache pruning failed open: ${errorMessage(error)}`)
+        }
+      }
+    })()
+      .finally(() => {
+        if (this.autoPruneTask === task) this.autoPruneTask = undefined
+      })
+    this.autoPruneTask = task
+  }
+
   private cleanupSession(session: Session): void {
     for (const state of this.states) {
       if (state.agent.session !== session) continue
@@ -1381,12 +1703,23 @@ export class SkillFluxService extends Service {
       if (state.agent.session === session) this.cleanupState(state, true)
     }
     this.trustedBySession.delete(session)
+    this.scheduleSessionCachePrune(session)
   }
 
   private disposeAgent(agent: Agent): void {
     const state = this.stateByAgent.get(agent)
+    const session = state?.agent.session
     if (state !== undefined) this.cleanupState(state, true)
     this.stateByAgent.delete(agent)
+    if (session !== undefined && ![...this.states].some(item => item.agent.session === session)) {
+      this.scheduleSessionCachePrune(session)
+    }
+  }
+
+  private scheduleSessionCachePrune(session: Session): void {
+    if (!this.cachePruneSessions.has(session)) return
+    this.cachePruneSessions.delete(session)
+    this.scheduleAutoPrune()
   }
 }
 
@@ -1428,6 +1761,7 @@ function usageIdentity(mounted: MountedSkill): SkillUsageIdentity {
     name: mounted.name,
     origin: mounted.origin,
     source: mounted.source,
+    ...(mounted.cacheId === undefined ? {} : { cacheId: mounted.cacheId }),
   }
 }
 

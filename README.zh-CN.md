@@ -68,7 +68,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
   -> 在 Skill 数量和可选目录 token 预算内选择并挂载
   -> Agent 调用已挂载的 Skill
   -> turn/end 自动卸载
-  -> 下载文件保留到用户主动清理
+  -> 按闲置时间、容量和实际使用价值保留或清理下载文件
 ```
 
 每个挂载只属于接收任务的 Agent。卸载会阻止它继续出现在后续目录，但不会删除
@@ -90,6 +90,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 - 将远程候选固定到不可变的 GitHub commit SHA。
 - 通过当前 Agent 的 `ctx.skills` scope 注册缓存 Skill。
 - 每次加载前使用 SHA-256 manifest 校验缓存内容。
+- 自动清理闲置和低价值的已安装 Skill 缓存，同时保护活动挂载和正在加载的条目。
 - 支持每次远程挂载审批、仓库会话内首次审批和自动审批三种策略。
 - 提供加载、搜索和挂载 Skill 的模型工具。
 - 提供查看状态、路由解释、使用统计和清理缓存的 `/skillflux` 用户命令。
@@ -180,6 +181,30 @@ dsh web
 `$DSH_HOME/storages/skillflux/remote-discovery.json`，默认最多 100 条，并有
 4 MiB 硬限制。设置 `remoteCacheTtlMs: 0` 可完全关闭。
 
+### 已安装 Skill 缓存治理
+
+下载后的 Skill 单独保存在 `$DSH_HOME/cache/skillflux`。每当远程 Skill 成功挂载，
+SkillFlux 会评估已安装缓存，并在该 session 的回合结束、释放挂载后再次检查。
+默认先清理连续 90 天未活动的条目；如果剩余缓存仍超过 100 项或 512 MiB，再按照
+成功调用 Skill 工具的次数、挂载次数、最近活动时间、质量分和采用度等确定性证据，
+从低价值条目开始淘汰。
+
+首次远程候选与后续缓存候选的使用记录会按不可变 cache ID 聚合，既能跨越二者
+不同的 candidate ID，又不会让同一 Skill 的不同 commit 共享价值。旧版中没有
+cache ID 的记录只归入匹配仓库和 Skill 的最新版本。共享 usage 文件的更新会在
+Harness 进程之间加锁并合并。当前已经挂载和并发加载中的缓存会跨 Service 实例和
+共用 `DSH_HOME` 的 Harness 进程受到保护。lease 心跳会在
+崩溃进程的 PID 被复用时限制孤儿 marker 的保留时间；进程内 live-lease 注册表
+允许热重载后的 Service 回收已经释放的 marker。自动治理失败只记录警告；协调锁
+失效时会终止当前缓存操作，不会在失去互斥保护后继续执行。
+
+使用 `/skillflux cache prune` 可以立即执行同一套策略。设置
+`cacheAutoPrune: false` 可关闭自动执行；设置 `cacheMaxIdleDays: 0` 可关闭按闲置
+时间淘汰，同时保留条目数和总字节限制。关闭 `usageTracking` 后没有本地使用
+证据，治理会保守地退回安装时间和不可变发现元数据。
+manifest 无效的目录不会被自动删除；`/skillflux status` 会报告其数量，用户可用
+`/skillflux cache clean all` 明确清理。
+
 ## 配置
 
 SkillFlux 支持以下插件配置：
@@ -199,6 +224,10 @@ remoteTrustedOwners: []       # 例如 [anthropics, openai, vercel-labs]
 remoteCacheTtlMs: 300000                  # 0 表示关闭
 remoteCacheStaleIfErrorMs: 86400000       # TTL 后的额外 stale 窗口
 remoteCacheMaxEntries: 100
+cacheAutoPrune: true
+cacheMaxEntries: 100
+cacheMaxTotalBytes: 536870912              # 已安装 Skill 合计 512 MiB
+cacheMaxIdleDays: 90                       # 0 表示关闭按闲置时间淘汰
 catalogDescriptionMaxLength: 160
 catalogTokenBudget: 0              # 0 表示关闭；否则为 64-1000000
 maxSkillFiles: 1000
@@ -330,6 +359,7 @@ catalogTokenBudget: 512
 /skillflux explain
 /skillflux usage
 /skillflux cache list
+/skillflux cache prune
 /skillflux cache clean <cache-id>
 /skillflux cache clean all
 /skillflux discovery-cache status
@@ -339,8 +369,8 @@ catalogTokenBudget: 512
 `explain` 会展示候选的 Router 阶段、总分、基础分、自适应加分，以及它只是被
 选中、已经成功挂载，还是因为目录预算被跳过。
 
-清理时会跳过仍在挂载的缓存。到达 `turn/end` 时，SkillFlux 注销运行时挂载，
-但保留下载文件供下次复用。
+清理和治理都会跳过已挂载或正在加载的缓存。到达 `turn/end` 时，SkillFlux 注销
+运行时挂载；已安装文件会保留到后续策略执行或用户主动清理。
 
 ## 安全与信任
 
@@ -366,6 +396,8 @@ catalogTokenBudget: 512
   Skill 正文或资源。
 - 使用统计不包含任务文本或 Skill 内容，并限制在 DSH 存储目录中的
   `usageMaxEntries` 条记录以内。
+- 已安装缓存治理只读取这些有界使用计数和不可变缓存元数据，不检查也不保存任务
+  原文。
 - 远程发现缓存只持久化查询/配置指纹和有界、经过校验的候选元数据，不保存查询
   原文或 API 凭据。
 - 可选的 `GITHUB_TOKEN` 或 `GH_TOKEN` 会启用 GitHub Code Search 和批量仓库
@@ -383,9 +415,11 @@ corepack pnpm eval
 ```
 
 测评包含 36 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
-场景、7 个目录预算场景、8 个远程质量两两对比场景和 7 个远程缓存策略场景，
+场景、7 个目录预算场景、8 个远程质量两两对比场景、7 个远程缓存策略场景和
+7 个已安装缓存治理场景，
 覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、
-语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期和负例拒绝。
+语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期、价值淘汰、
+活动挂载保护和负例拒绝。
 
 | 指标 | 当前基线 |
 | --- | ---: |
@@ -398,6 +432,7 @@ corepack pnpm eval
 | 语义负例拒绝率 | 100.0% |
 | 远程质量两两排序正确率 | 100.0% |
 | 远程缓存策略边界正确率 | 100.0% |
+| 已安装缓存治理边界正确率 | 100.0% |
 
 这些结果验证确定性 Router 和向量排序契约。语义向量是合成数据，不代表某个
 embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测评格式和限制见
@@ -417,7 +452,8 @@ embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测
 - provider 故障期间，stale 回退可能在配置窗口内返回较旧的排名证据，但候选始终
   固定在此前已验证的不可变 commit。
 - 卸载无法删除已经写入 session history 的文本。
-- 上游出现新 commit 时会形成新的不可变缓存；旧版本需要用户主动清理。
+- 上游出现新 commit 时会形成新的不可变缓存；价值感知治理可能保留多个版本，
+  直到其闲置或超过配置限制。
 
 ## 开发与测试
 
@@ -428,6 +464,7 @@ branch、离线质量门禁、GitHub 联网冒烟测试、评测集更新和 PR 
 corepack pnpm install
 corepack pnpm check
 corepack pnpm eval
+corepack pnpm test:cache-governance-live
 corepack pnpm test:discovery-live
 corepack pnpm test:embedding-live
 corepack pnpm pack --dry-run

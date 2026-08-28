@@ -1,0 +1,89 @@
+[
+  {
+    "id": "healthy-cache-noop",
+    "now": 1893456000000,
+    "policy": { "maxEntries": 2, "maxTotalBytes": 200, "maxIdleMs": 7776000000 },
+    "entries": [
+      { "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "source": "owner/a", "name": "a", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 100 },
+      { "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "source": "owner/b", "name": "b", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 100 }
+    ],
+    "evidence": [],
+    "active": [],
+    "expected": []
+  },
+  {
+    "id": "idle-entry-expires",
+    "now": 1893456000000,
+    "policy": { "maxEntries": 10, "maxTotalBytes": 1000, "maxIdleMs": 7776000000 },
+    "entries": [
+      { "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "source": "owner/a", "name": "a", "installedAt": "2029-01-01T00:00:00.000Z", "totalBytes": 100 }
+    ],
+    "evidence": [],
+    "active": [],
+    "expected": [{ "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "reason": "idle" }]
+  },
+  {
+    "id": "usage-beats-unused",
+    "now": 1893456000000,
+    "policy": { "maxEntries": 1, "maxTotalBytes": 1000, "maxIdleMs": 0 },
+    "entries": [
+      { "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "source": "owner/a", "name": "a", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 100 },
+      { "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "source": "owner/b", "name": "b", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 100 }
+    ],
+    "evidence": [{ "source": "owner/b", "name": "b", "mounts": 4, "uses": 2, "lastUsedAt": 1893369600000 }],
+    "active": [],
+    "expected": [{ "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "reason": "entry-limit" }]
+  },
+  {
+    "id": "byte-pressure-removes-enough",
+    "now": 1893456000000,
+    "policy": { "maxEntries": 10, "maxTotalBytes": 100, "maxIdleMs": 0 },
+    "entries": [
+      { "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "source": "owner/a", "name": "a", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 80 },
+      { "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "source": "owner/b", "name": "b", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 70 },
+      { "cacheId": "cccccccccccccccccccccccc", "source": "owner/c", "name": "c", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 60 }
+    ],
+    "evidence": [],
+    "active": [],
+    "expected": [
+      { "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "reason": "byte-limit" },
+      { "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "reason": "byte-limit" }
+    ]
+  },
+  {
+    "id": "active-entry-is-never-selected",
+    "now": 1893456000000,
+    "policy": { "maxEntries": 1, "maxTotalBytes": 100, "maxIdleMs": 0 },
+    "entries": [
+      { "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "source": "owner/a", "name": "a", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 100 },
+      { "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "source": "owner/b", "name": "b", "installedAt": "2029-12-31T00:00:00.000Z", "totalBytes": 100 }
+    ],
+    "evidence": [{ "source": "owner/b", "name": "b", "mounts": 10, "uses": 10, "lastUsedAt": 1893369600000 }],
+    "active": ["aaaaaaaaaaaaaaaaaaaaaaaa"],
+    "expected": [{ "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "reason": "entry-and-byte-limit" }]
+  },
+  {
+    "id": "recency-breaks-value-tie",
+    "now": 1893456000000,
+    "policy": { "maxEntries": 1, "maxTotalBytes": 1000, "maxIdleMs": 0 },
+    "entries": [
+      { "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "source": "owner/a", "name": "a", "installedAt": "2029-11-01T00:00:00.000Z", "totalBytes": 100 },
+      { "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "source": "owner/b", "name": "b", "installedAt": "2029-12-01T00:00:00.000Z", "totalBytes": 100 }
+    ],
+    "evidence": [],
+    "active": [],
+    "expected": [{ "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "reason": "entry-limit" }]
+  },
+  {
+    "id": "immutable-version-usage-isolation",
+    "now": 1893456000000,
+    "policy": { "maxEntries": 1, "maxTotalBytes": 1000, "maxIdleMs": 0 },
+    "entries": [
+      { "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "source": "owner/versioned", "name": "versioned", "installedAt": "2029-11-01T00:00:00.000Z", "totalBytes": 100 },
+      { "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "source": "owner/versioned", "name": "versioned", "installedAt": "2029-12-01T00:00:00.000Z", "totalBytes": 100 }
+    ],
+    "evidence": [{ "source": "owner/versioned", "name": "versioned", "cacheId": "bbbbbbbbbbbbbbbbbbbbbbbb", "mounts": 3, "uses": 2, "lastUsedAt": 1893369600000 }],
+    "active": [],
+    "expected": [{ "cacheId": "aaaaaaaaaaaaaaaaaaaaaaaa", "reason": "entry-limit" }]
+  }
+]

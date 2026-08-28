@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -24,6 +23,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Typecheck, lint, test, and build
         run: pnpm check
+      - name: Verify generated package entry is committed
+        run: git diff --exit-code -- lib
       - name: Run routing evaluation corpus
         run: pnpm eval
       - name: Verify package contents
