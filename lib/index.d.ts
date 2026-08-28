@@ -28,6 +28,9 @@ interface SkillFluxConfig {
   readonly remoteMinStars?: number;
   readonly remoteRecentActivityDays?: number;
   readonly remoteTrustedOwners?: string[];
+  readonly remoteCacheTtlMs?: number;
+  readonly remoteCacheStaleIfErrorMs?: number;
+  readonly remoteCacheMaxEntries?: number;
   readonly catalogDescriptionMaxLength?: number;
   readonly catalogTokenBudget?: number;
   readonly maxSkillFiles?: number;
@@ -62,6 +65,9 @@ interface ResolvedSkillFluxConfig {
   readonly remoteMinStars: number;
   readonly remoteRecentActivityDays: number;
   readonly remoteTrustedOwners: readonly string[];
+  readonly remoteCacheTtlMs: number;
+  readonly remoteCacheStaleIfErrorMs: number;
+  readonly remoteCacheMaxEntries: number;
   readonly catalogDescriptionMaxLength: number;
   readonly catalogTokenBudget: number;
   readonly maxSkillFiles: number;
@@ -89,6 +95,14 @@ interface EmbeddingRouterStats {
   readonly cacheHits: number;
   readonly cacheMisses: number;
   readonly cacheEntries: number;
+}
+interface RemoteDiscoveryCacheStats {
+  readonly enabled: boolean;
+  readonly entries: number;
+  readonly hits: number;
+  readonly misses: number;
+  readonly staleHits: number;
+  readonly writes: number;
 }
 interface CandidateRoutingMetadata {
   readonly selection?: CandidateSelection;
@@ -344,6 +358,49 @@ declare class EmbeddingRouter {
   private request;
 }
 //#endregion
+//#region src/remote-cache.d.ts
+interface RemoteDiscoveryCacheOptions {
+  readonly file: string;
+  readonly ttlMs: number;
+  readonly staleIfErrorMs: number;
+  readonly maxEntries: number;
+  readonly now?: () => number;
+  readonly warn?: (message: string) => void;
+}
+interface RemoteDiscoveryCacheHit {
+  readonly state: 'fresh' | 'stale';
+  readonly candidates: readonly RemoteCandidate[];
+}
+type RemoteDiscoveryCacheState = 'fresh' | 'stale' | 'expired';
+declare function remoteDiscoveryCacheState(ageMs: number, ttlMs: number, staleIfErrorMs: number): RemoteDiscoveryCacheState;
+declare class RemoteDiscoveryCache {
+  private readonly options;
+  private readonly now;
+  private entries;
+  private loadTask;
+  private writeQueue;
+  private cacheHits;
+  private cacheMisses;
+  private staleHits;
+  private writeCount;
+  constructor(options: RemoteDiscoveryCacheOptions);
+  get enabled(): boolean;
+  get(key: string): Promise<RemoteDiscoveryCacheHit | undefined>;
+  put(key: string, candidates: readonly RemoteCandidate[]): Promise<void>;
+  recordStaleHit(): void;
+  clear(): Promise<number>;
+  stats(): Promise<RemoteDiscoveryCacheStats>;
+  flush(): Promise<void>;
+  private enqueue;
+  private load;
+  private readDocument;
+  private trim;
+  private save;
+  private serializeWithinLimit;
+  private warn;
+  private currentTime;
+}
+//#endregion
 //#region src/remote.d.ts
 interface RemoteDiscoveryOptions {
   readonly searchLimit: number;
@@ -355,6 +412,7 @@ interface RemoteDiscoveryOptions {
   readonly trustedOwners?: readonly string[];
   readonly githubToken?: string;
   readonly now?: () => number;
+  readonly cache?: RemoteDiscoveryCache;
 }
 interface RemoteQualityInput {
   readonly relevanceScore: number;
@@ -373,10 +431,14 @@ declare class RemoteDiscoveryClient {
   private readonly options;
   private readonly githubToken;
   private readonly now;
+  private readonly cache;
   constructor(searchLimit: number, timeoutMs: number);
   constructor(options: RemoteDiscoveryOptions);
   get githubSearchEnabled(): boolean;
   search(query: string, signal?: AbortSignal): Promise<RemoteCandidate[]>;
+  discoveryCacheStats(): Promise<RemoteDiscoveryCacheStats | undefined>;
+  clearDiscoveryCache(): Promise<number>;
+  private searchLive;
 }
 //#endregion
 //#region src/usage.d.ts
@@ -447,6 +509,8 @@ declare class SkillFluxService extends Service {
   usageRecords(limit?: number): Promise<SkillUsageRecord[]>;
   embeddingStats(): EmbeddingRouterStats | undefined;
   listCache(): Promise<CacheEntry[]>;
+  discoveryCacheStats(): Promise<RemoteDiscoveryCacheStats | undefined>;
+  clearDiscoveryCache(): Promise<number>;
   cleanCache(selector: string): Promise<{
     removed: string[];
     skipped: string[];
@@ -477,5 +541,5 @@ declare class SkillFluxService extends Service {
   private disposeAgent;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteQualityInput, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, remoteQualityScore, routeScore, selectCandidates, tokenize };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheManifest, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteQualityInput, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, remoteDiscoveryCacheState, remoteQualityScore, routeScore, selectCandidates, tokenize };
 //# sourceMappingURL=index.d.ts.map

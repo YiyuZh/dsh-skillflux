@@ -1,0 +1,51 @@
+[
+  {
+    "id": "fresh-at-write",
+    "ageMs": 0,
+    "ttlMs": 300000,
+    "staleIfErrorMs": 86400000,
+    "expected": "fresh"
+  },
+  {
+    "id": "fresh-at-ttl-boundary",
+    "ageMs": 300000,
+    "ttlMs": 300000,
+    "staleIfErrorMs": 86400000,
+    "expected": "fresh"
+  },
+  {
+    "id": "stale-after-ttl",
+    "ageMs": 300001,
+    "ttlMs": 300000,
+    "staleIfErrorMs": 86400000,
+    "expected": "stale"
+  },
+  {
+    "id": "stale-at-fallback-boundary",
+    "ageMs": 86700000,
+    "ttlMs": 300000,
+    "staleIfErrorMs": 86400000,
+    "expected": "stale"
+  },
+  {
+    "id": "expired-after-fallback-boundary",
+    "ageMs": 86700001,
+    "ttlMs": 300000,
+    "staleIfErrorMs": 86400000,
+    "expected": "expired"
+  },
+  {
+    "id": "expired-with-stale-disabled",
+    "ageMs": 300001,
+    "ttlMs": 300000,
+    "staleIfErrorMs": 0,
+    "expected": "expired"
+  },
+  {
+    "id": "expired-when-cache-disabled",
+    "ageMs": 0,
+    "ttlMs": 0,
+    "staleIfErrorMs": 86400000,
+    "expected": "expired"
+  }
+]

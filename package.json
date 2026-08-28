@@ -26,7 +26,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "oxlint src tests",
     "test": "vitest run",
-    "eval": "vitest run tests/eval.spec.ts tests/embedding-eval.spec.ts tests/catalog-budget-eval.spec.ts tests/remote-quality-eval.spec.ts --reporter=verbose",
+    "eval": "vitest run tests/eval.spec.ts tests/embedding-eval.spec.ts tests/catalog-budget-eval.spec.ts tests/remote-quality-eval.spec.ts tests/remote-cache-eval.spec.ts --reporter=verbose",
     "test:discovery-live": "pnpm build && node scripts/discovery-smoke.mjs",
     "test:embedding-live": "pnpm build && node scripts/embedding-smoke.mjs",
     "test:coverage": "vitest run --coverage",

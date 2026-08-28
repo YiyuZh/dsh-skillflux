@@ -1,8 +1,9 @@
 import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
 import { candidateId, routeScore, tokenize } from './router.js'
+import { RemoteDiscoveryCache } from './remote-cache.js'
 import { parseSkillMarkdown } from './skill-file.js'
-import type { RemoteCandidate, RemoteDiscoveryProvider } from './types.js'
+import type { RemoteCandidate, RemoteDiscoveryCacheStats, RemoteDiscoveryProvider } from './types.js'
 
 interface SkillsSearchItem {
   readonly skillId: string
@@ -80,6 +81,7 @@ export interface RemoteDiscoveryOptions {
   readonly trustedOwners?: readonly string[]
   readonly githubToken?: string
   readonly now?: () => number
+  readonly cache?: RemoteDiscoveryCache
 }
 
 export interface RemoteQualityInput {
@@ -101,6 +103,28 @@ const MAX_REMOTE_SKILL_BYTES = 256 * 1024
 
 function boundedQuery(query: string): string {
   return query.normalize('NFKC').replaceAll(/\s+/gu, ' ').trim().slice(0, 128)
+}
+
+interface RemoteSearchResult {
+  readonly candidates: RemoteCandidate[]
+  readonly degraded: boolean
+}
+
+function discoveryCacheKey(
+  query: string,
+  options: Required<Omit<RemoteDiscoveryOptions, 'githubToken' | 'now' | 'cache'>>,
+  githubSearchEnabled: boolean,
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    query,
+    searchLimit: options.searchLimit,
+    providers: options.providers,
+    minQualityScore: options.minQualityScore,
+    minStars: options.minStars,
+    recentActivityDays: options.recentActivityDays,
+    trustedOwners: options.trustedOwners,
+    githubSearchEnabled,
+  })).digest('hex')
 }
 
 function timeoutSignal(parent: AbortSignal | undefined, timeoutMs: number): AbortSignal {
@@ -129,6 +153,7 @@ function isSearchItem(value: unknown): value is SkillsSearchItem {
     && SKILL_NAME.test(item.skillId)
     && typeof item.name === 'string'
     && item.name.trim().length > 0
+    && item.name.length <= 4_096
     && typeof item.installs === 'number'
     && Number.isSafeInteger(item.installs)
     && item.installs >= 0
@@ -399,6 +424,7 @@ async function githubSeed(
     throw new Error(`remote SKILL.md exceeds ${MAX_REMOTE_SKILL_BYTES} bytes`)
   }
   const definition = parseSkillMarkdown(raw, '/skillflux-remote-preview')
+  if (definition.description.length > 4_096) throw new Error('remote Skill description exceeds 4096 characters')
   return {
     source: hit.repository.full_name,
     skillId: definition.name,
@@ -438,9 +464,10 @@ function mergeSeeds(seeds: readonly CandidateSeed[], refBySource: ReadonlyMap<st
 }
 
 export class RemoteDiscoveryClient {
-  private readonly options: Required<Omit<RemoteDiscoveryOptions, 'githubToken' | 'now'>>
+  private readonly options: Required<Omit<RemoteDiscoveryOptions, 'githubToken' | 'now' | 'cache'>>
   private readonly githubToken: string | undefined
   private readonly now: () => number
+  private readonly cache: RemoteDiscoveryCache | undefined
 
   constructor(searchLimit: number, timeoutMs: number)
   constructor(options: RemoteDiscoveryOptions)
@@ -459,6 +486,7 @@ export class RemoteDiscoveryClient {
     }
     this.githubToken = configuredGithubToken(options.githubToken)
     this.now = options.now ?? Date.now
+    this.cache = options.cache
   }
 
   get githubSearchEnabled(): boolean {
@@ -468,7 +496,41 @@ export class RemoteDiscoveryClient {
   async search(query: string, signal?: AbortSignal): Promise<RemoteCandidate[]> {
     const normalized = boundedQuery(query)
     if (normalized.length === 0) return []
+    signal?.throwIfAborted()
+    const key = discoveryCacheKey(normalized, this.options, this.githubSearchEnabled)
+    const cached = await this.cache?.get(key)
+    signal?.throwIfAborted()
+    if (cached?.state === 'fresh') return [...cached.candidates]
     const operationSignal = timeoutSignal(signal, this.options.timeoutMs)
+    try {
+      const live = await this.searchLive(normalized, operationSignal)
+      if (cached?.state === 'stale' && live.degraded && live.candidates.length === 0) {
+        this.cache?.recordStaleHit()
+        return [...cached.candidates]
+      }
+      if (!live.degraded || (cached === undefined && live.candidates.length > 0)) {
+        await this.cache?.put(key, live.candidates)
+      }
+      return live.candidates
+    } catch (error: unknown) {
+      signal?.throwIfAborted()
+      if (cached?.state === 'stale') {
+        this.cache?.recordStaleHit()
+        return [...cached.candidates]
+      }
+      throw error
+    }
+  }
+
+  async discoveryCacheStats(): Promise<RemoteDiscoveryCacheStats | undefined> {
+    return await this.cache?.stats()
+  }
+
+  async clearDiscoveryCache(): Promise<number> {
+    return await this.cache?.clear() ?? 0
+  }
+
+  private async searchLive(normalized: string, operationSignal: AbortSignal): Promise<RemoteSearchResult> {
     const poolLimit = this.githubToken === undefined
       ? this.options.searchLimit
       : Math.min(20, Math.max(this.options.searchLimit, this.options.searchLimit * 2))
@@ -488,11 +550,12 @@ export class RemoteDiscoveryClient {
       if (this.options.providers.length === 1 && this.options.providers[0] === 'github') {
         throw new Error('GitHub Skill search requires GITHUB_TOKEN or GH_TOKEN')
       }
-      return []
+      return { candidates: [], degraded: false }
     }
     const providerResults = await Promise.allSettled(providerTasks)
     operationSignal.throwIfAborted()
     const fulfilled = providerResults.flatMap(result => result.status === 'fulfilled' ? [result.value] : [])
+    let degraded = providerResults.some(result => result.status === 'rejected')
     if (fulfilled.length === 0) {
       const rejected = providerResults.find(result => result.status === 'rejected')
       throw rejected?.reason instanceof Error ? rejected.reason : new Error('remote Skill discovery failed')
@@ -508,12 +571,14 @@ export class RemoteDiscoveryClient {
       ...githubHits.map(hit => hit.repository.full_name),
     ])]
     const snapshots = await resolveRepositories(sources, operationSignal, this.githubToken)
+    if (snapshots.size < sources.length) degraded = true
     operationSignal.throwIfAborted()
     const githubSeeds = await Promise.allSettled(githubHits.map(async hit => {
       const snapshot = snapshots.get(hit.repository.full_name)
       if (snapshot === undefined) throw new Error('repository metadata unavailable')
       return await githubSeed(hit, snapshot, operationSignal)
     }))
+    if (githubSeeds.some(result => result.status === 'rejected')) degraded = true
     operationSignal.throwIfAborted()
     const seeds = mergeSeeds([
       ...skillsSeeds,
@@ -576,6 +641,6 @@ export class RemoteDiscoveryClient {
       || right.installs - left.installs
       || right.stars - left.stars
       || `${left.source}/${left.name}`.localeCompare(`${right.source}/${right.name}`, 'en'))
-    return candidates.slice(0, this.options.searchLimit)
+    return { candidates: candidates.slice(0, this.options.searchLimit), degraded }
   }
 }
