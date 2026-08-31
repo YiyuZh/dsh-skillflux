@@ -362,14 +362,19 @@ describe('persistent cache', () => {
     const downloadedMarkdown = '---\nname: demo\ndescription: Timeout recovery\n---\nRecover after timeout.\n'
     const sourceHash = createHash('sha256').update(downloadedMarkdown).digest('hex')
     let verifierHangs = true
+    let verifierCalls = 0
     const cache = new SkillCache({
       root,
       maxFiles: 10,
       maxBytes: 10_000,
-      installTimeoutMs: 25,
-      verifyCandidate: async () => verifierHangs
-        ? await new Promise(() => undefined)
-        : { path: 'skills/demo/SKILL.md', skillFileHash: sourceHash },
+      // The recovery attempt also needs time for real filesystem operations.
+      installTimeoutMs: 1_000,
+      verifyCandidate: async () => {
+        verifierCalls += 1
+        return verifierHangs
+          ? await new Promise(() => undefined)
+          : { path: 'skills/demo/SKILL.md', skillFileHash: sourceHash }
+      },
       runInstaller: async invocation => {
         const downloaded = join(invocation.cwd, '.agents', 'skills', 'demo')
         await mkdir(downloaded, { recursive: true })
@@ -385,10 +390,12 @@ describe('persistent cache', () => {
       qualitySignals: ['recent-activity'], qualityWarnings: ['single-source', 'content-not-previewed'],
     }
     await expect(cache.install(candidate)).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(verifierCalls).toBe(1)
     expect(await cache.list()).toEqual([])
     verifierHangs = false
     await expect(cache.install(candidate)).resolves.toMatchObject({
       manifest: { name: 'demo', sourcePath: 'skills/demo/SKILL.md', sourceSkillFileHash: sourceHash },
     })
+    expect(verifierCalls).toBe(2)
   })
 })
