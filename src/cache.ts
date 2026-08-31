@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { inspectSkillDirectory } from './skill-file.js'
 import { planCachePrune, type CachePrunePlan, type CachePrunePolicy, type CacheUsageEvidence } from './cache-governance.js'
+import { verifyUniqueRemoteSkill, type RemoteCandidateVerifier } from './remote-source.js'
 import type { CacheEntry, CacheManifest, RemoteCandidate } from './types.js'
 import type { SkillDefinition } from '@deepseek-ai/dsh-skill'
 
@@ -65,12 +66,21 @@ function validManifest(value: unknown): value is CacheManifest {
     && (item.qualityScore === undefined
       || (typeof item.qualityScore === 'number' && Number.isSafeInteger(item.qualityScore)
         && item.qualityScore >= 0 && item.qualityScore <= 100))
+    && (item.trustLevel === undefined
+      || item.trustLevel === 'unverified'
+      || item.trustLevel === 'community'
+      || item.trustLevel === 'corroborated'
+      || item.trustLevel === 'trusted')
     && (item.stars === undefined
       || (typeof item.stars === 'number' && Number.isSafeInteger(item.stars) && item.stars >= 0))
     && (item.pushedAt === undefined || typeof item.pushedAt === 'string')
     && (item.discoverySources === undefined
       || (Array.isArray(item.discoverySources)
         && item.discoverySources.every(source => source === 'skills.sh' || source === 'github')))
+    && (item.sourcePath === undefined || (typeof item.sourcePath === 'string' && item.sourcePath.length > 0))
+    && (item.sourceSkillFileHash === undefined
+      || (typeof item.sourceSkillFileHash === 'string' && /^[0-9a-f]{64}$/u.test(item.sourceSkillFileHash)))
+    && ((item.sourcePath === undefined) === (item.sourceSkillFileHash === undefined))
     && typeof item.installedAt === 'string' && Number.isFinite(Date.parse(item.installedAt))
     && typeof item.fileCount === 'number'
     && Number.isSafeInteger(item.fileCount) && item.fileCount >= 1
@@ -121,6 +131,7 @@ export interface CacheManagerOptions {
   readonly maxBytes: number
   readonly installTimeoutMs: number
   readonly runInstaller?: SkillInstaller
+  readonly verifyCandidate?: RemoteCandidateVerifier
   readonly removeLeaseMarker?: (file: string, directory: string) => Promise<void>
   readonly beforeInstallCommit?: () => Promise<void>
   readonly beforeLeaseDirectoryRead?: (directory: string) => Promise<void>
@@ -141,6 +152,15 @@ export interface CacheInventoryStats {
   readonly entries: number
   readonly totalBytes: number
   readonly invalidEntries: number
+}
+
+async function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted()
+  return await new Promise<T>((resolve, reject) => {
+    const aborted = () => { reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError')) }
+    signal.addEventListener('abort', aborted, { once: true })
+    operation.then(resolve, reject).finally(() => { signal.removeEventListener('abort', aborted) }).catch(() => undefined)
+  })
 }
 
 export class SkillCache {
@@ -189,10 +209,12 @@ export class SkillCache {
   }
 
   async install(candidate: RemoteCandidate, signal?: AbortSignal): Promise<CacheEntry> {
-    signal?.throwIfAborted()
+    const deadline = AbortSignal.timeout(this.options.installTimeoutMs)
+    const operationSignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    operationSignal.throwIfAborted()
     const id = cacheId(candidate.source, candidate.ref, candidate.skillId)
     const existing = await this.get(id)
-    signal?.throwIfAborted()
+    operationSignal.throwIfAborted()
     if (existing !== undefined) return existing
     const staging = join(this.stagingRoot, randomUUID())
     const workspace = join(staging, 'workspace')
@@ -202,6 +224,11 @@ export class SkillCache {
     assertWithin(this.root, destination)
     await mkdir(workspace, { recursive: true })
     try {
+      const verifiedSource = await withAbort(
+        (this.options.verifyCandidate ?? verifyUniqueRemoteSkill)(candidate, operationSignal),
+        operationSignal,
+      )
+      operationSignal.throwIfAborted()
       const source = immutableArchiveUrl(candidate.source, candidate.ref)
       const args = [
         skillsCliPath(), 'add', source, '--skill', candidate.skillId,
@@ -219,20 +246,20 @@ export class SkillCache {
       }
       const execute = async (env: NodeJS.ProcessEnv): Promise<void> => {
         if (this.options.runInstaller !== undefined) {
-          await this.options.runInstaller({
+          await withAbort(this.options.runInstaller({
             executable: process.execPath,
             args,
             cwd: workspace,
             timeoutMs: this.options.installTimeoutMs,
-            ...(signal === undefined ? {} : { signal }),
+            signal: operationSignal,
             env,
-          })
+          }), operationSignal)
         } else {
           await execFileAsync(process.execPath, args, {
             cwd: workspace,
             timeout: this.options.installTimeoutMs,
             maxBuffer: 2 * 1024 * 1024,
-            signal,
+            signal: operationSignal,
             env,
           })
         }
@@ -246,20 +273,20 @@ export class SkillCache {
         await execute(withoutLoopbackProxy(baseEnvironment))
       }
       await access(downloaded)
-      signal?.throwIfAborted()
-      if (candidate.skillFileHash !== undefined) {
+      operationSignal.throwIfAborted()
+      {
         const downloadedSkill = await readFile(join(downloaded, 'SKILL.md'))
-        signal?.throwIfAborted()
+        operationSignal.throwIfAborted()
         const downloadedHash = createHash('sha256').update(downloadedSkill).digest('hex')
-        if (downloadedHash !== candidate.skillFileHash) {
-          throw new Error('downloaded SKILL.md does not match the GitHub search preview')
+        if (downloadedHash !== verifiedSource.skillFileHash) {
+          throw new Error('downloaded SKILL.md does not match the unique pinned GitHub source')
         }
       }
       const inspected = await inspectSkillDirectory(downloaded, {
         maxFiles: this.options.maxFiles,
         maxBytes: this.options.maxBytes,
-      }, signal)
-      signal?.throwIfAborted()
+      }, operationSignal)
+      operationSignal.throwIfAborted()
       if (inspected.definition.name !== candidate.skillId) {
         throw new Error(`downloaded skill name "${inspected.definition.name}" does not match "${candidate.skillId}"`)
       }
@@ -274,26 +301,29 @@ export class SkillCache {
         ...(inspected.definition.whenToUse === undefined ? {} : { whenToUse: inspected.definition.whenToUse }),
         installs: candidate.installs,
         qualityScore: candidate.qualityScore,
+        trustLevel: candidate.trustLevel,
         stars: candidate.stars,
         ...(candidate.pushedAt === undefined ? {} : { pushedAt: candidate.pushedAt }),
         discoverySources: candidate.discoverySources,
+        sourcePath: verifiedSource.path,
+        sourceSkillFileHash: verifiedSource.skillFileHash,
         installedAt: new Date().toISOString(),
         fileCount: inspected.fileCount,
         totalBytes: inspected.totalBytes,
         contentHash: inspected.contentHash,
       }
-      signal?.throwIfAborted()
+      operationSignal.throwIfAborted()
       await writeFile(join(downloaded, MANIFEST_NAME), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
-      signal?.throwIfAborted()
+      operationSignal.throwIfAborted()
       await mkdir(this.entriesRoot, { recursive: true })
       await this.options.beforeInstallCommit?.()
-      signal?.throwIfAborted()
+      operationSignal.throwIfAborted()
       try {
         await rename(downloaded, destination)
-        signal?.throwIfAborted()
+        operationSignal.throwIfAborted()
       } catch (error: unknown) {
         const raced = await this.get(id)
-        signal?.throwIfAborted()
+        operationSignal.throwIfAborted()
         if (raced !== undefined) return raced
         throw error
       }

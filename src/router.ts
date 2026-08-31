@@ -174,6 +174,7 @@ export function cacheCandidates(entries: readonly CacheEntry[]): SkillFluxCandid
     cacheId: manifest.cacheId,
     ...(manifest.installs === undefined ? {} : { installs: manifest.installs }),
     ...(manifest.qualityScore === undefined ? {} : { qualityScore: manifest.qualityScore }),
+    ...(manifest.trustLevel === undefined ? {} : { trustLevel: manifest.trustLevel }),
     ...(manifest.stars === undefined ? {} : { stars: manifest.stars }),
     ...(manifest.pushedAt === undefined ? {} : { pushedAt: manifest.pushedAt }),
     ...(manifest.discoverySources === undefined ? {} : { discoverySources: manifest.discoverySources }),

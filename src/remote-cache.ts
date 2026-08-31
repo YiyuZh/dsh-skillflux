@@ -5,7 +5,7 @@ import { basename, dirname, join } from 'node:path'
 import { candidateId } from './router.js'
 import type { RemoteCandidate, RemoteDiscoveryCacheStats, RemoteDiscoveryProvider } from './types.js'
 
-const CACHE_VERSION = 1
+const CACHE_VERSION = 2
 const MAX_CACHE_FILE_BYTES = 4 * 1024 * 1024
 const MAX_CACHE_ENTRIES = 1_000
 const CACHE_KEY = /^[0-9a-f]{64}$/u
@@ -14,6 +14,15 @@ const COMMIT_SHA = /^[0-9a-f]{40}$/u
 const CONTENT_HASH = /^[0-9a-f]{64}$/u
 const GITHUB_SOURCE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
+const TRUST_LEVELS = new Set(['unverified', 'community', 'corroborated', 'trusted'])
+const QUALITY_SIGNALS = new Set([
+  'trusted-owner', 'cross-source', 'content-pinned', 'recent-activity',
+  'declared-license', 'organization-owned', 'market-adoption', 'repository-adoption',
+])
+const QUALITY_WARNINGS = new Set([
+  'single-source', 'content-not-previewed', 'activity-unknown',
+  'stale-activity', 'license-missing', 'low-adoption',
+])
 
 interface DiscoveryCacheEntry {
   readonly key: string
@@ -22,7 +31,7 @@ interface DiscoveryCacheEntry {
 }
 
 interface DiscoveryCacheDocument {
-  readonly version: 1
+  readonly version: 2
   readonly entries: readonly DiscoveryCacheEntry[]
 }
 
@@ -85,6 +94,22 @@ function validSkillPath(value: unknown): boolean {
     && segments.at(-1)?.toLocaleLowerCase('en-US') === 'skill.md'
 }
 
+function validStringSet(value: unknown, allowed: ReadonlySet<string>, maximum: number): value is readonly string[] {
+  return Array.isArray(value)
+    && value.length <= maximum
+    && value.every(item => typeof item === 'string' && allowed.has(item))
+    && new Set(value).size === value.length
+}
+
+function validBreakdown(value: unknown, total: unknown): boolean {
+  if (typeof value !== 'object' || value === null || !count(total, 100)) return false
+  const item = value as Record<string, unknown>
+  const keys = ['relevance', 'adoption', 'repository', 'freshness', 'trust', 'provenance'] as const
+  if (!keys.every(key => count(item[key], 100)) || item.total !== total) return false
+  const sum = keys.reduce((result, key) => result + (item[key] as number), 0)
+  return Math.min(100, sum) === total
+}
+
 function validCandidate(value: unknown): value is RemoteCandidate {
   if (typeof value !== 'object' || value === null) return false
   const item = value as Record<string, unknown>
@@ -110,6 +135,10 @@ function validCandidate(value: unknown): value is RemoteCandidate {
     && (item.license === undefined || boundedString(item.license, 128))
     && typeof item.recentlyActive === 'boolean'
     && typeof item.trustedSource === 'boolean'
+    && typeof item.trustLevel === 'string' && TRUST_LEVELS.has(item.trustLevel)
+    && validBreakdown(item.qualityBreakdown, item.qualityScore)
+    && validStringSet(item.qualitySignals, QUALITY_SIGNALS, QUALITY_SIGNALS.size)
+    && validStringSet(item.qualityWarnings, QUALITY_WARNINGS, QUALITY_WARNINGS.size)
     && validSkillPath(item.path)
     && (item.skillFileHash === undefined
       || (typeof item.skillFileHash === 'string' && CONTENT_HASH.test(item.skillFileHash))))) return false
@@ -145,6 +174,9 @@ function cloneCandidates(candidates: readonly RemoteCandidate[]): RemoteCandidat
   return candidates.map(candidate => ({
     ...candidate,
     discoverySources: [...candidate.discoverySources],
+    qualityBreakdown: { ...candidate.qualityBreakdown },
+    qualitySignals: [...candidate.qualitySignals],
+    qualityWarnings: [...candidate.qualityWarnings],
   }))
 }
 

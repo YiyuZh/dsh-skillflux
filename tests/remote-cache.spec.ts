@@ -43,6 +43,10 @@ function candidate(name = 'pdf-reader'): RemoteCandidate {
     license: 'MIT',
     recentlyActive: true,
     trustedSource: false,
+    trustLevel: 'corroborated',
+    qualityBreakdown: { relevance: 50, adoption: 8, repository: 10, freshness: 8, trust: 0, provenance: 4, total: 80 },
+    qualitySignals: ['cross-source', 'content-pinned'],
+    qualityWarnings: [],
     path: `skills/${name}/SKILL.md`,
     skillFileHash: 'c'.repeat(64),
   }
@@ -59,6 +63,7 @@ describe('remote discovery cache', () => {
     const raw = await readFile(file, 'utf8')
     expect(raw).toContain(key)
     expect(raw).not.toContain('analyze my confidential PDF')
+    expect((JSON.parse(raw) as { version?: unknown }).version).toBe(2)
 
     const reopened = new RemoteDiscoveryCache({ file, ttlMs: 1_000, staleIfErrorMs: 5_000, maxEntries: 10 })
     expect(await reopened.get(key)).toMatchObject({ state: 'fresh', candidates: [{ name: 'pdf-reader' }] })
@@ -123,6 +128,20 @@ describe('remote discovery cache', () => {
     const cache = new RemoteDiscoveryCache({ file, ttlMs: 1_000, staleIfErrorMs: 5_000, maxEntries: 10, warn })
     const tampered = { ...candidate(), source: 'attacker/other-repository' }
     await cache.put('9'.repeat(64), [tampered])
+    expect(await cache.stats()).toMatchObject({ entries: 0, writes: 0 })
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('skipped invalid'))
+  })
+
+  it('refuses inconsistent quality evidence instead of caching an unexplained score', async () => {
+    const file = await cacheFile()
+    const warn = vi.fn()
+    const cache = new RemoteDiscoveryCache({ file, ttlMs: 1_000, staleIfErrorMs: 5_000, maxEntries: 10, warn })
+    const original = candidate()
+    const tampered: RemoteCandidate = {
+      ...original,
+      qualityBreakdown: { ...original.qualityBreakdown, total: original.qualityScore - 1 },
+    }
+    await cache.put('8'.repeat(64), [tampered])
     expect(await cache.stats()).toMatchObject({ entries: 0, writes: 0 })
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('skipped invalid'))
   })

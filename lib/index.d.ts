@@ -7,6 +7,10 @@ import "@deepseek-ai/dsh-session";
 type ApprovalPolicy = 'always' | 'session' | 'automatic';
 type RemoteDiscovery = 'automatic' | 'on-demand' | 'off';
 type RemoteDiscoveryProvider = 'skills.sh' | 'github';
+type RemoteTrustPolicy = 'open' | 'community' | 'corroborated' | 'trusted';
+type RemoteTrustLevel = 'unverified' | 'community' | 'corroborated' | 'trusted';
+type RemoteQualitySignal = 'trusted-owner' | 'cross-source' | 'content-pinned' | 'recent-activity' | 'declared-license' | 'organization-owned' | 'market-adoption' | 'repository-adoption';
+type RemoteQualityWarning = 'single-source' | 'content-not-previewed' | 'activity-unknown' | 'stale-activity' | 'license-missing' | 'low-adoption';
 type CandidateOrigin = 'registry' | 'cache' | 'remote';
 type RouterMode = 'lexical' | 'hybrid';
 type EmbeddingProvider = 'ollama' | 'openai-compatible';
@@ -27,7 +31,9 @@ interface SkillFluxConfig {
   readonly remoteMinQualityScore?: number;
   readonly remoteMinStars?: number;
   readonly remoteRecentActivityDays?: number;
+  readonly remoteTrustPolicy?: RemoteTrustPolicy;
   readonly remoteTrustedOwners?: string[];
+  readonly remoteBlockedOwners?: string[];
   readonly remoteCacheTtlMs?: number;
   readonly remoteCacheStaleIfErrorMs?: number;
   readonly remoteCacheMaxEntries?: number;
@@ -69,7 +75,9 @@ interface ResolvedSkillFluxConfig {
   readonly remoteMinQualityScore: number;
   readonly remoteMinStars: number;
   readonly remoteRecentActivityDays: number;
+  readonly remoteTrustPolicy: RemoteTrustPolicy;
   readonly remoteTrustedOwners: readonly string[];
+  readonly remoteBlockedOwners: readonly string[];
   readonly remoteCacheTtlMs: number;
   readonly remoteCacheStaleIfErrorMs: number;
   readonly remoteCacheMaxEntries: number;
@@ -140,6 +148,7 @@ interface CachedCandidate extends CandidateRoutingMetadata {
   readonly cacheId: string;
   readonly installs?: number;
   readonly qualityScore?: number;
+  readonly trustLevel?: RemoteTrustLevel;
   readonly stars?: number;
   readonly pushedAt?: string;
   readonly discoverySources?: readonly RemoteDiscoveryProvider[];
@@ -163,8 +172,21 @@ interface RemoteCandidate extends CandidateRoutingMetadata {
   readonly license?: string;
   readonly recentlyActive: boolean;
   readonly trustedSource: boolean;
+  readonly trustLevel: RemoteTrustLevel;
+  readonly qualityBreakdown: RemoteQualityBreakdown;
+  readonly qualitySignals: readonly RemoteQualitySignal[];
+  readonly qualityWarnings: readonly RemoteQualityWarning[];
   readonly path?: string;
   readonly skillFileHash?: string;
+}
+interface RemoteQualityBreakdown {
+  readonly relevance: number;
+  readonly adoption: number;
+  readonly repository: number;
+  readonly freshness: number;
+  readonly trust: number;
+  readonly provenance: number;
+  readonly total: number;
 }
 type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate;
 interface MountedSkill {
@@ -221,9 +243,14 @@ interface CacheManifest {
   readonly whenToUse?: string;
   readonly installs?: number;
   readonly qualityScore?: number;
+  readonly trustLevel?: RemoteTrustLevel;
   readonly stars?: number;
   readonly pushedAt?: string;
   readonly discoverySources?: readonly RemoteDiscoveryProvider[];
+  /** Pinned repository path proven unique for this Skill name. */
+  readonly sourcePath?: string;
+  /** SHA-256 of the unique pinned source SKILL.md. */
+  readonly sourceSkillFileHash?: string;
   readonly installedAt: string;
   readonly fileCount: number;
   readonly totalBytes: number;
@@ -266,6 +293,18 @@ interface CachePrunePlan {
 }
 declare function planCachePrune(entries: readonly CacheEntry[], evidence: readonly CacheUsageEvidence[], policy: CachePrunePolicy, active?: ReadonlySet<string>, now?: number): CachePrunePlan;
 //#endregion
+//#region src/remote-source.d.ts
+interface VerifiedRemoteSkill {
+  readonly path: string;
+  readonly skillFileHash: string;
+}
+type RemoteCandidateVerifier = (candidate: Pick<RemoteCandidate, 'source' | 'ref' | 'skillId' | 'path' | 'skillFileHash'>, signal?: AbortSignal) => Promise<VerifiedRemoteSkill>;
+/**
+ * Prove that the pinned repository contains exactly one usable Skill with the
+ * requested name before invoking the name-based `skills` installer.
+ */
+declare function verifyUniqueRemoteSkill(candidate: Pick<RemoteCandidate, 'source' | 'ref' | 'skillId' | 'path' | 'skillFileHash'>, signal?: AbortSignal): Promise<VerifiedRemoteSkill>;
+//#endregion
 //#region src/cache.d.ts
 declare function isLoopbackProxyFailure(error: unknown): boolean;
 interface CacheManagerOptions {
@@ -274,6 +313,7 @@ interface CacheManagerOptions {
   readonly maxBytes: number;
   readonly installTimeoutMs: number;
   readonly runInstaller?: SkillInstaller;
+  readonly verifyCandidate?: RemoteCandidateVerifier;
   readonly removeLeaseMarker?: (file: string, directory: string) => Promise<void>;
   readonly beforeInstallCommit?: () => Promise<void>;
   readonly beforeLeaseDirectoryRead?: (directory: string) => Promise<void>;
@@ -356,6 +396,9 @@ interface SkillFluxCandidatesSource {
     readonly stars: number;
     readonly recentlyActive: boolean;
     readonly trustedSource: boolean;
+    readonly trustLevel: string;
+    readonly qualitySignals: readonly string[];
+    readonly qualityWarnings: readonly string[];
   }[];
 }
 type CatalogItem = Pick<SkillSummary, 'name' | 'description'>;
@@ -414,6 +457,33 @@ declare class EmbeddingRouter {
   private request;
 }
 //#endregion
+//#region src/remote-governance.d.ts
+interface RemoteEvidenceInput {
+  readonly relevanceScore: number;
+  readonly installs: number;
+  readonly stars: number;
+  readonly forks: number;
+  readonly pushedAt?: string;
+  readonly recentActivityDays: number;
+  readonly trustedSource: boolean;
+  readonly organizationOwned: boolean;
+  readonly hasLicense: boolean;
+  readonly discoverySourceCount?: number;
+  readonly contentPinned?: boolean;
+  readonly now: number;
+}
+interface RemoteQualityEvidence {
+  readonly trustLevel: RemoteTrustLevel;
+  readonly breakdown: RemoteQualityBreakdown;
+  readonly signals: readonly RemoteQualitySignal[];
+  readonly warnings: readonly RemoteQualityWarning[];
+}
+declare function remoteQualityEvidence(input: RemoteEvidenceInput): RemoteQualityEvidence;
+declare function remoteTrustPolicyAllows(level: RemoteTrustLevel, policy: RemoteTrustPolicy): boolean;
+declare function compareRemoteTrust(left: RemoteTrustLevel, right: RemoteTrustLevel): number;
+declare function compareRemoteCandidates(left: RemoteCandidate, right: RemoteCandidate): number;
+declare function deduplicateRemoteCandidates(candidates: readonly RemoteCandidate[]): RemoteCandidate[];
+//#endregion
 //#region src/remote-cache.d.ts
 interface RemoteDiscoveryCacheOptions {
   readonly file: string;
@@ -465,23 +535,14 @@ interface RemoteDiscoveryOptions {
   readonly minQualityScore?: number;
   readonly minStars?: number;
   readonly recentActivityDays?: number;
+  readonly trustPolicy?: RemoteTrustPolicy;
   readonly trustedOwners?: readonly string[];
+  readonly blockedOwners?: readonly string[];
   readonly githubToken?: string;
   readonly now?: () => number;
   readonly cache?: RemoteDiscoveryCache;
 }
-interface RemoteQualityInput {
-  readonly relevanceScore: number;
-  readonly installs: number;
-  readonly stars: number;
-  readonly forks: number;
-  readonly pushedAt?: string;
-  readonly recentActivityDays: number;
-  readonly trustedSource: boolean;
-  readonly organizationOwned: boolean;
-  readonly hasLicense: boolean;
-  readonly now: number;
-}
+interface RemoteQualityInput extends RemoteEvidenceInput {}
 declare function remoteQualityScore(input: RemoteQualityInput): number;
 declare class RemoteDiscoveryClient {
   private readonly options;
@@ -620,5 +681,5 @@ declare class SkillFluxService extends Service {
   private scheduleSessionCachePrune;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteQualityInput, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityScore, routeScore, selectCandidates, tokenize };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, routeScore, selectCandidates, tokenize, verifyUniqueRemoteSkill };
 //# sourceMappingURL=index.d.ts.map

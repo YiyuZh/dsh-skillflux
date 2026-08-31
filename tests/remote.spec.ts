@@ -84,6 +84,8 @@ describe('remote discovery', () => {
       recentlyActive: true,
       license: 'MIT',
       selection: 'remote-quality',
+      trustLevel: 'community',
+      qualityWarnings: expect.arrayContaining(['single-source', 'content-not-previewed']),
     })
     expect(result[0]?.qualityScore).toBeGreaterThan(0)
     expect(result[0]?.description).toContain('PDF toolkit')
@@ -126,6 +128,8 @@ describe('remote discovery', () => {
       discoverySources: ['github'],
       stars: 900,
       installs: 0,
+      trustLevel: 'community',
+      qualitySignals: expect.arrayContaining(['content-pinned']),
     })
   })
 
@@ -158,7 +162,66 @@ describe('remote discovery', () => {
       installs: 4_200,
       description: 'Analyze PDF files and extract tables.',
       discoverySources: ['skills.sh', 'github'],
+      trustLevel: 'corroborated',
+      qualitySignals: expect.arrayContaining(['cross-source', 'content-pinned']),
     })
+  })
+
+  it('rejects same-name Skills found at multiple paths even when SKILL.md bytes match', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://api.github.com/search/code')) {
+        return new Response(JSON.stringify({
+          items: [
+            { path: 'skills/a/SKILL.md', repository: { full_name: 'acme/agent-skills', private: false } },
+            { path: 'skills/b/SKILL.md', repository: { full_name: 'acme/agent-skills', private: false } },
+          ],
+        }), { status: 200 })
+      }
+      if (url === 'https://api.github.com/graphql') {
+        return new Response(JSON.stringify({ data: { r0: graphqlRepository() } }), { status: 200 })
+      }
+      return new Response(skillMarkdown('pdf-reader', 'Read PDF documents with OCR.'), { status: 200 })
+    }))
+    const result = await new RemoteDiscoveryClient({
+      searchLimit: 5,
+      timeoutMs: 1_000,
+      providers: ['github'],
+      githubToken: 'test-token',
+      now: () => Date.parse('2026-08-24T00:00:00Z'),
+    }).search('pdf reader')
+    expect(result).toEqual([])
+  })
+
+  it('enforces trusted and blocked owner governance independently of stars', async () => {
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://skills.sh/')) {
+        return new Response(JSON.stringify({
+          skills: [
+            { skillId: 'pdf-trusted', name: 'PDF trusted', installs: 1, source: 'trusted/repo' },
+            { skillId: 'pdf-popular', name: 'PDF popular', installs: 100_000, source: 'popular/repo' },
+            { skillId: 'pdf-blocked', name: 'PDF blocked', installs: 1_000_000, source: 'blocked/repo' },
+          ],
+        }), { status: 200 })
+      }
+      if (url.endsWith('/commits/HEAD')) return new Response(JSON.stringify({ sha }), { status: 200 })
+      const stars = url.includes('/blocked/') ? 1_000_000 : url.includes('/popular/') ? 100_000 : 0
+      return new Response(JSON.stringify(repository({ stargazers_count: stars })), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await new RemoteDiscoveryClient({
+      searchLimit: 5,
+      timeoutMs: 1_000,
+      providers: ['skills.sh'],
+      trustPolicy: 'trusted',
+      trustedOwners: ['trusted'],
+      blockedOwners: ['blocked'],
+      now: () => Date.parse('2026-08-24T00:00:00Z'),
+    }).search('pdf')
+    expect(result).toHaveLength(1)
+    expect(result[0]).toMatchObject({ source: 'trusted/repo', trustLevel: 'trusted', trustedSource: true })
+    expect(fetchMock.mock.calls.map(([input]) => String(input)).some(url => url.includes('/blocked/repo'))).toBe(false)
   })
 
   it('filters archived repositories and configurable low-value results', async () => {

@@ -27,6 +27,10 @@ const candidate: RemoteCandidate = {
   license: 'MIT',
   recentlyActive: true,
   trustedSource: false,
+  trustLevel: 'community',
+  qualityBreakdown: { relevance: 55, adoption: 7, repository: 8, freshness: 8, trust: 2, provenance: 0, total: 80 },
+  qualitySignals: ['recent-activity', 'declared-license'],
+  qualityWarnings: ['single-source', 'content-not-previewed'],
 }
 
 function agentWithRemoteHistory(entries: readonly RemoteCandidate[][]): Agent {
@@ -59,6 +63,42 @@ describe('remote candidate catalog', () => {
   it('does not repeat an already-visible empty replacement', () => {
     const agent = agentWithRemoteHistory([[candidate], []])
     expect(updateRemoteCandidates(agent, [])).toBeUndefined()
+  })
+
+  it('replaces a visible legacy candidate catalog after an upgrade', () => {
+    const legacy = {
+      type: 'user/message' as const,
+      seq: 1,
+      time: 1,
+      data: {
+        id: 'legacy-message',
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text: 'legacy candidates' }],
+        source: {
+          kind: 'skillflux-candidates' as const,
+          form: 'catalog' as const,
+          entries: [{
+            id: candidate.id,
+            name: candidate.name,
+            source: candidate.source,
+            ref: candidate.ref,
+            installs: candidate.installs,
+            discoverySources: candidate.discoverySources,
+            qualityScore: candidate.qualityScore,
+            relevanceScore: candidate.relevanceScore,
+            stars: candidate.stars,
+            recentlyActive: candidate.recentlyActive,
+            trustedSource: candidate.trustedSource,
+          }],
+        },
+      },
+    }
+    const agent = {
+      session: { events: [legacy], surface: { nodes: [legacy.seq] } },
+    } as unknown as Agent
+    expect(updateRemoteCandidates(agent, [candidate])?.source).toMatchObject({
+      kind: 'skillflux-candidates', update: true,
+    })
   })
 })
 

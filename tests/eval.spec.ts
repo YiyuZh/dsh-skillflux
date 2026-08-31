@@ -269,6 +269,10 @@ function toCandidate(candidate: EvalCandidate): SkillFluxCandidate {
     forks: 0,
     recentlyActive: false,
     trustedSource: false,
+    trustLevel: 'unverified',
+    qualityBreakdown: { relevance: 0, adoption: 0, repository: 0, freshness: 0, trust: 0, provenance: 0, total: 0 },
+    qualitySignals: [],
+    qualityWarnings: ['single-source', 'content-not-previewed', 'activity-unknown', 'license-missing', 'low-adoption'],
   }
 }
 
