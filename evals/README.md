@@ -83,7 +83,18 @@ This corpus measures deterministic router behavior. It doesn't measure the
 quality of third-party Skill instructions or the final answer from an online
 model. Those require a separate, credential-backed end-to-end run.
 
+`remote-fallback-cases.json` adds 8 runtime scenarios covering first-success
+termination, source/installer failures, the default attempt cap, single-attempt
+mode, exhaustion, and both manual approval policies. Its integration runner
+uses real cache files, registration, the `skill` tool, and turn cleanup with
+fixture discovery/installation. Extra regressions cover shared deadlines,
+cancellation, stale turns, owner policy, and post-install catalog budgets.
+
 ## 中文说明
+
+`remote-fallback-cases.json` 新增 8 个自动挂载场景，验证失败回退、次数上限、审批
+模式、成功停止与失败提示清理；集成测试使用真实缓存目录、Skill 工具及回合清理。
+额外回归用例覆盖共享超时、取消、过期回合、owner 策略和安装后的目录预算。
 
 `routing-cases.json` 是词法与自适应 Router 的人工确定性测评集；
 `semantic-routing-cases.json` 使用版本化合成向量验证 embedding 排序契约；

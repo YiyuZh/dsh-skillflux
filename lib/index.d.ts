@@ -27,6 +27,8 @@ interface SkillFluxConfig {
   readonly remoteDiscovery?: RemoteDiscovery;
   readonly remoteProviders?: RemoteDiscoveryProvider[];
   readonly remoteSearchLimit?: number;
+  /** Maximum ranked candidates attempted per automatic remote mount sequence. */
+  readonly remoteAutoMountLimit?: number;
   readonly remoteSearchTimeoutMs?: number;
   readonly remoteMinQualityScore?: number;
   readonly remoteMinStars?: number;
@@ -71,6 +73,7 @@ interface ResolvedSkillFluxConfig {
   readonly remoteDiscovery: RemoteDiscovery;
   readonly remoteProviders: readonly RemoteDiscoveryProvider[];
   readonly remoteSearchLimit: number;
+  readonly remoteAutoMountLimit: number;
   readonly remoteSearchTimeoutMs: number;
   readonly remoteMinQualityScore: number;
   readonly remoteMinStars: number;
@@ -208,7 +211,7 @@ interface RoutingTrace {
   readonly origin: CandidateOrigin;
   readonly source: string;
   readonly selection: CandidateSelection;
-  readonly outcome: 'selected' | 'mounted' | 'budget-skipped';
+  readonly outcome: 'selected' | 'mounted' | 'budget-skipped' | 'mount-failed' | 'mount-timeout';
   readonly score: number;
   readonly baseScore?: number;
   readonly adaptiveBoost?: number;

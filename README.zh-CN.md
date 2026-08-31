@@ -237,6 +237,7 @@ approvalPolicy: always       # always | session | automatic
 remoteDiscovery: automatic   # automatic | on-demand | off
 remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
+remoteAutoMountLimit: 3      # 仅 automatic 审批；设为 1 可关闭候选回退
 remoteSearchTimeoutMs: 30000
 remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
@@ -363,9 +364,25 @@ catalogTokenBudget: 512
 | --- | --- |
 | `always` | 每次远程挂载都请求 DSH 原生审批；默认值。 |
 | `session` | 同一仓库首次成功安装需要审批，之后仅在当前 session 内信任。 |
-| `automatic` | 无需审批，自动下载并挂载排名最高的远程候选；仅在可信环境使用。 |
+| `automatic` | 无需审批，按排名尝试远程候选，首次挂载成功即停止；仅在可信环境使用。 |
 
 审批服务不可用、拒绝或取消时，SkillFlux 会拒绝远程挂载，且不会记录会话信任。
+
+### 自动远端候选回退
+
+仅在 `approvalPolicy: automatic` 下，首个候选不可用时会按发现顺序尝试后续候选，
+首次挂载成功即停止。`remoteAutoMountLimit` 默认为 **3**，允许 **1–5**；设为 `1`
+可保留只尝试一个候选的行为。
+
+多次尝试共享一个 `installTimeoutMs` 预算，从搜索结束后开始计时。预算用尽、用户
+显式取消或回合结束后，不再发起下一个尝试。在途的锁获取和清理会等待安全结束，
+因此该预算不保证整个过程在精确的墙钟时间内返回。
+
+每个候选仍须通过当前信任与 owner 策略、固定版本源码验证、安装内容校验和目录
+预算检查。`/skillflux explain` 会记录 `mount-failed`、`mount-timeout`、
+`budget-skipped` 或 `mounted`。失败候选不再出现在本回合提示中，尚未尝试的候选
+仍可使用；重新执行 `skillflux_search` 可以重试，不会形成持久黑名单。
+`always`、`session` 和显式 `skillflux_mount` 的审批行为不变，也不会静默换候选。
 
 ## 模型工具和用户命令
 

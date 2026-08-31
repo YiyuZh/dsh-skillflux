@@ -273,6 +273,7 @@ approvalPolicy: always       # always | session | automatic
 remoteDiscovery: automatic   # automatic | on-demand | off
 remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
+remoteAutoMountLimit: 3      # automatic approval only; 1 disables fallback
 remoteSearchTimeoutMs: 30000
 remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
@@ -409,10 +410,30 @@ current estimate and `/skillflux explain` marks rejected candidates as
 | --- | --- |
 | `always` | Request native DSH approval for every remote mount. This is the default. |
 | `session` | Request approval for the first successful install from a repository, then trust that repository for the current session. |
-| `automatic` | Download and mount the highest-ranked remote candidate without approval. Use only in a trusted environment. |
+| `automatic` | Try ranked remote candidates until one mounts, without approval. Use only in a trusted environment. |
 
 If approval is unavailable, rejected, or canceled, the remote mount fails
 closed.
+
+### Automatic remote fallback
+
+With `approvalPolicy: automatic`, a broken first result no longer blocks a
+usable second result. SkillFlux tries at most `remoteAutoMountLimit` candidates
+in discovery order (default **3**, allowed **1–5**), stopping after the first
+successful mount. Set it to `1` for single-candidate behavior.
+
+All attempts share one `installTimeoutMs` deadline, starting after discovery.
+The next candidate is not started after this deadline, explicit cancellation,
+or turn cleanup. In-flight lock acquisition and cleanup are awaited safely;
+the deadline is not a strict wall-clock bound on their completion.
+
+Every attempt still enforces current trust/owner policy, pinned-source
+verification, installed-content integrity, and catalog limits.
+`/skillflux explain` records `mount-failed`, `mount-timeout`, `budget-skipped`, or `mounted`.
+Failed candidates are removed from this turn's hint; unattempted candidates
+remain available. A new `skillflux_search` can retry a failure; failures are not
+persisted as a blacklist. `always`, `session`, and explicit `skillflux_mount`
+keep their existing approval behavior and never silently switch candidates.
 
 ## Model tools and user commands
 
