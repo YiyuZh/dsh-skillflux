@@ -1,9 +1,21 @@
 import { Buffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
 import { candidateId, routeScore, tokenize } from './router.js'
+import {
+  compareRemoteCandidates,
+  deduplicateRemoteCandidates,
+  remoteQualityEvidence,
+  remoteTrustPolicyAllows,
+  type RemoteEvidenceInput,
+} from './remote-governance.js'
 import { RemoteDiscoveryCache } from './remote-cache.js'
 import { parseSkillMarkdown } from './skill-file.js'
-import type { RemoteCandidate, RemoteDiscoveryCacheStats, RemoteDiscoveryProvider } from './types.js'
+import type {
+  RemoteCandidate,
+  RemoteDiscoveryCacheStats,
+  RemoteDiscoveryProvider,
+  RemoteTrustPolicy,
+} from './types.js'
 
 interface SkillsSearchItem {
   readonly skillId: string
@@ -78,28 +90,20 @@ export interface RemoteDiscoveryOptions {
   readonly minQualityScore?: number
   readonly minStars?: number
   readonly recentActivityDays?: number
+  readonly trustPolicy?: RemoteTrustPolicy
   readonly trustedOwners?: readonly string[]
+  readonly blockedOwners?: readonly string[]
   readonly githubToken?: string
   readonly now?: () => number
   readonly cache?: RemoteDiscoveryCache
 }
 
-export interface RemoteQualityInput {
-  readonly relevanceScore: number
-  readonly installs: number
-  readonly stars: number
-  readonly forks: number
-  readonly pushedAt?: string
-  readonly recentActivityDays: number
-  readonly trustedSource: boolean
-  readonly organizationOwned: boolean
-  readonly hasLicense: boolean
-  readonly now: number
-}
+export interface RemoteQualityInput extends RemoteEvidenceInput {}
 
 const GITHUB_SOURCE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
 const MAX_REMOTE_SKILL_BYTES = 256 * 1024
+const RANKING_VERSION = 2
 
 function boundedQuery(query: string): string {
   return query.normalize('NFKC').replaceAll(/\s+/gu, ' ').trim().slice(0, 128)
@@ -116,13 +120,16 @@ function discoveryCacheKey(
   githubSearchEnabled: boolean,
 ): string {
   return createHash('sha256').update(JSON.stringify({
+    rankingVersion: RANKING_VERSION,
     query,
     searchLimit: options.searchLimit,
     providers: options.providers,
     minQualityScore: options.minQualityScore,
     minStars: options.minStars,
     recentActivityDays: options.recentActivityDays,
+    trustPolicy: options.trustPolicy,
     trustedOwners: options.trustedOwners,
+    blockedOwners: options.blockedOwners,
     githubSearchEnabled,
   })).digest('hex')
 }
@@ -201,10 +208,6 @@ function isRepositoryResponse(value: unknown): value is GithubRepositoryResponse
       && typeof (license as Record<string, unknown>).spdx_id !== 'undefined'))
 }
 
-function logarithmicPoints(value: number, multiplier: number, maximum: number): number {
-  return Math.min(maximum, Math.round(Math.log10(value + 1) * multiplier))
-}
-
 function activityAgeDays(pushedAt: string | undefined, now: number): number | undefined {
   if (pushedAt === undefined) return undefined
   const pushed = Date.parse(pushedAt)
@@ -213,23 +216,7 @@ function activityAgeDays(pushedAt: string | undefined, now: number): number | un
 }
 
 export function remoteQualityScore(input: RemoteQualityInput): number {
-  const relevance = input.relevanceScore >= 100
-    ? 55
-    : Math.min(50, Math.max(0, input.relevanceScore * 2))
-  const adoption = logarithmicPoints(input.installs, 4, 15)
-  const repository = logarithmicPoints(input.stars, 4, 15) + logarithmicPoints(input.forks, 2, 5)
-  const age = activityAgeDays(input.pushedAt, input.now)
-  const freshness = age === undefined
-    ? 0
-    : age <= input.recentActivityDays
-      ? 10
-      : age <= input.recentActivityDays * 3
-        ? 6
-        : age <= 365
-          ? 3
-          : 0
-  const trust = (input.trustedSource ? 10 : 0) + (input.organizationOwned ? 3 : 0) + (input.hasLicense ? 2 : 0)
-  return Math.min(100, relevance + adoption + repository + freshness + trust)
+  return remoteQualityEvidence(input).breakdown.total
 }
 
 function graphqlRepository(value: unknown): GithubGraphqlRepository | undefined {
@@ -439,25 +426,35 @@ async function githubSeed(
 
 function mergeSeeds(seeds: readonly CandidateSeed[], refBySource: ReadonlyMap<string, RepositorySnapshot>): CandidateSeed[] {
   const merged = new Map<string, CandidateSeed>()
+  const ambiguous = new Set<string>()
   for (const seed of seeds) {
     const ref = refBySource.get(seed.source)?.ref
     if (ref === undefined) continue
     const key = `${seed.source}\0${ref}\0${seed.skillId}`
+    if (ambiguous.has(key)) continue
     const prior = merged.get(key)
     if (prior === undefined) {
       merged.set(key, seed)
       continue
     }
+    if (prior.path !== undefined && seed.path !== undefined && prior.path !== seed.path) {
+      merged.delete(key)
+      ambiguous.add(key)
+      continue
+    }
     const discoverySources = [...new Set([...prior.discoverySources, ...seed.discoverySources])]
+    const preferred = prior.path === undefined && seed.path !== undefined
+      ? seed
+      : prior.path !== undefined && seed.path !== undefined && seed.path.localeCompare(prior.path, 'en') < 0
+        ? seed
+        : prior
     merged.set(key, {
-      ...prior,
+      ...preferred,
       description: seed.discoverySources.includes('github') ? seed.description : prior.description,
       installs: Math.max(prior.installs, seed.installs),
       discoverySources,
-      ...(prior.path === undefined && seed.path !== undefined ? { path: seed.path } : {}),
-      ...(prior.skillFileHash === undefined && seed.skillFileHash !== undefined
-        ? { skillFileHash: seed.skillFileHash }
-        : {}),
+      ...(preferred.path === undefined ? {} : { path: preferred.path }),
+      ...(preferred.skillFileHash === undefined ? {} : { skillFileHash: preferred.skillFileHash }),
     })
   }
   return [...merged.values()]
@@ -482,7 +479,9 @@ export class RemoteDiscoveryClient {
       minQualityScore: options.minQualityScore ?? 0,
       minStars: options.minStars ?? 0,
       recentActivityDays: options.recentActivityDays ?? 30,
+      trustPolicy: options.trustPolicy ?? 'community',
       trustedOwners: options.trustedOwners ?? [],
+      blockedOwners: options.blockedOwners ?? [],
     }
     this.githubToken = configuredGithubToken(options.githubToken)
     this.now = options.now ?? Date.now
@@ -560,12 +559,17 @@ export class RemoteDiscoveryClient {
       const rejected = providerResults.find(result => result.status === 'rejected')
       throw rejected?.reason instanceof Error ? rejected.reason : new Error('remote Skill discovery failed')
     }
+    const blockedOwners = new Set(this.options.blockedOwners.map(owner => owner.toLocaleLowerCase('en-US')))
+    const blocked = (source: string): boolean => {
+      const owner = source.split('/')[0]?.toLocaleLowerCase('en-US') ?? ''
+      return blockedOwners.has(owner)
+    }
     const skillsSeeds = fulfilled.flatMap(result => result.provider === 'skills.sh'
       ? result.value as CandidateSeed[]
-      : [])
+      : []).filter(seed => !blocked(seed.source))
     const githubHits = fulfilled.flatMap(result => result.provider === 'github'
       ? result.value as GithubCodeSearchItem[]
-      : [])
+      : []).filter(hit => !blocked(hit.repository.full_name))
     const sources = [...new Set([
       ...skillsSeeds.map(seed => seed.source),
       ...githubHits.map(hit => hit.repository.full_name),
@@ -594,7 +598,7 @@ export class RemoteDiscoveryClient {
       if (relevanceScore === 0) return []
       const owner = seed.source.split('/')[0]?.toLocaleLowerCase('en-US') ?? ''
       const trustedSource = trustedOwners.has(owner)
-      const qualityScore = remoteQualityScore({
+      const evidence = remoteQualityEvidence({
         relevanceScore,
         installs: seed.installs,
         stars: snapshot.stars,
@@ -604,9 +608,13 @@ export class RemoteDiscoveryClient {
         trustedSource,
         organizationOwned: snapshot.organizationOwned,
         hasLicense: snapshot.license !== undefined,
+        discoverySourceCount: seed.discoverySources.length,
+        contentPinned: seed.path !== undefined && seed.skillFileHash !== undefined,
         now,
       })
+      const qualityScore = evidence.breakdown.total
       if (qualityScore < this.options.minQualityScore) return []
+      if (!remoteTrustPolicyAllows(evidence.trustLevel, this.options.trustPolicy)) return []
       const age = activityAgeDays(snapshot.pushedAt, now)
       return [{
         id: candidateId('remote', seed.source, snapshot.ref, seed.skillId),
@@ -630,17 +638,18 @@ export class RemoteDiscoveryClient {
         ...(snapshot.license === undefined ? {} : { license: snapshot.license }),
         recentlyActive: age !== undefined && age <= this.options.recentActivityDays,
         trustedSource,
+        trustLevel: evidence.trustLevel,
+        qualityBreakdown: evidence.breakdown,
+        qualitySignals: evidence.signals,
+        qualityWarnings: evidence.warnings,
         ...(seed.path === undefined ? {} : { path: seed.path }),
         ...(seed.skillFileHash === undefined ? {} : { skillFileHash: seed.skillFileHash }),
       }]
     })
-    candidates.sort((left, right) => right.qualityScore - left.qualityScore
-      || right.relevanceScore - left.relevanceScore
-      || Number(right.trustedSource) - Number(left.trustedSource)
-      || Number(right.recentlyActive) - Number(left.recentlyActive)
-      || right.installs - left.installs
-      || right.stars - left.stars
-      || `${left.source}/${left.name}`.localeCompare(`${right.source}/${right.name}`, 'en'))
-    return { candidates: candidates.slice(0, this.options.searchLimit), degraded }
+    candidates.sort(compareRemoteCandidates)
+    return {
+      candidates: deduplicateRemoteCandidates(candidates).slice(0, this.options.searchLimit),
+      degraded,
+    }
   }
 }

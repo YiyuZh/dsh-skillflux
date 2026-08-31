@@ -3,6 +3,24 @@ import type { SkillDefinition, SkillSummary } from '@deepseek-ai/dsh-skill'
 export type ApprovalPolicy = 'always' | 'session' | 'automatic'
 export type RemoteDiscovery = 'automatic' | 'on-demand' | 'off'
 export type RemoteDiscoveryProvider = 'skills.sh' | 'github'
+export type RemoteTrustPolicy = 'open' | 'community' | 'corroborated' | 'trusted'
+export type RemoteTrustLevel = 'unverified' | 'community' | 'corroborated' | 'trusted'
+export type RemoteQualitySignal =
+  | 'trusted-owner'
+  | 'cross-source'
+  | 'content-pinned'
+  | 'recent-activity'
+  | 'declared-license'
+  | 'organization-owned'
+  | 'market-adoption'
+  | 'repository-adoption'
+export type RemoteQualityWarning =
+  | 'single-source'
+  | 'content-not-previewed'
+  | 'activity-unknown'
+  | 'stale-activity'
+  | 'license-missing'
+  | 'low-adoption'
 export type CandidateOrigin = 'registry' | 'cache' | 'remote'
 export type RouterMode = 'lexical' | 'hybrid'
 export type EmbeddingProvider = 'ollama' | 'openai-compatible'
@@ -25,10 +43,17 @@ export interface SkillFluxConfig {
   readonly remoteMinQualityScore?: number
   readonly remoteMinStars?: number
   readonly remoteRecentActivityDays?: number
+  readonly remoteTrustPolicy?: RemoteTrustPolicy
   readonly remoteTrustedOwners?: string[]
+  readonly remoteBlockedOwners?: string[]
   readonly remoteCacheTtlMs?: number
   readonly remoteCacheStaleIfErrorMs?: number
   readonly remoteCacheMaxEntries?: number
+  readonly cacheAutoPrune?: boolean
+  readonly cacheMaxEntries?: number
+  readonly cacheMaxTotalBytes?: number
+  /** Zero disables idle-time eviction. */
+  readonly cacheMaxIdleDays?: number
   readonly catalogDescriptionMaxLength?: number
   readonly catalogTokenBudget?: number
   readonly maxSkillFiles?: number
@@ -63,10 +88,16 @@ export interface ResolvedSkillFluxConfig {
   readonly remoteMinQualityScore: number
   readonly remoteMinStars: number
   readonly remoteRecentActivityDays: number
+  readonly remoteTrustPolicy: RemoteTrustPolicy
   readonly remoteTrustedOwners: readonly string[]
+  readonly remoteBlockedOwners: readonly string[]
   readonly remoteCacheTtlMs: number
   readonly remoteCacheStaleIfErrorMs: number
   readonly remoteCacheMaxEntries: number
+  readonly cacheAutoPrune: boolean
+  readonly cacheMaxEntries: number
+  readonly cacheMaxTotalBytes: number
+  readonly cacheMaxIdleDays: number
   readonly catalogDescriptionMaxLength: number
   readonly catalogTokenBudget: number
   readonly maxSkillFiles: number
@@ -135,6 +166,7 @@ export interface CachedCandidate extends CandidateRoutingMetadata {
   readonly cacheId: string
   readonly installs?: number
   readonly qualityScore?: number
+  readonly trustLevel?: RemoteTrustLevel
   readonly stars?: number
   readonly pushedAt?: string
   readonly discoverySources?: readonly RemoteDiscoveryProvider[]
@@ -159,8 +191,22 @@ export interface RemoteCandidate extends CandidateRoutingMetadata {
   readonly license?: string
   readonly recentlyActive: boolean
   readonly trustedSource: boolean
+  readonly trustLevel: RemoteTrustLevel
+  readonly qualityBreakdown: RemoteQualityBreakdown
+  readonly qualitySignals: readonly RemoteQualitySignal[]
+  readonly qualityWarnings: readonly RemoteQualityWarning[]
   readonly path?: string
   readonly skillFileHash?: string
+}
+
+export interface RemoteQualityBreakdown {
+  readonly relevance: number
+  readonly adoption: number
+  readonly repository: number
+  readonly freshness: number
+  readonly trust: number
+  readonly provenance: number
+  readonly total: number
 }
 
 export type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate
@@ -202,6 +248,8 @@ export interface SkillUsageIdentity {
   readonly name: string
   readonly origin: CandidateOrigin
   readonly source: string
+  /** Present for remote and cached mounts after immutable installation. */
+  readonly cacheId?: string
 }
 
 export interface SkillUsageRecord extends SkillUsageIdentity {
@@ -222,9 +270,14 @@ export interface CacheManifest {
   readonly whenToUse?: string
   readonly installs?: number
   readonly qualityScore?: number
+  readonly trustLevel?: RemoteTrustLevel
   readonly stars?: number
   readonly pushedAt?: string
   readonly discoverySources?: readonly RemoteDiscoveryProvider[]
+  /** Pinned repository path proven unique for this Skill name. */
+  readonly sourcePath?: string
+  /** SHA-256 of the unique pinned source SKILL.md. */
+  readonly sourceSkillFileHash?: string
   readonly installedAt: string
   readonly fileCount: number
   readonly totalBytes: number

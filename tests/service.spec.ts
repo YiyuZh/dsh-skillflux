@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { agentEvents, Inbox, type Agent } from '@deepseek-ai/dsh-agent'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
@@ -11,10 +14,11 @@ import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import type { LockOptions } from 'proper-lockfile'
 import SkillFluxService, { estimateCatalogTokens, UsageStore, type SkillFluxConfig } from '../src/index.js'
 import PublishedSkillFluxService from '../lib/index.js'
-import { candidateId } from '../src/router.js'
-import type { CacheEntry, SkillFluxCandidate } from '../src/types.js'
+import { cacheCandidates, candidateId } from '../src/router.js'
+import type { CacheEntry, RemoteCandidate, SkillFluxCandidate } from '../src/types.js'
 import type { SkillDefinition } from '@deepseek-ai/dsh-skill'
 
 const disposers: Array<() => Promise<void>> = []
@@ -112,7 +116,9 @@ describe('SkillFlux service', () => {
       remoteMinQualityScore: 60,
       remoteMinStars: 25,
       remoteRecentActivityDays: 30,
+      remoteTrustPolicy: 'corroborated',
       remoteTrustedOwners: ['Anthropics', 'openai'],
+      remoteBlockedOwners: ['Known-Bad'],
       remoteCacheTtlMs: 60_000,
       remoteCacheStaleIfErrorMs: 600_000,
       remoteCacheMaxEntries: 25,
@@ -122,16 +128,171 @@ describe('SkillFlux service', () => {
       remoteMinQualityScore: 60,
       remoteMinStars: 25,
       remoteRecentActivityDays: 30,
+      remoteTrustPolicy: 'corroborated',
       remoteTrustedOwners: ['anthropics', 'openai'],
+      remoteBlockedOwners: ['known-bad'],
       remoteCacheTtlMs: 60_000,
       remoteCacheStaleIfErrorMs: 600_000,
       remoteCacheMaxEntries: 25,
     })
+    const status = await context.commands.execute(
+      fakeAgent(context),
+      '/skillflux status',
+      [],
+      new AbortController().signal,
+    )
+    expect(status?.result.text).toContain('evidence policy corroborated')
+    expect(status?.result.text).toContain('1 blocked owner(s)')
     await expect(setup({ remoteProviders: [] })).rejects.toThrow('remoteProviders must contain at least one')
     await expect(setup({ remoteMinQualityScore: 101 })).rejects.toThrow('remoteMinQualityScore')
     await expect(setup({ remoteTrustedOwners: ['bad/owner'] })).rejects.toThrow('invalid GitHub owner')
+    await expect(setup({ remoteBlockedOwners: ['bad/owner'] })).rejects.toThrow('invalid GitHub owner')
+    await expect(setup({ remoteTrustedOwners: ['same'], remoteBlockedOwners: ['SAME'] }))
+      .rejects.toThrow('cannot be both trusted and blocked')
     await expect(setup({ remoteCacheTtlMs: -1 })).rejects.toThrow('remoteCacheTtlMs')
     await expect(setup({ remoteCacheMaxEntries: 1_001 })).rejects.toThrow('remoteCacheMaxEntries')
+  })
+
+  it('reapplies current owner and evidence policy to cached Skills after restart and before mount', async () => {
+    const source = 'once-trusted/repo'
+    const entry: CacheEntry = {
+      directory: '/cache/policy-skill',
+      manifest: {
+        version: 1,
+        cacheId: '1'.repeat(24),
+        source,
+        ref: '2'.repeat(40),
+        skillId: 'policy-skill',
+        name: 'policy-skill',
+        description: 'Handle policy documents',
+        trustLevel: 'trusted',
+        discoverySources: ['github'],
+        installedAt: '2026-08-28T00:00:00.000Z',
+        fileCount: 1,
+        totalBytes: 100,
+        contentHash: '3'.repeat(64),
+      },
+    }
+    const useEntries = (context: Context, entries: readonly CacheEntry[]) => {
+      const cache = (context.skillFlux as unknown as { cache: { list: () => Promise<readonly CacheEntry[]> } }).cache
+      cache.list = async () => entries
+    }
+
+    const trusted = await setup({ routes: [], remoteTrustPolicy: 'trusted', remoteTrustedOwners: ['once-trusted'] })
+    useEntries(trusted, [entry])
+    expect(await trusted.skillFlux.discover(fakeAgent(trusted), 'policy-skill')).toMatchObject([
+      { source, origin: 'cache', trustLevel: 'trusted' },
+    ])
+
+    // A new service instance represents a restart with a stricter current
+    // configuration. Persisted `trusted` is downgraded when its owner is no
+    // longer explicitly trusted.
+    const revoked = await setup({ routes: [], remoteTrustPolicy: 'trusted' })
+    useEntries(revoked, [entry])
+    expect(await revoked.skillFlux.discover(fakeAgent(revoked), 'policy-skill')).toEqual([])
+
+    const blocked = await setup({ routes: [], remoteBlockedOwners: ['once-trusted'] })
+    useEntries(blocked, [entry])
+    const blockedAgent = fakeAgent(blocked)
+    expect(await blocked.skillFlux.discover(blockedAgent, 'policy-skill')).toEqual([])
+    const user = createUserMessage({
+      content: [{ type: 'text', text: 'Use policy-skill for this policy document' }],
+      source: { kind: 'user' },
+    })
+    await propose(blocked, blockedAgent, [user])
+    expect(blocked.skillFlux.mounted(blockedAgent)).toEqual([])
+
+    const blockedInternals = blocked.skillFlux as unknown as {
+      cache: { get: ReturnType<typeof vi.fn> }
+      state: (agent: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+    }
+    blockedInternals.cache.get = vi.fn(async () => entry)
+    const rawCandidate = cacheCandidates([entry])[0]!
+    blockedInternals.state(blockedAgent).candidates.set(rawCandidate.id, rawCandidate)
+    await expect(blocked.skillFlux.mount(blockedAgent, rawCandidate.id)).rejects.toThrow('remoteBlockedOwners')
+    expect(blockedInternals.cache.get).not.toHaveBeenCalled()
+
+    const { trustLevel: _legacyTrust, ...legacyManifest } = entry.manifest
+    const legacyEntry: CacheEntry = { ...entry, manifest: legacyManifest }
+    const legacyCommunity = await setup({ routes: [], remoteTrustPolicy: 'community' })
+    useEntries(legacyCommunity, [legacyEntry])
+    expect(await legacyCommunity.skillFlux.discover(fakeAgent(legacyCommunity), 'policy-skill')).toMatchObject([
+      { origin: 'cache', trustLevel: 'community' },
+    ])
+    const legacyCorroborated = await setup({ routes: [], remoteTrustPolicy: 'corroborated' })
+    useEntries(legacyCorroborated, [legacyEntry])
+    expect(await legacyCorroborated.skillFlux.discover(fakeAgent(legacyCorroborated), 'policy-skill')).toEqual([])
+
+    const openInstalled: CacheEntry = {
+      ...entry,
+      manifest: {
+        ...entry.manifest,
+        trustLevel: 'unverified',
+        sourcePath: 'skills/policy-skill/SKILL.md',
+        sourceSkillFileHash: '4'.repeat(64),
+      },
+    }
+    const communityRestart = await setup({ routes: [], remoteTrustPolicy: 'community' })
+    const restartCache = (communityRestart.skillFlux as unknown as {
+      cache: {
+        list: () => Promise<CacheEntry[]>
+        get: () => Promise<CacheEntry>
+        load: () => Promise<SkillDefinition>
+        createActiveLease: () => Promise<() => Promise<void>>
+      }
+    }).cache
+    restartCache.list = async () => [openInstalled]
+    restartCache.get = async () => openInstalled
+    restartCache.load = async () => ({
+      name: openInstalled.manifest.name,
+      description: openInstalled.manifest.description,
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'runtime',
+      provider: 'skillflux-cache',
+      content: 'Verified open-policy installation.',
+    })
+    restartCache.createActiveLease = async () => async () => undefined
+    const restartAgent = fakeAgent(communityRestart)
+    const restartUser = createUserMessage({
+      content: [{ type: 'text', text: 'Handle this policy document with policy-skill' }],
+      source: { kind: 'user' },
+    })
+    await propose(communityRestart, restartAgent, [restartUser])
+    expect(communityRestart.skillFlux.mounted(restartAgent)).toMatchObject([
+      { name: 'policy-skill', origin: 'cache', source },
+    ])
+  })
+
+  it('releases the cache process lock after remote source verification times out', async () => {
+    const context = await setup({ routes: [], cacheAutoPrune: false, installTimeoutMs: 25 })
+    const agent = fakeAgent(context)
+    const candidate: RemoteCandidate = {
+      id: 'verification-timeout', origin: 'remote', name: 'timeout-skill',
+      description: 'Remote verification timeout fixture', source: 'owner/repo', ref: '4'.repeat(40),
+      score: 70, skillId: 'timeout-skill', installs: 0, discoverySources: ['skills.sh'],
+      qualityScore: 70, relevanceScore: 100, stars: 1, forks: 0, recentlyActive: true,
+      trustedSource: false, trustLevel: 'community',
+      qualityBreakdown: { relevance: 55, adoption: 0, repository: 1, freshness: 10, trust: 2, provenance: 0, total: 68 },
+      qualitySignals: ['recent-activity'], qualityWarnings: ['single-source', 'content-not-previewed'],
+    }
+    const internals = context.skillFlux as unknown as {
+      cache: { options: { verifyCandidate: () => Promise<never> } }
+      state: (target: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+      acquireCacheLease: () => Promise<() => Promise<void>>
+    }
+    internals.cache.options.verifyCandidate = async () => await new Promise(() => undefined)
+    internals.state(agent).candidates.set(candidate.id, candidate)
+    await expect(context.skillFlux.mount(agent, candidate.id)).rejects.toMatchObject({ name: 'TimeoutError' })
+
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const release = await Promise.race([
+      internals.acquireCacheLease(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => { reject(new Error('cache process lock was not released')) }, 1_000)
+      }),
+    ])
+    if (timeout !== undefined) clearTimeout(timeout)
+    await release()
   })
 
   it('reports and clears the persistent remote discovery cache', async () => {
@@ -151,6 +312,439 @@ describe('SkillFlux service', () => {
       new AbortController().signal,
     )
     expect(cleaned?.result.text).toBe('Removed 0 remote discovery cache entries.')
+  })
+
+  it('validates and reports installed cache governance configuration', async () => {
+    const context = await setup({
+      cacheAutoPrune: false,
+      cacheMaxEntries: 25,
+      cacheMaxTotalBytes: 1_048_576,
+      cacheMaxIdleDays: 0,
+    })
+    expect(context.skillFlux.config).toMatchObject({
+      cacheAutoPrune: false,
+      cacheMaxEntries: 25,
+      cacheMaxTotalBytes: 1_048_576,
+      cacheMaxIdleDays: 0,
+    })
+    const agent = fakeAgent(context)
+    const status = await context.commands.execute(agent, '/skillflux status', [], new AbortController().signal)
+    expect(status?.result.text).toContain('Installed Skill cache: 0/25 entries, 0/1048576 bytes; auto prune off; idle limit off.')
+    const pruned = await context.commands.execute(agent, '/skillflux cache prune', [], new AbortController().signal)
+    expect(pruned?.result.text).toBe('SkillFlux cache prune removed 0 entries; 0 entries and 0 bytes remain.')
+    await expect(setup({ cacheMaxEntries: 0 })).rejects.toThrow('cacheMaxEntries')
+    await expect(setup({ cacheMaxTotalBytes: 0 })).rejects.toThrow('cacheMaxTotalBytes')
+    await expect(setup({ cacheMaxIdleDays: -1 })).rejects.toThrow('cacheMaxIdleDays')
+  })
+
+  it('serializes cache maintenance against in-flight cache loads', async () => {
+    const context = await setup()
+    const internals = context.skillFlux as unknown as {
+      cache: { prune: (...args: unknown[]) => Promise<unknown> }
+      acquireCacheLease: () => Promise<() => Promise<void>>
+      pruneCache: () => Promise<unknown>
+    }
+    const emptyPlan = {
+      decisions: [], protected: [], beforeEntries: 0, beforeBytes: 0, afterEntries: 0, afterBytes: 0,
+    }
+    const releaseLoad = await internals.acquireCacheLease()
+    const prune = vi.spyOn(internals.cache, 'prune').mockResolvedValue(emptyPlan)
+    const waitingPrune = internals.pruneCache()
+    await new Promise(resolve => { setTimeout(resolve, 0) })
+    expect(prune).not.toHaveBeenCalled()
+    await releaseLoad()
+    await waitingPrune
+    expect(prune).toHaveBeenCalledOnce()
+
+    let finishMaintenance: (() => void) | undefined
+    prune.mockImplementation(async () => await new Promise(resolve => {
+      finishMaintenance = () => { resolve(emptyPlan) }
+    }))
+    const activePrune = internals.pruneCache()
+    await vi.waitFor(() => { expect(finishMaintenance).toBeDefined() })
+    let leaseAcquired = false
+    const waitingLease = internals.acquireCacheLease().then(release => {
+      leaseAcquired = true
+      return release
+    })
+    await new Promise(resolve => { setTimeout(resolve, 0) })
+    expect(leaseAcquired).toBe(false)
+    finishMaintenance?.()
+    await activePrune
+    const releaseWaitingLoad = await waitingLease
+    expect(leaseAcquired).toBe(true)
+    await releaseWaitingLoad()
+  })
+
+  it('serializes cache operations across service instances sharing DSH_HOME', async () => {
+    const first = await setup()
+    const second = await setup()
+    const firstInternals = first.skillFlux as unknown as { acquireCacheLease: () => Promise<() => Promise<void>> }
+    const secondInternals = second.skillFlux as unknown as { acquireCacheLease: () => Promise<() => Promise<void>> }
+    const releaseFirst = await firstInternals.acquireCacheLease()
+    let secondAcquired = false
+    const waitingSecond = secondInternals.acquireCacheLease().then(release => {
+      secondAcquired = true
+      return release
+    })
+    await new Promise(resolve => { setTimeout(resolve, 50) })
+    expect(secondAcquired).toBe(false)
+    await releaseFirst()
+    const releaseSecond = await waitingSecond
+    expect(secondAcquired).toBe(true)
+    await releaseSecond()
+  })
+
+  it('makes the real Service lease wait for a child process holding the cache lock', async () => {
+    const context = await setup()
+    const cacheRoot = join(process.env.DSH_HOME!, 'cache', 'skillflux')
+    const child = spawn(process.execPath, [
+      fileURLToPath(new URL('./fixtures/cache-process-worker.mjs', import.meta.url)),
+      'lock',
+      cacheRoot,
+    ], { stdio: ['pipe', 'pipe', 'pipe'] })
+    const exited = once(child, 'exit')
+    try {
+      child.stdout.setEncoding('utf8')
+      await new Promise<void>((resolve, reject) => {
+        let output = ''
+        const timeout = setTimeout(() => { reject(new Error(`child lock did not start: ${output}`)) }, 5_000)
+        child.stdout.on('data', chunk => {
+          output += String(chunk)
+          if (!output.includes('LOCKED')) return
+          clearTimeout(timeout)
+          resolve()
+        })
+        child.once('error', error => {
+          clearTimeout(timeout)
+          reject(error)
+        })
+      })
+      const internals = context.skillFlux as unknown as {
+        acquireCacheLease: () => Promise<() => Promise<void>>
+      }
+      let acquired = false
+      const waiting = internals.acquireCacheLease().then(release => {
+        acquired = true
+        return release
+      })
+      await new Promise(resolve => { setTimeout(resolve, 100) })
+      expect(acquired).toBe(false)
+      child.stdin.end('\n')
+      await exited
+      const release = await waiting
+      expect(acquired).toBe(true)
+      await release()
+    } finally {
+      if (!child.killed) child.kill()
+    }
+  })
+
+  it('turns a compromised process lock into a maintenance failure without throwing from its callback', async () => {
+    const context = await setup({ cacheAutoPrune: false })
+    let compromise: ((error: Error) => unknown) | undefined
+    let markPruneStarted!: () => void
+    const pruneStarted = new Promise<void>(resolve => { markPruneStarted = resolve })
+    const internals = context.skillFlux as unknown as {
+      cacheProcessLock: (file: string, options?: LockOptions) => Promise<() => Promise<void>>
+      cache: { prune: (...args: unknown[]) => Promise<unknown> }
+      pruneCache: () => Promise<unknown>
+    }
+    internals.cacheProcessLock = async (_file, options) => {
+      compromise = options?.onCompromised
+      return async () => undefined
+    }
+    internals.cache.prune = async (...args) => {
+      const signal = args[4] as AbortSignal
+      markPruneStarted()
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => { reject(signal.reason) }, { once: true })
+      })
+      throw new Error('unreachable')
+    }
+    const pending = internals.pruneCache()
+    await pruneStarted
+    expect(() => { compromise?.(new Error('lock heartbeat lost')) }).not.toThrow()
+    await expect(pending).rejects.toThrow('lock heartbeat lost')
+  })
+
+  it('retries an abandoned active-marker cleanup before the next maintenance run', async () => {
+    const context = await setup({ cacheAutoPrune: false })
+    let attempts = 0
+    const cleanup = vi.fn(async () => {
+      attempts += 1
+      if (attempts <= 3) throw new Error('marker is temporarily busy')
+    })
+    const emptyPlan = {
+      decisions: [], protected: [], beforeEntries: 0, beforeBytes: 0, afterEntries: 0, afterBytes: 0,
+    }
+    const internals = context.skillFlux as unknown as {
+      pendingActiveLeaseCleanups: Set<() => Promise<void>>
+      trackActiveLeaseCleanup: (operation: () => Promise<void>) => Promise<void>
+      cache: { prune: (...args: unknown[]) => Promise<unknown> }
+      pruneCache: () => Promise<unknown>
+    }
+    await internals.trackActiveLeaseCleanup(cleanup)
+    expect(cleanup).toHaveBeenCalledTimes(3)
+    expect(internals.pendingActiveLeaseCleanups.size).toBe(1)
+    internals.cache.prune = async () => emptyPlan
+    await internals.pruneCache()
+    expect(cleanup).toHaveBeenCalledTimes(4)
+    expect(internals.pendingActiveLeaseCleanups.size).toBe(0)
+  })
+
+  it('automatically governs after a remote mount and again after turn cleanup', async () => {
+    const context = await setup({ cacheAutoPrune: true })
+    const agent = fakeAgent(context)
+    const ref = 'd'.repeat(40)
+    const cacheId = 'e'.repeat(24)
+    const candidate: RemoteCandidate = {
+      id: candidateId('remote', 'owner/auto', ref, 'auto-skill'),
+      origin: 'remote',
+      name: 'auto-skill',
+      description: 'Automatic governance fixture',
+      source: 'owner/auto',
+      ref,
+      score: 100,
+      skillId: 'auto-skill',
+      installs: 0,
+      discoverySources: ['github'],
+      qualityScore: 50,
+      relevanceScore: 100,
+      stars: 0,
+      forks: 0,
+      recentlyActive: true,
+      trustedSource: false,
+      trustLevel: 'community',
+      qualityBreakdown: { relevance: 50, adoption: 0, repository: 0, freshness: 0, trust: 0, provenance: 0, total: 50 },
+      qualitySignals: ['content-pinned'],
+      qualityWarnings: [],
+    }
+    const entry: CacheEntry = {
+      directory: '/cache/auto-skill',
+      manifest: {
+        version: 1,
+        cacheId,
+        source: candidate.source,
+        ref,
+        skillId: candidate.skillId,
+        name: candidate.name,
+        description: candidate.description,
+        installedAt: new Date().toISOString(),
+        fileCount: 1,
+        totalBytes: 100,
+        contentHash: 'f'.repeat(64),
+      },
+    }
+    const definition: SkillDefinition = {
+      name: candidate.name,
+      description: candidate.description,
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'runtime',
+      provider: 'skillflux-cache',
+      content: 'AUTO BODY',
+    }
+    const internals = context.skillFlux as unknown as {
+      cache: {
+        install: () => Promise<CacheEntry>
+        load: () => Promise<SkillDefinition>
+        createActiveLease: () => Promise<() => Promise<void>>
+        prune: () => Promise<unknown>
+      }
+      state: (target: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+    }
+    vi.spyOn(internals.cache, 'install').mockResolvedValue(entry)
+    vi.spyOn(internals.cache, 'load').mockResolvedValue(definition)
+    vi.spyOn(internals.cache, 'createActiveLease').mockResolvedValue(async () => undefined)
+    const prune = vi.spyOn(internals.cache, 'prune').mockResolvedValue({
+      decisions: [], protected: [cacheId], beforeEntries: 1, beforeBytes: 100, afterEntries: 1, afterBytes: 100,
+    })
+    internals.state(agent).candidates.set(candidate.id, candidate)
+    await context.skillFlux.mount(agent, candidate.id)
+    await vi.waitFor(() => { expect(prune).toHaveBeenCalledTimes(1) })
+
+    context.emit(scopeTarget(agent.session, undefined), 'session/event', agent.session, {
+      type: 'turn/end',
+      seq: 1,
+      time: 1,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })
+    await vi.waitFor(() => { expect(prune).toHaveBeenCalledTimes(2) })
+  })
+
+  it('does not schedule automatic governance when it is disabled', async () => {
+    const context = await setup({ cacheAutoPrune: false })
+    const internals = context.skillFlux as unknown as {
+      scheduleAutoPrune: () => void
+      cache: { prune: () => Promise<unknown> }
+    }
+    const prune = vi.spyOn(internals.cache, 'prune')
+    internals.scheduleAutoPrune()
+    await new Promise(resolve => { setTimeout(resolve, 0) })
+    expect(prune).not.toHaveBeenCalled()
+  })
+
+  it('schedules post-cleanup governance when an agent is disposed without turn/end', async () => {
+    const context = await setup({ cacheAutoPrune: true })
+    const agent = fakeAgent(context)
+    const internals = context.skillFlux as unknown as {
+      state: (target: Agent) => unknown
+      disposeAgent: (target: Agent) => void
+      cachePruneSessions: WeakSet<Session>
+      scheduleAutoPrune: () => void
+    }
+    internals.state(agent)
+    internals.cachePruneSessions.add(agent.session)
+    const schedule = vi.spyOn(internals, 'scheduleAutoPrune').mockImplementation(() => undefined)
+    internals.disposeAgent(agent)
+    expect(schedule).toHaveBeenCalledOnce()
+    expect(internals.cachePruneSessions.has(agent.session)).toBe(false)
+  })
+
+  it('rejects a mount disposed while its process lock is being released', async () => {
+    const context = await setup({ routes: [] })
+    const agent = fakeAgent(context)
+    const ref = '4'.repeat(40)
+    const cacheId = '5'.repeat(24)
+    const candidate: SkillFluxCandidate = {
+      id: candidateId('cache', 'owner/release-race', ref, 'release-race'),
+      origin: 'cache',
+      name: 'release-race',
+      description: 'Release lifecycle fixture',
+      source: 'owner/release-race',
+      ref,
+      score: 100,
+      cacheId,
+    }
+    const entry: CacheEntry = {
+      directory: '/cache/release-race',
+      manifest: {
+        version: 1,
+        cacheId,
+        source: candidate.source,
+        ref,
+        skillId: candidate.name,
+        name: candidate.name,
+        description: candidate.description,
+        installedAt: '2026-08-22T00:00:00.000Z',
+        fileCount: 1,
+        totalBytes: 10,
+        contentHash: '6'.repeat(64),
+      },
+    }
+    let finishRelease!: () => void
+    let markReleaseStarted!: () => void
+    const releaseStarted = new Promise<void>(resolve => { markReleaseStarted = resolve })
+    const releaseGate = new Promise<void>(resolve => { finishRelease = resolve })
+    let releaseCalled = false
+    const internals = context.skillFlux as unknown as {
+      state: (target: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+      disposeAgent: (target: Agent) => void
+      acquireCacheLease: () => Promise<() => Promise<void>>
+      cache: {
+        get: () => Promise<CacheEntry>
+        load: () => Promise<SkillDefinition>
+        createActiveLease: () => Promise<() => Promise<void>>
+      }
+    }
+    internals.state(agent).candidates.set(candidate.id, candidate)
+    internals.cache.get = async () => entry
+    internals.cache.load = async () => ({
+      name: candidate.name,
+      description: candidate.description,
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'runtime',
+      provider: 'skillflux-cache',
+      content: 'RELEASE BODY',
+    })
+    internals.cache.createActiveLease = async () => async () => undefined
+    internals.acquireCacheLease = async () => async () => {
+      if (releaseCalled) return
+      releaseCalled = true
+      markReleaseStarted()
+      await releaseGate
+    }
+    const pending = context.skillFlux.mount(agent, candidate.id)
+    await releaseStarted
+    internals.disposeAgent(agent)
+    finishRelease()
+    await expect(pending).rejects.toThrow('lifecycle ended')
+  })
+
+  it('rolls back a mounted Skill when only its signal aborts during process-lock release', async () => {
+    const context = await setup({ routes: [], usageTracking: true })
+    const agent = fakeAgent(context)
+    const ref = '7'.repeat(40)
+    const cacheId = '8'.repeat(24)
+    const candidate: SkillFluxCandidate = {
+      id: candidateId('cache', 'owner/abort-race', ref, 'abort-race'),
+      origin: 'cache',
+      name: 'abort-race',
+      description: 'Abort lifecycle fixture',
+      source: 'owner/abort-race',
+      ref,
+      score: 100,
+      cacheId,
+    }
+    const entry: CacheEntry = {
+      directory: '/cache/abort-race',
+      manifest: {
+        version: 1,
+        cacheId,
+        source: candidate.source,
+        ref,
+        skillId: candidate.name,
+        name: candidate.name,
+        description: candidate.description,
+        installedAt: '2026-08-22T00:00:00.000Z',
+        fileCount: 1,
+        totalBytes: 10,
+        contentHash: '9'.repeat(64),
+      },
+    }
+    let finishRelease!: () => void
+    let markReleaseStarted!: () => void
+    const releaseStarted = new Promise<void>(resolve => { markReleaseStarted = resolve })
+    const releaseGate = new Promise<void>(resolve => { finishRelease = resolve })
+    let releaseCalled = false
+    const releaseMarker = vi.fn(async () => undefined)
+    const internals = context.skillFlux as unknown as {
+      state: (target: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+      acquireCacheLease: () => Promise<() => Promise<void>>
+      cache: {
+        get: () => Promise<CacheEntry>
+        load: () => Promise<SkillDefinition>
+        createActiveLease: () => Promise<() => Promise<void>>
+      }
+    }
+    internals.state(agent).candidates.set(candidate.id, candidate)
+    internals.cache.get = async () => entry
+    internals.cache.load = async () => ({
+      name: candidate.name,
+      description: candidate.description,
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'runtime',
+      provider: 'skillflux-cache',
+      content: 'ABORT BODY',
+    })
+    internals.cache.createActiveLease = async () => releaseMarker
+    internals.acquireCacheLease = async () => async () => {
+      if (releaseCalled) return
+      releaseCalled = true
+      markReleaseStarted()
+      await releaseGate
+    }
+    const controller = new AbortController()
+    const pending = context.skillFlux.mount(agent, candidate.id, controller.signal)
+    await releaseStarted
+    controller.abort()
+    finishRelease()
+    await expect(pending).rejects.toThrow()
+    expect(context.skillFlux.mounted(agent)).toEqual([])
+    expect(context.skillFlux.lastRouting(agent)).toEqual([])
+    await expect(context.skills.get(candidate.name, { scope: agent })).resolves.toBeUndefined()
+    expect(releaseMarker).toHaveBeenCalledOnce()
+    expect(await context.skillFlux.usageRecords()).toEqual([])
   })
 
   it('virtualizes a large registry to the configured active catalog', async () => {
@@ -508,6 +1102,155 @@ describe('SkillFlux service', () => {
     await expect(pending).rejects.toThrow('lifecycle ended')
     expect(register).not.toHaveBeenCalled()
     expect(context.skillFlux.mounted(agent)).toEqual([])
+  })
+
+  it('rolls back a persistent cache lease when lifecycle ends during lease creation', async () => {
+    const context = await setup({ routes: [] })
+    const cached: CacheEntry = {
+      directory: '/cache/lease-race',
+      manifest: {
+        version: 1,
+        cacheId: '1'.repeat(24),
+        source: 'cached/repo',
+        ref: '2'.repeat(40),
+        skillId: 'lease-race',
+        name: 'lease-race',
+        description: 'Lease lifecycle fixture',
+        installedAt: '2026-08-22T00:00:00.000Z',
+        fileCount: 1,
+        totalBytes: 10,
+        contentHash: '3'.repeat(64),
+      },
+    }
+    let finishLease!: (release: () => Promise<void>) => void
+    let markLeaseStarted!: () => void
+    const leaseStarted = new Promise<void>(resolve => { markLeaseStarted = resolve })
+    const leaseResult = new Promise<() => Promise<void>>(resolve => { finishLease = resolve })
+    let releaseAttempts = 0
+    const releaseMarker = vi.fn(async () => {
+      releaseAttempts += 1
+      if (releaseAttempts <= 3) throw new Error('lease marker is busy')
+    })
+    const internals = context.skillFlux as unknown as {
+      pendingActiveLeaseCleanups: Set<() => Promise<void>>
+      cache: {
+        list: () => Promise<CacheEntry[]>
+        get: () => Promise<CacheEntry>
+        load: () => Promise<SkillDefinition>
+        createActiveLease: () => Promise<() => Promise<void>>
+        prune: () => Promise<unknown>
+      }
+    }
+    const cache = internals.cache
+    cache.list = async () => [cached]
+    cache.get = async () => cached
+    cache.load = async () => ({
+      name: cached.manifest.name,
+      description: cached.manifest.description,
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'runtime',
+      provider: 'skillflux-cache',
+      content: 'LEASE BODY',
+    })
+    cache.createActiveLease = async () => {
+      markLeaseStarted()
+      return await leaseResult
+    }
+    const agent = fakeAgent(context)
+    await context.tools.execute({
+      callId: CallId('skillflux-search-lease-race'),
+      name: 'skillflux_search',
+      arguments: { query: 'lease-race', remote: false },
+      agent,
+      signal: new AbortController().signal,
+    })
+    const register = vi.spyOn(context.skills, 'register')
+    const pending = context.skillFlux.mount(
+      agent,
+      candidateId('cache', cached.manifest.source, cached.manifest.ref, cached.manifest.skillId),
+    )
+    await leaseStarted
+    ;(context.skillFlux as unknown as { disposeAgent: (disposed: Agent) => void }).disposeAgent(agent)
+    finishLease(releaseMarker)
+    await expect(pending).rejects.toThrow('lifecycle ended')
+    expect(releaseMarker).toHaveBeenCalledTimes(3)
+    expect(internals.pendingActiveLeaseCleanups.size).toBe(1)
+    expect(register).not.toHaveBeenCalled()
+    cache.prune = async () => ({
+      decisions: [], protected: [], beforeEntries: 0, beforeBytes: 0, afterEntries: 0, afterBytes: 0,
+    })
+    await context.skillFlux.pruneCache()
+    expect(releaseMarker).toHaveBeenCalledTimes(4)
+    expect(internals.pendingActiveLeaseCleanups.size).toBe(0)
+  })
+
+  it('queues marker cleanup retries when runtime Skill registration fails', async () => {
+    const context = await setup({ routes: [] })
+    const agent = fakeAgent(context)
+    const ref = '3'.repeat(40)
+    const cacheId = '4'.repeat(24)
+    const candidate: SkillFluxCandidate = {
+      id: candidateId('cache', 'cached/register-failure', ref, 'register-failure'),
+      origin: 'cache',
+      name: 'register-failure',
+      description: 'Registration failure fixture',
+      source: 'cached/register-failure',
+      ref,
+      cacheId,
+      score: 10,
+    }
+    const entry: CacheEntry = {
+      directory: '/cache/register-failure',
+      manifest: {
+        version: 1,
+        cacheId,
+        source: candidate.source,
+        ref,
+        skillId: candidate.name,
+        name: candidate.name,
+        description: candidate.description,
+        installedAt: '2026-08-22T00:00:00.000Z',
+        fileCount: 1,
+        totalBytes: 10,
+        contentHash: '5'.repeat(64),
+      },
+    }
+    let releaseAttempts = 0
+    const releaseMarker = vi.fn(async () => {
+      releaseAttempts += 1
+      if (releaseAttempts <= 3) throw new Error('lease marker is busy')
+    })
+    const internals = context.skillFlux as unknown as {
+      state: (target: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+      pendingActiveLeaseCleanups: Set<() => Promise<void>>
+      cache: {
+        get: () => Promise<CacheEntry>
+        load: () => Promise<SkillDefinition>
+        createActiveLease: () => Promise<() => Promise<void>>
+        prune: () => Promise<unknown>
+      }
+    }
+    internals.state(agent).candidates.set(candidate.id, candidate)
+    internals.cache.get = async () => entry
+    internals.cache.load = async () => ({
+      name: candidate.name,
+      description: candidate.description,
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'runtime',
+      provider: 'skillflux-cache',
+      content: 'REGISTER FAILURE BODY',
+    })
+    internals.cache.createActiveLease = async () => releaseMarker
+    vi.spyOn(context.skills, 'register').mockImplementation(() => { throw new Error('registration failed') })
+    await expect(context.skillFlux.mount(agent, candidate.id)).rejects.toThrow('registration failed')
+    expect(releaseMarker).toHaveBeenCalledTimes(3)
+    expect(internals.pendingActiveLeaseCleanups.size).toBe(1)
+    internals.cache.prune = async () => ({
+      decisions: [], protected: [], beforeEntries: 0, beforeBytes: 0, afterEntries: 0, afterBytes: 0,
+    })
+    await context.skillFlux.pruneCache()
+    expect(releaseMarker).toHaveBeenCalledTimes(4)
+    expect(internals.pendingActiveLeaseCleanups.size).toBe(0)
   })
 
   it('propagates pre-step cancellation instead of failing open', async () => {

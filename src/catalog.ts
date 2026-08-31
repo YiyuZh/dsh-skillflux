@@ -28,6 +28,9 @@ export interface SkillFluxCandidatesSource {
     readonly stars: number
     readonly recentlyActive: boolean
     readonly trustedSource: boolean
+    readonly trustLevel: string
+    readonly qualitySignals: readonly string[]
+    readonly qualityWarnings: readonly string[]
   }[]
 }
 
@@ -128,7 +131,13 @@ function readRemoteEntries(source: unknown): RemoteEntries | undefined {
       || typeof item.relevanceScore !== 'number'
       || typeof item.stars !== 'number'
       || typeof item.recentlyActive !== 'boolean'
-      || typeof item.trustedSource !== 'boolean') return undefined
+      || typeof item.trustedSource !== 'boolean'
+      || typeof item.trustLevel !== 'string'
+      || !Array.isArray(item.qualitySignals)
+      || !item.qualitySignals.every(value => typeof value === 'string')
+      || !Array.isArray(item.qualityWarnings)
+      || !item.qualityWarnings.every(value => typeof value === 'string')
+      ) return undefined
     result.push({
       id: item.id,
       name: item.name,
@@ -141,6 +150,9 @@ function readRemoteEntries(source: unknown): RemoteEntries | undefined {
       stars: item.stars,
       recentlyActive: item.recentlyActive,
       trustedSource: item.trustedSource,
+      trustLevel: item.trustLevel,
+      qualitySignals: item.qualitySignals,
+      qualityWarnings: item.qualityWarnings,
     })
   }
   return result
@@ -160,6 +172,9 @@ function remoteDigest(entries: RemoteEntries): string {
       entry.stars,
       entry.recentlyActive,
       entry.trustedSource,
+      entry.trustLevel,
+      entry.qualitySignals,
+      entry.qualityWarnings,
     ])).join('\n'))
     .digest('hex')
 }
@@ -184,9 +199,12 @@ function remoteHistory(agent: Agent): { published: boolean; visibleDigest?: stri
   for (let index = agent.session.events.length - 1; index >= 0; index -= 1) {
     const event = agent.session.events[index]
     if (event === undefined || event.type !== 'user/message' || event.data.source.kind !== 'skillflux-candidates') continue
+    // Older SkillFlux versions published a narrower entry shape. It cannot
+    // produce the current digest, but it still needs an explicit replacement
+    // so stale candidate ids do not remain visible after an upgrade.
+    published = true
     const entries = readRemoteEntries(event.data.source)
     if (entries === undefined) continue
-    published = true
     if (visible.has(event.seq)) return { published, visibleDigest: remoteDigest(entries) }
   }
   return { published }
@@ -244,6 +262,9 @@ function candidateEntries(candidates: readonly RemoteCandidate[]): RemoteEntries
     stars: candidate.stars,
     recentlyActive: candidate.recentlyActive,
     trustedSource: candidate.trustedSource,
+    trustLevel: candidate.trustLevel,
+    qualitySignals: candidate.qualitySignals,
+    qualityWarnings: candidate.qualityWarnings,
   }))
 }
 
@@ -260,12 +281,16 @@ function buildRemoteCandidateMessage(candidates: readonly RemoteCandidate[], upd
     stars: candidate.stars,
     recentlyActive: candidate.recentlyActive,
     trustedSource: candidate.trustedSource,
+    trustLevel: candidate.trustLevel,
+    qualitySignals: candidate.qualitySignals,
+    qualityWarnings: candidate.qualityWarnings,
   }))
   const lines = entries.map(entry =>
     `- \`${entry.id}\` — \`${entry.name}\` from ${entry.source} @ ${entry.ref.slice(0, 12)} `
     + `(quality ${entry.qualityScore}, relevance ${entry.relevanceScore}, ${entry.installs} installs, `
     + `${entry.stars} stars, ${entry.recentlyActive ? 'active in freshness window' : 'older activity'}, `
-    + `via ${entry.discoverySources.join('+')}${entry.trustedSource ? ', trusted owner' : ''})`)
+    + `${entry.trustLevel} evidence via ${entry.discoverySources.join('+')}`
+    + `${entry.qualityWarnings.length === 0 ? '' : `, warnings ${entry.qualityWarnings.join('+')}`})`)
   return createUserMessage({
     content: [{
       type: 'text',

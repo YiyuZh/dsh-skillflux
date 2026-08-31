@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "exact-low-star-content-pinned",
+      "input": { "relevanceScore": 100, "installs": 0, "stars": 1, "forks": 0, "ageDays": 1, "trustedSource": false, "organizationOwned": false, "hasLicense": true, "discoverySourceCount": 1, "contentPinned": true },
+      "expectedLevel": "community",
+      "allowedPolicies": ["open", "community"],
+      "signals": ["content-pinned"],
+      "warnings": ["single-source", "low-adoption"]
+    },
+    {
+      "id": "marketplace-active-licensed",
+      "input": { "relevanceScore": 20, "installs": 1000, "stars": 100, "forks": 10, "ageDays": 10, "trustedSource": false, "organizationOwned": true, "hasLicense": true, "discoverySourceCount": 1, "contentPinned": false },
+      "expectedLevel": "community",
+      "allowedPolicies": ["open", "community"],
+      "signals": ["market-adoption", "repository-adoption", "recent-activity"],
+      "warnings": ["single-source", "content-not-previewed"]
+    },
+    {
+      "id": "cross-source-content-pinned",
+      "input": { "relevanceScore": 20, "installs": 50, "stars": 20, "forks": 2, "ageDays": 5, "trustedSource": false, "organizationOwned": false, "hasLicense": true, "discoverySourceCount": 2, "contentPinned": true },
+      "expectedLevel": "corroborated",
+      "allowedPolicies": ["open", "community", "corroborated"],
+      "signals": ["cross-source", "content-pinned"],
+      "warnings": []
+    },
+    {
+      "id": "explicitly-trusted-owner",
+      "input": { "relevanceScore": 10, "installs": 0, "stars": 0, "forks": 0, "ageDays": 500, "trustedSource": true, "organizationOwned": false, "hasLicense": false, "discoverySourceCount": 1, "contentPinned": false },
+      "expectedLevel": "trusted",
+      "allowedPolicies": ["open", "community", "corroborated", "trusted"],
+      "signals": ["trusted-owner"],
+      "warnings": ["stale-activity", "license-missing", "low-adoption"]
+    },
+    {
+      "id": "stale-unlicensed-no-adoption",
+      "input": { "relevanceScore": 30, "installs": 0, "stars": 0, "forks": 0, "ageDays": 800, "trustedSource": false, "organizationOwned": false, "hasLicense": false, "discoverySourceCount": 1, "contentPinned": false },
+      "expectedLevel": "unverified",
+      "allowedPolicies": ["open"],
+      "signals": [],
+      "warnings": ["single-source", "content-not-previewed", "stale-activity", "license-missing", "low-adoption"]
+    },
+    {
+      "id": "unknown-activity-is-not-freshness",
+      "input": { "relevanceScore": 30, "installs": 10000, "stars": 10000, "forks": 1000, "ageDays": null, "trustedSource": false, "organizationOwned": true, "hasLicense": true, "discoverySourceCount": 1, "contentPinned": false },
+      "expectedLevel": "unverified",
+      "allowedPolicies": ["open"],
+      "signals": ["market-adoption", "repository-adoption"],
+      "warnings": ["activity-unknown"]
+    },
+    {
+      "id": "direct-preview-survives-stale-popularity",
+      "input": { "relevanceScore": 100, "installs": 0, "stars": 0, "forks": 0, "ageDays": 800, "trustedSource": false, "organizationOwned": false, "hasLicense": false, "discoverySourceCount": 1, "contentPinned": true },
+      "expectedLevel": "community",
+      "allowedPolicies": ["open", "community"],
+      "signals": ["content-pinned"],
+      "warnings": ["stale-activity", "license-missing", "low-adoption"]
+    },
+    {
+      "id": "two-indexes-without-preview-are-not-corroboration",
+      "input": { "relevanceScore": 20, "installs": 100, "stars": 100, "forks": 10, "ageDays": 5, "trustedSource": false, "organizationOwned": false, "hasLicense": true, "discoverySourceCount": 2, "contentPinned": false },
+      "expectedLevel": "community",
+      "allowedPolicies": ["open", "community"],
+      "signals": ["cross-source"],
+      "warnings": ["content-not-previewed"]
+    }
+  ]
+}

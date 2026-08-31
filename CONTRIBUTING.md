@@ -47,6 +47,7 @@ focused pull request.
    corepack pnpm install --frozen-lockfile
    corepack pnpm check
    corepack pnpm eval
+   corepack pnpm test:cache-governance-live
    corepack pnpm pack --dry-run
    ```
 
@@ -85,6 +86,8 @@ focused pull request.
   the immutable-commit or approval boundaries of candidates that remain.
 - Never persist raw discovery queries. Cache keys must remain one-way
   fingerprints, and explicit cancellation must never trigger stale fallback.
+- Installed-cache pruning must be deterministic, protect active and in-flight
+  mounts across processes, and remain inside the dedicated SkillFlux cache root.
 - Never execute scripts as part of discovery or installation.
 - Fail open for routing/search availability, but fail closed for installation and approval.
 - Preserve explicit `/skill-name` behavior and the durable `skill-catalog` source contract.
@@ -95,8 +98,12 @@ Keep changes focused and add tests for behavior or security boundaries. Router
 changes should add or update a case in
 [`evals/routing-cases.json`](evals/routing-cases.json). Remote quality changes
 should update [`evals/remote-quality-cases.json`](evals/remote-quality-cases.json).
+Evidence-level, owner-policy, or content-deduplication changes should update
+[`evals/remote-governance-cases.json`](evals/remote-governance-cases.json).
 Discovery cache policy changes should update
 [`evals/remote-cache-cases.json`](evals/remote-cache-cases.json).
+Installed cache governance changes should update
+[`evals/cache-governance-cases.json`](evals/cache-governance-cases.json).
 PRs should pass typecheck,
 lint, tests, the routing evaluation, build, and package-content validation. Do
 not commit credentials, local DSH profiles, cache entries, or `.qartez` indexes.

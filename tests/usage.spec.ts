@@ -55,6 +55,25 @@ describe('UsageStore', () => {
     expect(raw).not.toContain('content')
   })
 
+  it('merges updates from multiple stores sharing one DSH usage file', async () => {
+    const { file } = await fixture()
+    const first = new UsageStore({ file, maxEntries: 100, now: () => 1_000 })
+    const second = new UsageStore({ file, maxEntries: 100, now: () => 2_000 })
+    await Promise.all([
+      first.recordMount(identity('shared-skill')),
+      second.recordMount(identity('shared-skill')),
+      first.recordUse(identity('first-only')),
+      second.recordUse(identity('second-only')),
+    ])
+    const records = await new UsageStore({ file, maxEntries: 100 }).list()
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ candidateId: 'shared-skill', mounts: 2 }),
+      expect.objectContaining({ candidateId: 'first-only', uses: 1 }),
+      expect.objectContaining({ candidateId: 'second-only', uses: 1 }),
+    ]))
+    expect(records).toHaveLength(3)
+  })
+
   it('evicts the least recently useful records at the configured bound', async () => {
     const { file } = await fixture()
     let now = 100
@@ -84,6 +103,34 @@ describe('UsageStore', () => {
     const aged = await store.boosts(candidates, options)
     expect(aged.get('experienced')).toBeLessThan(fresh.get('experienced')!)
     expect(aged.get('experienced')).toBeGreaterThan(0)
+  })
+
+  it('exposes privacy-preserving cache governance evidence', async () => {
+    const { file } = await fixture()
+    const store = new UsageStore({ file, maxEntries: 10, now: () => 123 })
+    const cacheId = 'a'.repeat(24)
+    await store.recordMount({ candidateId: 'remote-id', name: 'pdf-reader', origin: 'remote', source: 'owner/repo', cacheId })
+    await store.recordUse({ candidateId: 'cache-id', name: 'pdf-reader', origin: 'cache', source: 'owner/repo', cacheId })
+    const evidence = await store.cacheEvidence()
+    expect(evidence).toEqual(expect.arrayContaining([
+      { source: 'owner/repo', name: 'pdf-reader', cacheId, mounts: 1, uses: 0, lastMountedAt: 123 },
+      { source: 'owner/repo', name: 'pdf-reader', cacheId, mounts: 0, uses: 1, lastUsedAt: 123 },
+    ]))
+    expect(evidence).toHaveLength(2)
+  })
+
+  it('upgrades a legacy candidate record to immutable cache identity on its next mount', async () => {
+    const { file } = await fixture()
+    const legacy = new UsageStore({ file, maxEntries: 10, now: () => 100 })
+    await legacy.recordMount({ candidateId: 'remote-version', name: 'versioned', origin: 'remote', source: 'owner/repo' })
+    const upgraded = new UsageStore({ file, maxEntries: 10, now: () => 200 })
+    const cacheId = 'b'.repeat(24)
+    await upgraded.recordMount({
+      candidateId: 'remote-version', name: 'versioned', origin: 'remote', source: 'owner/repo', cacheId,
+    })
+    expect(await upgraded.cacheEvidence()).toEqual([{
+      source: 'owner/repo', name: 'versioned', cacheId, mounts: 2, uses: 0, lastMountedAt: 200,
+    }])
   })
 
   it('fails closed to empty data for corrupt and oversized files', async () => {

@@ -1,16 +1,33 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, readdir, rename, rm, rmdir, stat, utimes, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { inspectSkillDirectory } from './skill-file.js'
+import { planCachePrune, type CachePrunePlan, type CachePrunePolicy, type CacheUsageEvidence } from './cache-governance.js'
+import { verifyUniqueRemoteSkill, type RemoteCandidateVerifier } from './remote-source.js'
 import type { CacheEntry, CacheManifest, RemoteCandidate } from './types.js'
 import type { SkillDefinition } from '@deepseek-ai/dsh-skill'
 
 const execFileAsync = promisify(execFile)
 const MANIFEST_NAME = '.skillflux.json'
 const CACHE_ID = /^[0-9a-f]{24}$/u
+const PROCESS_INSTANCE_KEY = Symbol.for('dsh-skillflux.process-instance-id')
+const PROCESS_LIVE_LEASES_KEY = Symbol.for('dsh-skillflux.process-live-leases')
+const processScope = globalThis as typeof globalThis & Record<symbol, unknown>
+const existingProcessInstanceId = processScope[PROCESS_INSTANCE_KEY]
+const PROCESS_INSTANCE_ID = typeof existingProcessInstanceId === 'string'
+  ? existingProcessInstanceId
+  : randomUUID()
+processScope[PROCESS_INSTANCE_KEY] = PROCESS_INSTANCE_ID
+const existingLiveLeases = processScope[PROCESS_LIVE_LEASES_KEY]
+const PROCESS_LIVE_LEASE_IDS: Set<string> = existingLiveLeases instanceof Set
+  ? existingLiveLeases as Set<string>
+  : new Set<string>()
+processScope[PROCESS_LIVE_LEASES_KEY] = PROCESS_LIVE_LEASE_IDS
+const ACTIVE_LEASE_HEARTBEAT_MS = 30_000
+const ACTIVE_LEASE_STALE_MS = 24 * 60 * 60_000
 
 function assertWithin(root: string, target: string): void {
   const normalizedRoot = resolve(root)
@@ -49,13 +66,22 @@ function validManifest(value: unknown): value is CacheManifest {
     && (item.qualityScore === undefined
       || (typeof item.qualityScore === 'number' && Number.isSafeInteger(item.qualityScore)
         && item.qualityScore >= 0 && item.qualityScore <= 100))
+    && (item.trustLevel === undefined
+      || item.trustLevel === 'unverified'
+      || item.trustLevel === 'community'
+      || item.trustLevel === 'corroborated'
+      || item.trustLevel === 'trusted')
     && (item.stars === undefined
       || (typeof item.stars === 'number' && Number.isSafeInteger(item.stars) && item.stars >= 0))
     && (item.pushedAt === undefined || typeof item.pushedAt === 'string')
     && (item.discoverySources === undefined
       || (Array.isArray(item.discoverySources)
         && item.discoverySources.every(source => source === 'skills.sh' || source === 'github')))
-    && typeof item.installedAt === 'string'
+    && (item.sourcePath === undefined || (typeof item.sourcePath === 'string' && item.sourcePath.length > 0))
+    && (item.sourceSkillFileHash === undefined
+      || (typeof item.sourceSkillFileHash === 'string' && /^[0-9a-f]{64}$/u.test(item.sourceSkillFileHash)))
+    && ((item.sourcePath === undefined) === (item.sourceSkillFileHash === undefined))
+    && typeof item.installedAt === 'string' && Number.isFinite(Date.parse(item.installedAt))
     && typeof item.fileCount === 'number'
     && Number.isSafeInteger(item.fileCount) && item.fileCount >= 1
     && typeof item.totalBytes === 'number'
@@ -105,6 +131,10 @@ export interface CacheManagerOptions {
   readonly maxBytes: number
   readonly installTimeoutMs: number
   readonly runInstaller?: SkillInstaller
+  readonly verifyCandidate?: RemoteCandidateVerifier
+  readonly removeLeaseMarker?: (file: string, directory: string) => Promise<void>
+  readonly beforeInstallCommit?: () => Promise<void>
+  readonly beforeLeaseDirectoryRead?: (directory: string) => Promise<void>
 }
 
 export interface SkillInstallerInvocation {
@@ -118,15 +148,32 @@ export interface SkillInstallerInvocation {
 
 export type SkillInstaller = (invocation: SkillInstallerInvocation) => Promise<void>
 
+export interface CacheInventoryStats {
+  readonly entries: number
+  readonly totalBytes: number
+  readonly invalidEntries: number
+}
+
+async function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted()
+  return await new Promise<T>((resolve, reject) => {
+    const aborted = () => { reject(signal.reason ?? new DOMException('The operation was aborted', 'AbortError')) }
+    signal.addEventListener('abort', aborted, { once: true })
+    operation.then(resolve, reject).finally(() => { signal.removeEventListener('abort', aborted) }).catch(() => undefined)
+  })
+}
+
 export class SkillCache {
   readonly root: string
   private readonly entriesRoot: string
   private readonly stagingRoot: string
+  private readonly leasesRoot: string
 
   constructor(private readonly options: CacheManagerOptions) {
     this.root = resolve(options.root)
     this.entriesRoot = join(this.root, 'entries')
     this.stagingRoot = join(this.root, '.staging')
+    this.leasesRoot = join(this.root, '.leases')
   }
 
   async list(): Promise<CacheEntry[]> {
@@ -162,10 +209,12 @@ export class SkillCache {
   }
 
   async install(candidate: RemoteCandidate, signal?: AbortSignal): Promise<CacheEntry> {
-    signal?.throwIfAborted()
+    const deadline = AbortSignal.timeout(this.options.installTimeoutMs)
+    const operationSignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    operationSignal.throwIfAborted()
     const id = cacheId(candidate.source, candidate.ref, candidate.skillId)
     const existing = await this.get(id)
-    signal?.throwIfAborted()
+    operationSignal.throwIfAborted()
     if (existing !== undefined) return existing
     const staging = join(this.stagingRoot, randomUUID())
     const workspace = join(staging, 'workspace')
@@ -175,6 +224,11 @@ export class SkillCache {
     assertWithin(this.root, destination)
     await mkdir(workspace, { recursive: true })
     try {
+      const verifiedSource = await withAbort(
+        (this.options.verifyCandidate ?? verifyUniqueRemoteSkill)(candidate, operationSignal),
+        operationSignal,
+      )
+      operationSignal.throwIfAborted()
       const source = immutableArchiveUrl(candidate.source, candidate.ref)
       const args = [
         skillsCliPath(), 'add', source, '--skill', candidate.skillId,
@@ -192,20 +246,20 @@ export class SkillCache {
       }
       const execute = async (env: NodeJS.ProcessEnv): Promise<void> => {
         if (this.options.runInstaller !== undefined) {
-          await this.options.runInstaller({
+          await withAbort(this.options.runInstaller({
             executable: process.execPath,
             args,
             cwd: workspace,
             timeoutMs: this.options.installTimeoutMs,
-            ...(signal === undefined ? {} : { signal }),
+            signal: operationSignal,
             env,
-          })
+          }), operationSignal)
         } else {
           await execFileAsync(process.execPath, args, {
             cwd: workspace,
             timeout: this.options.installTimeoutMs,
             maxBuffer: 2 * 1024 * 1024,
-            signal,
+            signal: operationSignal,
             env,
           })
         }
@@ -219,17 +273,20 @@ export class SkillCache {
         await execute(withoutLoopbackProxy(baseEnvironment))
       }
       await access(downloaded)
-      if (candidate.skillFileHash !== undefined) {
+      operationSignal.throwIfAborted()
+      {
         const downloadedSkill = await readFile(join(downloaded, 'SKILL.md'))
+        operationSignal.throwIfAborted()
         const downloadedHash = createHash('sha256').update(downloadedSkill).digest('hex')
-        if (downloadedHash !== candidate.skillFileHash) {
-          throw new Error('downloaded SKILL.md does not match the GitHub search preview')
+        if (downloadedHash !== verifiedSource.skillFileHash) {
+          throw new Error('downloaded SKILL.md does not match the unique pinned GitHub source')
         }
       }
       const inspected = await inspectSkillDirectory(downloaded, {
         maxFiles: this.options.maxFiles,
         maxBytes: this.options.maxBytes,
-      }, signal)
+      }, operationSignal)
+      operationSignal.throwIfAborted()
       if (inspected.definition.name !== candidate.skillId) {
         throw new Error(`downloaded skill name "${inspected.definition.name}" does not match "${candidate.skillId}"`)
       }
@@ -244,21 +301,29 @@ export class SkillCache {
         ...(inspected.definition.whenToUse === undefined ? {} : { whenToUse: inspected.definition.whenToUse }),
         installs: candidate.installs,
         qualityScore: candidate.qualityScore,
+        trustLevel: candidate.trustLevel,
         stars: candidate.stars,
         ...(candidate.pushedAt === undefined ? {} : { pushedAt: candidate.pushedAt }),
         discoverySources: candidate.discoverySources,
+        sourcePath: verifiedSource.path,
+        sourceSkillFileHash: verifiedSource.skillFileHash,
         installedAt: new Date().toISOString(),
         fileCount: inspected.fileCount,
         totalBytes: inspected.totalBytes,
         contentHash: inspected.contentHash,
       }
+      operationSignal.throwIfAborted()
       await writeFile(join(downloaded, MANIFEST_NAME), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+      operationSignal.throwIfAborted()
       await mkdir(this.entriesRoot, { recursive: true })
+      await this.options.beforeInstallCommit?.()
+      operationSignal.throwIfAborted()
       try {
         await rename(downloaded, destination)
+        operationSignal.throwIfAborted()
       } catch (error: unknown) {
         const raced = await this.get(id)
-        signal?.throwIfAborted()
+        operationSignal.throwIfAborted()
         if (raced !== undefined) return raced
         throw error
       }
@@ -268,7 +333,14 @@ export class SkillCache {
     }
   }
 
-  async clean(selector: string, active: ReadonlySet<string> = new Set()): Promise<{ removed: string[]; skipped: string[] }> {
+  async clean(
+    selector: string,
+    active: ReadonlySet<string> = new Set(),
+    signal?: AbortSignal,
+  ): Promise<{ removed: string[]; skipped: string[] }> {
+    signal?.throwIfAborted()
+    const protectedIds = new Set([...active, ...await this.activeLeaseIds(signal)])
+    signal?.throwIfAborted()
     if (selector === 'all') {
       await mkdir(this.entriesRoot, { recursive: true })
       const directories = (await readdir(this.entriesRoot, { withFileTypes: true }))
@@ -277,7 +349,8 @@ export class SkillCache {
       const removed: string[] = []
       const skipped: string[] = []
       for (const entry of directories) {
-        if (active.has(entry.id)) {
+        signal?.throwIfAborted()
+        if (protectedIds.has(entry.id)) {
           skipped.push(entry.id)
           continue
         }
@@ -285,6 +358,7 @@ export class SkillCache {
         await rm(entry.directory, { recursive: true, force: true })
         removed.push(entry.id)
       }
+      signal?.throwIfAborted()
       return { removed, skipped }
     }
     const entries = [await this.get(selector)].filter((entry): entry is CacheEntry => entry !== undefined)
@@ -292,7 +366,8 @@ export class SkillCache {
     const removed: string[] = []
     const skipped: string[] = []
     for (const entry of entries) {
-      if (active.has(entry.manifest.cacheId)) {
+      signal?.throwIfAborted()
+      if (protectedIds.has(entry.manifest.cacheId)) {
         skipped.push(entry.manifest.cacheId)
         continue
       }
@@ -300,7 +375,140 @@ export class SkillCache {
       await rm(entry.directory, { recursive: true, force: true })
       removed.push(entry.manifest.cacheId)
     }
+    signal?.throwIfAborted()
     return { removed, skipped }
+  }
+
+  async stats(): Promise<CacheInventoryStats> {
+    await mkdir(this.entriesRoot, { recursive: true })
+    const directories = (await readdir(this.entriesRoot, { withFileTypes: true }))
+      .filter(entry => entry.isDirectory() && CACHE_ID.test(entry.name))
+    const entries = await this.list()
+    return {
+      entries: entries.length,
+      totalBytes: entries.reduce((total, entry) => Math.min(Number.MAX_SAFE_INTEGER, total + entry.manifest.totalBytes), 0),
+      invalidEntries: Math.max(0, directories.length - entries.length),
+    }
+  }
+
+  async prune(
+    policy: CachePrunePolicy,
+    evidence: readonly CacheUsageEvidence[] = [],
+    active: ReadonlySet<string> = new Set(),
+    now = Date.now(),
+    signal?: AbortSignal,
+  ): Promise<CachePrunePlan> {
+    signal?.throwIfAborted()
+    const protectedIds = new Set([...active, ...await this.activeLeaseIds(signal)])
+    signal?.throwIfAborted()
+    const plan = planCachePrune(await this.list(), evidence, policy, protectedIds, now)
+    for (const decision of plan.decisions) {
+      signal?.throwIfAborted()
+      const directory = join(this.entriesRoot, decision.cacheId)
+      assertWithin(this.entriesRoot, directory)
+      await rm(directory, { recursive: true, force: true })
+    }
+    signal?.throwIfAborted()
+    return plan
+  }
+
+  async createActiveLease(cacheId: string): Promise<() => Promise<void>> {
+    if (!CACHE_ID.test(cacheId)) throw new Error(`invalid cache lease id "${cacheId}"`)
+    const directory = join(this.leasesRoot, cacheId)
+    const leaseId = randomUUID()
+    const file = join(directory, `${process.pid}-${leaseId}.json`)
+    assertWithin(this.root, directory)
+    assertWithin(this.root, file)
+    await mkdir(directory, { recursive: true })
+    await writeFile(file, `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      instanceId: PROCESS_INSTANCE_ID,
+      leaseId,
+      createdAt: Date.now(),
+    })}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+    })
+    PROCESS_LIVE_LEASE_IDS.add(leaseId)
+    const heartbeat = setInterval(() => {
+      const now = new Date()
+      void utimes(file, now, now).catch(() => undefined)
+    }, ACTIVE_LEASE_HEARTBEAT_MS)
+    heartbeat.unref()
+    let heartbeatStopped = false
+    let released = false
+    return async () => {
+      if (released) return
+      if (!heartbeatStopped) {
+        clearInterval(heartbeat)
+        heartbeatStopped = true
+      }
+      PROCESS_LIVE_LEASE_IDS.delete(leaseId)
+      if (this.options.removeLeaseMarker !== undefined) await this.options.removeLeaseMarker(file, directory)
+      else await removeLeaseMarker(file, directory)
+      released = true
+    }
+  }
+
+  async activeLeaseIds(signal?: AbortSignal): Promise<Set<string>> {
+    signal?.throwIfAborted()
+    await mkdir(this.leasesRoot, { recursive: true })
+    const active = new Set<string>()
+    const directories = await readdir(this.leasesRoot, { withFileTypes: true })
+    for (const directory of directories) {
+      signal?.throwIfAborted()
+      if (!directory.isDirectory() || !CACHE_ID.test(directory.name)) continue
+      const leaseDirectory = join(this.leasesRoot, directory.name)
+      assertWithin(this.root, leaseDirectory)
+      await this.options.beforeLeaseDirectoryRead?.(leaseDirectory)
+      let names: string[]
+      try {
+        names = await readdir(leaseDirectory)
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+        throw error
+      }
+      for (const name of names) {
+        signal?.throwIfAborted()
+        const file = join(leaseDirectory, name)
+        assertWithin(this.root, file)
+        let pid: number | undefined
+        let instanceId: string | undefined
+        let leaseId: string | undefined
+        let heartbeatAt: number | undefined
+        try {
+          const [raw, metadata] = await Promise.all([readFile(file, 'utf8'), stat(file)])
+          const parsed = JSON.parse(raw) as unknown
+          if (typeof parsed === 'object' && parsed !== null) {
+            const candidate = (parsed as Record<string, unknown>).pid
+            if (typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate > 0) pid = candidate
+            const candidateInstance = (parsed as Record<string, unknown>).instanceId
+            if (typeof candidateInstance === 'string' && candidateInstance.length > 0) instanceId = candidateInstance
+            const candidateLease = (parsed as Record<string, unknown>).leaseId
+            if (typeof candidateLease === 'string' && candidateLease.length > 0) leaseId = candidateLease
+          }
+          heartbeatAt = metadata.mtimeMs
+        } catch {
+          // Invalid and abandoned lease markers are removed below.
+        }
+        const heartbeatFresh = heartbeatAt !== undefined
+          && Math.max(0, Date.now() - heartbeatAt) <= ACTIVE_LEASE_STALE_MS
+        const currentInstance = pid === process.pid && instanceId === PROCESS_INSTANCE_ID
+          && leaseId !== undefined && PROCESS_LIVE_LEASE_IDS.has(leaseId)
+        const activeExternalProcess = pid !== undefined && pid !== process.pid
+          && heartbeatFresh && processIsAlive(pid)
+        if (currentInstance || activeExternalProcess) {
+          active.add(directory.name)
+          continue
+        }
+        signal?.throwIfAborted()
+        await rm(file, { force: true })
+      }
+      await removeEmptyLeaseDirectory(leaseDirectory)
+    }
+    signal?.throwIfAborted()
+    return active
   }
 
   private async read(id: string): Promise<CacheEntry | undefined> {
@@ -315,5 +523,29 @@ export class SkillCache {
     } catch {
       return undefined
     }
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  if (pid === process.pid) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+async function removeLeaseMarker(file: string, directory: string): Promise<void> {
+  await rm(file, { force: true })
+  await removeEmptyLeaseDirectory(directory)
+}
+
+async function removeEmptyLeaseDirectory(directory: string): Promise<void> {
+  try {
+    await rmdir(directory)
+  } catch (error: unknown) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') throw error
   }
 }

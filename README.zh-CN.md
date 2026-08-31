@@ -68,7 +68,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
   -> 在 Skill 数量和可选目录 token 预算内选择并挂载
   -> Agent 调用已挂载的 Skill
   -> turn/end 自动卸载
-  -> 下载文件保留到用户主动清理
+  -> 按闲置时间、容量和实际使用价值保留或清理下载文件
 ```
 
 每个挂载只属于接收任务的 Agent。卸载会阻止它继续出现在后续目录，但不会删除
@@ -85,11 +85,12 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 - 可选使用保守的 token 估算预算限制 Skill 目录提示。
 - 从 DSH Registry、SkillFlux 缓存、[skills.sh](https://skills.sh/) 和经过
   身份验证的 GitHub `SKILL.md` Code Search 发现候选。
-- 根据任务相关性、市场安装量、仓库活跃度、stars、forks、license 元数据及配置的
-  可信 owner，对远程结果重新排序。
+- 根据任务相关性、市场安装量、仓库活跃度、stars、forks、license、内容来源及
+  owner 策略重新排序，并为每个结果输出可解释的证据等级和告警。
 - 将远程候选固定到不可变的 GitHub commit SHA。
 - 通过当前 Agent 的 `ctx.skills` scope 注册缓存 Skill。
 - 每次加载前使用 SHA-256 manifest 校验缓存内容。
+- 自动清理闲置和低价值的已安装 Skill 缓存，同时保护活动挂载和正在加载的条目。
 - 支持每次远程挂载审批、仓库会话内首次审批和自动审批三种策略。
 - 提供加载、搜索和挂载 Skill 的模型工具。
 - 提供查看状态、路由解释、使用统计和清理缓存的 `/skillflux` 用户命令。
@@ -137,7 +138,10 @@ SkillFlux 按以下顺序处理任务：
 3. GitHub 仓库元数据提供不可变 HEAD commit、stars、forks、license、归档状态、
    owner 类型和最近 push 时间。
 4. SkillFlux 拒绝零相关、已归档、已禁用、低于 stars 门槛或低于质量门槛的结果，
-   再返回质量最高的候选。
+   再应用配置的证据策略。
+5. 只有 candidate identity 完全相同的重复项会折叠。不同仓库即使根 `SKILL.md`
+   哈希相同也会保留，因为相邻资源可能不同；它们也不会被算成独立 provider 交叉
+   验证。
 
 质量分最高为 100。相关性既是准入门槛，也是权重最大的单项，因此高 star 但不
 相关的仓库不会仅凭热度压过精确匹配的新 Skill。
@@ -150,10 +154,25 @@ SkillFlux 按以下顺序处理任务：
 | GitHub forks | 5 |
 | 仓库活跃度，配置的近期窗口权重最高 | 10 |
 | 可信 owner、组织归属和 license 元数据 | 15 |
+| 跨来源发现与固定的 GitHub 内容预览 | 8 |
 
 `remoteRecentActivityDays` 默认是 30。窗口内活跃可获得完整 freshness 加分；更老但
 仍维护的项目会逐步衰减，而不是直接淘汰。只有经过你独立验证的 owner 才应加入
 `remoteTrustedOwners`；组织账号或高 stars 本身不等于可信认证。
+
+每个候选会标记为 `unverified`、`community`、`corroborated` 或 `trusted`。
+默认的 `remoteTrustPolicy: community` 会保留相关性高、已直接预览并固定内容的
+GitHub Skill，即使它刚创建、stars 很少，同时明确暴露 `low-adoption`、缺少
+license、活动陈旧和来源覆盖不足等告警。`corroborated` 要求内容已固定且被多个
+provider 发现；`trusted` 只表示 owner 在本地 `remoteTrustedOwners` 名单中，
+不是安全认证。`remoteBlockedOwners` 是显式拒绝名单；同一 owner 不能同时可信和
+拒绝。
+
+这些策略会在每次搜索、自动路由和挂载时重新应用到已安装的 SkillFlux 缓存。把
+owner 从 `remoteTrustedOwners` 移除会撤销缓存中的旧 `trusted` 标签；加入
+`remoteBlockedOwners` 后，即使重启也不能复用。没有证据标签的旧版缓存 manifest
+因已知不可变 commit 和安装目录哈希而按 `community` 处理，但不能通过
+`corroborated` 或 `trusted` 门槛。
 
 GitHub Code Search 需要身份验证。请从带有标准环境变量的 shell 启动 DSH，例如
 PowerShell：
@@ -176,9 +195,36 @@ dsh web
 任务原文、token 或 Skill 正文。候选仍固定在最初验证过的 commit，因此 stale
 回退只影响排名证据的新鲜度，不改变源码完整性或审批对象。
 
+证据感知的缓存文档带有版本号；旧排序缓存不会套用新的信任语义，而是丢弃并通过
+在线查询重建。
+
 缓存通过原子替换写入
 `$DSH_HOME/storages/skillflux/remote-discovery.json`，默认最多 100 条，并有
 4 MiB 硬限制。设置 `remoteCacheTtlMs: 0` 可完全关闭。
+
+### 已安装 Skill 缓存治理
+
+下载后的 Skill 单独保存在 `$DSH_HOME/cache/skillflux`。每当远程 Skill 成功挂载，
+SkillFlux 会评估已安装缓存，并在该 session 的回合结束、释放挂载后再次检查。
+默认先清理连续 90 天未活动的条目；如果剩余缓存仍超过 100 项或 512 MiB，再按照
+成功调用 Skill 工具的次数、挂载次数、最近活动时间、质量分和采用度等确定性证据，
+从低价值条目开始淘汰。
+
+首次远程候选与后续缓存候选的使用记录会按不可变 cache ID 聚合，既能跨越二者
+不同的 candidate ID，又不会让同一 Skill 的不同 commit 共享价值。旧版中没有
+cache ID 的记录只归入匹配仓库和 Skill 的最新版本。共享 usage 文件的更新会在
+Harness 进程之间加锁并合并。当前已经挂载和并发加载中的缓存会跨 Service 实例和
+共用 `DSH_HOME` 的 Harness 进程受到保护。lease 心跳会在
+崩溃进程的 PID 被复用时限制孤儿 marker 的保留时间；进程内 live-lease 注册表
+允许热重载后的 Service 回收已经释放的 marker。自动治理失败只记录警告；协调锁
+失效时会终止当前缓存操作，不会在失去互斥保护后继续执行。
+
+使用 `/skillflux cache prune` 可以立即执行同一套策略。设置
+`cacheAutoPrune: false` 可关闭自动执行；设置 `cacheMaxIdleDays: 0` 可关闭按闲置
+时间淘汰，同时保留条目数和总字节限制。关闭 `usageTracking` 后没有本地使用
+证据，治理会保守地退回安装时间和不可变发现元数据。
+manifest 无效的目录不会被自动删除；`/skillflux status` 会报告其数量，用户可用
+`/skillflux cache clean all` 明确清理。
 
 ## 配置
 
@@ -195,10 +241,16 @@ remoteSearchTimeoutMs: 30000
 remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
 remoteRecentActivityDays: 30
+remoteTrustPolicy: community  # open | community | corroborated | trusted
 remoteTrustedOwners: []       # 例如 [anthropics, openai, vercel-labs]
+remoteBlockedOwners: []
 remoteCacheTtlMs: 300000                  # 0 表示关闭
 remoteCacheStaleIfErrorMs: 86400000       # TTL 后的额外 stale 窗口
 remoteCacheMaxEntries: 100
+cacheAutoPrune: true
+cacheMaxEntries: 100
+cacheMaxTotalBytes: 536870912              # 已安装 Skill 合计 512 MiB
+cacheMaxIdleDays: 90                       # 0 表示关闭按闲置时间淘汰
 catalogDescriptionMaxLength: 160
 catalogTokenBudget: 0              # 0 表示关闭；否则为 64-1000000
 maxSkillFiles: 1000
@@ -320,7 +372,8 @@ catalogTokenBudget: 512
 模型可以使用：
 
 - `skill({ name })`：加载当前回合已经挂载的 Skill 指令。
-- `skillflux_search({ query, remote? })`：搜索本地、缓存和不可变远程候选。
+- `skillflux_search({ query, remote? })`：搜索本地、缓存和不可变远程候选；远程
+  结果包含评分分项、证据等级、正向信号和告警。
 - `skillflux_mount({ candidateId })`：挂载当前 SkillFlux 发现状态中的候选。
 
 用户可以使用：
@@ -330,6 +383,7 @@ catalogTokenBudget: 512
 /skillflux explain
 /skillflux usage
 /skillflux cache list
+/skillflux cache prune
 /skillflux cache clean <cache-id>
 /skillflux cache clean all
 /skillflux discovery-cache status
@@ -339,8 +393,8 @@ catalogTokenBudget: 512
 `explain` 会展示候选的 Router 阶段、总分、基础分、自适应加分，以及它只是被
 选中、已经成功挂载，还是因为目录预算被跳过。
 
-清理时会跳过仍在挂载的缓存。到达 `turn/end` 时，SkillFlux 注销运行时挂载，
-但保留下载文件供下次复用。
+清理和治理都会跳过已挂载或正在加载的缓存。到达 `turn/end` 时，SkillFlux 注销
+运行时挂载；已安装文件会保留到后续策略执行或用户主动清理。
 
 ## 安全与信任
 
@@ -348,10 +402,17 @@ catalogTokenBudget: 512
   公共 GitHub 仓库。
 - GitHub 发现的 `SKILL.md` 限制为 256 KiB，并且必须先通过同一套 frontmatter
   parser，才能成为候选。
-- 安装器最终选中的 `SKILL.md` 必须与 GitHub 搜索预览的 SHA-256 一致，防止仓库
-  内其他同名 Skill 静默替换已展示的结果。
+- 每次新安装前，SkillFlux 都会通过 GitHub tree API 枚举固定 commit 中最多 512 个
+  `SKILL.md`，并要求目标名称只对应一个可用 Skill；skills.sh-only 与 GitHub Code
+  Search 结果都执行该检查。
+- 已验证源文件的 SHA-256 必须同时匹配之前的 GitHub 搜索预览（若有）和安装器最终
+  选中的 `SKILL.md`。因此同一仓库多个路径中的同名文件即使根文件字节相同也会因
+  歧义被拒绝，因为相邻资源仍可能不同。
+- 没有完整 Skill 目录哈希时，跨仓库相同根文件哈希不会被折叠或称为镜像。
 - 已归档和已禁用仓库会被拒绝。热度、活跃度和 license 只是排序证据，不是安全
   审计结论。
+- `remoteTrustPolicy` 是证据门槛，不是恶意代码扫描器；`trusted` 只反映当前本地
+  配置的 owner 白名单，证据门槛与拒绝名单也会治理已安装 SkillFlux 缓存的复用。
 - 每个远程结果先解析为 40 位 commit SHA，再生成 candidate ID。
 - 通过固定的 `skills@1.5.23` CLI 下载该 SHA 对应的不可变 GitHub codeload
   归档。
@@ -366,6 +427,8 @@ catalogTokenBudget: 512
   Skill 正文或资源。
 - 使用统计不包含任务文本或 Skill 内容，并限制在 DSH 存储目录中的
   `usageMaxEntries` 条记录以内。
+- 已安装缓存治理只读取这些有界使用计数和不可变缓存元数据，不检查也不保存任务
+  原文。
 - 远程发现缓存只持久化查询/配置指纹和有界、经过校验的候选元数据，不保存查询
   原文或 API 凭据。
 - 可选的 `GITHUB_TOKEN` 或 `GH_TOKEN` 会启用 GitHub Code Search 和批量仓库
@@ -383,9 +446,11 @@ corepack pnpm eval
 ```
 
 测评包含 36 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
-场景、7 个目录预算场景、8 个远程质量两两对比场景和 7 个远程缓存策略场景，
+场景、7 个目录预算场景、8 个远程质量两两对比场景、8 个远程证据治理场景、
+7 个远程缓存策略场景和 7 个已安装缓存治理场景，
 覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、
-语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期和负例拒绝。
+语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期、价值淘汰、
+活动挂载保护和负例拒绝。
 
 | 指标 | 当前基线 |
 | --- | ---: |
@@ -397,7 +462,9 @@ corepack pnpm eval
 | 语义正例 Top-1 | 100.0% |
 | 语义负例拒绝率 | 100.0% |
 | 远程质量两两排序正确率 | 100.0% |
+| 远程证据治理边界正确率 | 100.0% |
 | 远程缓存策略边界正确率 | 100.0% |
+| 已安装缓存治理边界正确率 | 100.0% |
 
 这些结果验证确定性 Router 和向量排序契约。语义向量是合成数据，不代表某个
 embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测评格式和限制见
@@ -417,7 +484,8 @@ embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测
 - provider 故障期间，stale 回退可能在配置窗口内返回较旧的排名证据，但候选始终
   固定在此前已验证的不可变 commit。
 - 卸载无法删除已经写入 session history 的文本。
-- 上游出现新 commit 时会形成新的不可变缓存；旧版本需要用户主动清理。
+- 上游出现新 commit 时会形成新的不可变缓存；价值感知治理可能保留多个版本，
+  直到其闲置或超过配置限制。
 
 ## 开发与测试
 
@@ -428,6 +496,7 @@ branch、离线质量门禁、GitHub 联网冒烟测试、评测集更新和 PR 
 corepack pnpm install
 corepack pnpm check
 corepack pnpm eval
+corepack pnpm test:cache-governance-live
 corepack pnpm test:discovery-live
 corepack pnpm test:embedding-live
 corepack pnpm pack --dry-run
@@ -437,7 +506,9 @@ corepack pnpm pack --dry-run
 `GH_TOKEN` 时还会测试 GitHub Code Search，并验证第二次相同查询由持久发现缓存
 直接返回。可用 `SKILLFLUX_DISCOVERY_QUERY`
 替换任务，用 `SKILLFLUX_TRUSTED_OWNERS` 传入逗号分隔的可信 owner，或设置
-`SKILLFLUX_REQUIRE_GITHUB=1`，让 GitHub provider 不可用时测试直接失败。
+`SKILLFLUX_BLOCKED_OWNERS` 提供拒绝 owner；`SKILLFLUX_TRUST_POLICY` 可覆盖
+smoke test 的证据门槛。设置 `SKILLFLUX_REQUIRE_GITHUB=1`，可让 GitHub
+provider 不可用时测试直接失败。
 
 `test:embedding-live` 要求配置的 Ollama 模型已经存在。测试其他 endpoint 时可通过
 `SKILLFLUX_EMBEDDING_MODEL`、`SKILLFLUX_EMBEDDING_ENDPOINT` 和

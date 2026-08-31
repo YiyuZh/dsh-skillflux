@@ -6,9 +6,12 @@ contract with versioned synthetic vectors. `catalog-budget-cases.json` checks
 catalog footprint boundaries and stable greedy admission, while
 `remote-quality-cases.json` checks that relevance stays primary while current
 adoption, repository, trust, and 30-day activity signals rank otherwise
-comparable remote candidates. `remote-cache-cases.json` checks fresh, stale,
-expired, and disabled cache boundaries. None of the suites calls an LLM, the
-network, or a remote Skill registry.
+comparable remote candidates. `remote-governance-cases.json` checks explainable
+evidence levels, low-adoption warnings, and the open/community/corroborated/trusted
+policy boundaries. `remote-cache-cases.json` checks fresh, stale,
+expired, and disabled cache boundaries. `cache-governance-cases.json` checks
+installed-cache age, value, capacity, byte, and active-mount boundaries. None of
+the suites calls an LLM, the network, or a remote Skill registry.
 
 The corpus covers:
 
@@ -52,16 +55,29 @@ market and repository adoption, organization/license evidence, and the 100-point
 cap. These fixtures validate the scoring contract; they do not certify any live
 repository.
 
+The remote-governance corpus contains 8 evidence cases. It distinguishes a
+directly content-pinned low-star Skill from an unverified index result, requires
+both content pinning and multi-provider discovery for corroboration, treats an
+explicit owner allowlist separately, and verifies every policy boundary.
+
 The remote-cache corpus contains 7 policy cases covering exact TTL boundaries,
 stale-if-error boundaries, and disabled-cache behavior. Integration tests
 separately verify persistence, eviction, provider-failure fallback, and explicit
 cancellation.
 
+The installed-cache governance corpus contains 7 policy cases covering healthy
+no-op behavior, idle eviction, usage-aware retention, byte pressure, active
+mount protection, deterministic recency ordering, and immutable-version usage
+isolation.
+
 Routing and quality cases contain stable IDs, task/candidate inputs, and expected
-ordering. Cache policy cases contain age/window inputs and an expected state.
+ordering. Discovery-cache policy cases contain age/window inputs and an expected
+state; installed-cache cases contain bounded entries, usage evidence, active IDs,
+and expected eviction decisions.
 Optional routing fields override the selector limit, score threshold, rules,
 adaptive boosts, or expected rule-forced candidates. Add a focused case whenever
-router, remote-quality, catalog-budget, or cache-policy behavior changes.
+router, remote-quality, remote-governance, catalog-budget, or cache-policy
+behavior changes.
 
 This corpus measures deterministic router behavior. It doesn't measure the
 quality of third-party Skill instructions or the final answer from an online
@@ -72,10 +88,12 @@ model. Those require a separate, credential-backed end-to-end run.
 `routing-cases.json` 是词法与自适应 Router 的人工确定性测评集；
 `semantic-routing-cases.json` 使用版本化合成向量验证 embedding 排序契约；
 `remote-quality-cases.json` 验证相关性优先、采用度、仓库信号、可信 owner
-和 30 天活跃度的排序约束；`catalog-budget-cases.json` 验证目录预算边界；
-`remote-cache-cases.json` 验证 fresh、stale、expired 和关闭缓存的边界。这些测评
-均不访问 LLM、网络或远程 Skill Registry。确定性部分重点验证中英文匹配、
-规则优先级、阈值拒绝、
+和 30 天活跃度的排序约束；`remote-governance-cases.json` 验证可解释证据等级、
+低采用度告警及四级策略边界；`catalog-budget-cases.json` 验证目录预算边界；
+`remote-cache-cases.json` 验证 fresh、stale、expired 和关闭缓存的边界，
+`cache-governance-cases.json` 验证已安装缓存的闲置、价值、容量、总字节数和活动
+挂载保护边界。这些测评均不访问 LLM、网络或远程 Skill Registry。确定性部分
+重点验证中英文匹配、规则优先级、阈值拒绝、
 Selector 返回数量上限、来源排序、同名去重和短名称边界。
 
 运行 `corepack pnpm eval` 后，命令会输出完整顺序准确率、Top-1 准确率、负例

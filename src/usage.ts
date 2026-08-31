@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
+import { lock } from 'proper-lockfile'
 import type { SkillFluxCandidate, SkillUsageIdentity, SkillUsageRecord } from './types.js'
+import type { CacheUsageEvidence } from './cache-governance.js'
 
 const USAGE_VERSION = 1
 const MAX_USAGE_FILE_BYTES = 2 * 1024 * 1024
 const MAX_USAGE_RECORDS = 5_000
 const DAY_MS = 24 * 60 * 60 * 1_000
+const CACHE_ID = /^[0-9a-f]{24}$/u
 
 interface UsageDocument {
   readonly version: 1
@@ -45,6 +48,7 @@ function validRecord(value: unknown): value is SkillUsageRecord {
     && boundedString(item.name, 128)
     && (item.origin === 'registry' || item.origin === 'cache' || item.origin === 'remote')
     && boundedString(item.source, 2_048)
+    && (item.cacheId === undefined || (typeof item.cacheId === 'string' && CACHE_ID.test(item.cacheId)))
     && count(item.mounts)
     && count(item.uses)
     && timestamp(item.lastMountedAt)
@@ -89,8 +93,6 @@ function increment(value: number): number {
 
 export class UsageStore {
   private readonly now: () => number
-  private records: Map<string, SkillUsageRecord> | undefined
-  private loadTask: Promise<Map<string, SkillUsageRecord>> | undefined
   private writeQueue: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: UsageStoreOptions) {
@@ -128,11 +130,25 @@ export class UsageStore {
 
   async list(limit = this.options.maxEntries): Promise<SkillUsageRecord[]> {
     await this.writeQueue
-    const records = await this.load()
+    const records = await this.readLatest()
     return [...records.values()]
       .sort(usageOrder)
       .slice(0, Math.max(0, Math.min(limit, this.options.maxEntries)))
       .map(record => ({ ...record }))
+  }
+
+  async cacheEvidence(): Promise<CacheUsageEvidence[]> {
+    await this.writeQueue
+    const records = await this.readLatest()
+    return [...records.values()].map(record => ({
+      source: record.source,
+      name: record.name,
+      ...(record.cacheId === undefined ? {} : { cacheId: record.cacheId }),
+      mounts: record.mounts,
+      uses: record.uses,
+      ...(record.lastMountedAt === undefined ? {} : { lastMountedAt: record.lastMountedAt }),
+      ...(record.lastUsedAt === undefined ? {} : { lastUsedAt: record.lastUsedAt }),
+    }))
   }
 
   async boosts(
@@ -149,7 +165,7 @@ export class UsageStore {
       throw new Error('adaptive halfLifeDays must be from 0.1 to 3650')
     }
     await this.writeQueue
-    const records = await this.load()
+    const records = await this.readLatest()
     const result = new Map<string, number>()
     const now = this.currentTime()
     for (const candidate of candidates) {
@@ -169,27 +185,25 @@ export class UsageStore {
   }
 
   private async enqueue(update: (records: Map<string, SkillUsageRecord>) => Promise<void>): Promise<void> {
-    const task = this.writeQueue.then(async () => {
-      const records = await this.load()
+    const task = this.writeQueue.then(async () => await this.withFileLock(async signal => {
+      const records = await this.readDocument()
+      signal.throwIfAborted()
       await update(records)
+      signal.throwIfAborted()
       this.trim(records)
-      await this.save(records)
-    })
+      await this.save(records, signal)
+    }))
     this.writeQueue = task.catch(() => undefined)
     await task
   }
 
-  private async load(): Promise<Map<string, SkillUsageRecord>> {
-    if (this.records !== undefined) return this.records
-    if (this.loadTask !== undefined) return await this.loadTask
-    this.loadTask = this.readDocument()
-    try {
-      this.records = await this.loadTask
-      this.trim(this.records)
-      return this.records
-    } finally {
-      this.loadTask = undefined
-    }
+  private async readLatest(): Promise<Map<string, SkillUsageRecord>> {
+    return await this.withFileLock(async signal => {
+      const records = await this.readDocument()
+      signal.throwIfAborted()
+      this.trim(records)
+      return records
+    })
   }
 
   private async readDocument(): Promise<Map<string, SkillUsageRecord>> {
@@ -218,18 +232,59 @@ export class UsageStore {
     for (const record of [...records.values()].sort(evictionOrder).slice(0, excess)) records.delete(record.candidateId)
   }
 
-  private async save(records: Map<string, SkillUsageRecord>): Promise<void> {
+  private async save(records: Map<string, SkillUsageRecord>, signal?: AbortSignal): Promise<void> {
     const directory = dirname(this.options.file)
     const temporary = join(directory, `.${basename(this.options.file)}.${randomUUID()}.tmp`)
     const serialized = this.serializeWithinLimit(records)
+    signal?.throwIfAborted()
     await mkdir(directory, { recursive: true })
     try {
+      signal?.throwIfAborted()
       await writeFile(temporary, serialized, { encoding: 'utf8', flag: 'wx' })
+      signal?.throwIfAborted()
       await rename(temporary, this.options.file)
+      signal?.throwIfAborted()
     } catch (error: unknown) {
       await unlink(temporary).catch(() => undefined)
       throw error
     }
+  }
+
+  private async withFileLock<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    await mkdir(dirname(this.options.file), { recursive: true })
+    const controller = new AbortController()
+    let compromised: Error | undefined
+    const release = await lock(this.options.file, {
+      realpath: false,
+      stale: 10_000,
+      update: 5_000,
+      retries: { retries: 50, factor: 1, minTimeout: 100, maxTimeout: 100, randomize: true },
+      onCompromised: error => {
+        compromised = error
+        controller.abort(error)
+      },
+    })
+    let result: T | undefined
+    let operationError: unknown
+    try {
+      controller.signal.throwIfAborted()
+      result = await operation(controller.signal)
+      controller.signal.throwIfAborted()
+    } catch (error: unknown) {
+      operationError = error
+    }
+    let releaseError: unknown
+    try {
+      await release()
+    } catch (error: unknown) {
+      releaseError = error
+    }
+    if (compromised !== undefined) {
+      throw new Error(`SkillFlux usage lock was compromised: ${errorMessage(compromised)}`, { cause: compromised })
+    }
+    if (operationError !== undefined) throw operationError
+    if (releaseError !== undefined) throw releaseError
+    return result as T
   }
 
   private serializeWithinLimit(records: Map<string, SkillUsageRecord>): string {
