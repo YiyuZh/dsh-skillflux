@@ -300,11 +300,19 @@ declare function planCachePrune(entries: readonly CacheEntry[], evidence: readon
 interface VerifiedRemoteSkill {
   readonly path: string;
   readonly skillFileHash: string;
+  /** Files are present for the built-in GitHub installer. Optional for custom verifier compatibility. */
+  readonly files?: readonly VerifiedRemoteFile[];
+}
+interface VerifiedRemoteFile {
+  /** Path relative to the directory that contains the unique SKILL.md. */
+  readonly path: string;
+  readonly sha: string;
+  readonly size: number;
 }
 type RemoteCandidateVerifier = (candidate: Pick<RemoteCandidate, 'source' | 'ref' | 'skillId' | 'path' | 'skillFileHash'>, signal?: AbortSignal) => Promise<VerifiedRemoteSkill>;
 /**
  * Prove that the pinned repository contains exactly one usable Skill with the
- * requested name before invoking the name-based `skills` installer.
+ * requested name and return the immutable blobs in that Skill directory.
  */
 declare function verifyUniqueRemoteSkill(candidate: Pick<RemoteCandidate, 'source' | 'ref' | 'skillId' | 'path' | 'skillFileHash'>, signal?: AbortSignal): Promise<VerifiedRemoteSkill>;
 //#endregion

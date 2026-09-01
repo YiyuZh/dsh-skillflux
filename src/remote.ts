@@ -386,19 +386,20 @@ async function searchGithub(
   return payload.items.filter(isGithubCodeSearchItem).slice(0, limit)
 }
 
-function rawGithubUrl(source: string, ref: string, path: string): string {
+function githubContentUrl(source: string, ref: string, path: string): string {
   const sourcePath = source.split('/').map(encodeURIComponent).join('/')
   const skillPath = path.split('/').map(encodeURIComponent).join('/')
-  return `https://raw.githubusercontent.com/${sourcePath}/${ref}/${skillPath}`
+  return `https://api.github.com/repos/${sourcePath}/contents/${skillPath}?ref=${encodeURIComponent(ref)}`
 }
 
 async function githubSeed(
   hit: GithubCodeSearchItem,
   snapshot: RepositorySnapshot,
   signal: AbortSignal,
+  token: string,
 ): Promise<CandidateSeed> {
-  const response = await fetch(rawGithubUrl(hit.repository.full_name, snapshot.ref, hit.path), {
-    headers: { accept: 'text/plain', 'user-agent': 'dsh-skillflux' },
+  const response = await fetch(githubContentUrl(hit.repository.full_name, snapshot.ref, hit.path), {
+    headers: { ...githubHeaders(token), accept: 'application/vnd.github.raw+json' },
     signal,
   })
   if (!response.ok) throw new Error(`GitHub Skill fetch failed for ${hit.repository.full_name}/${hit.path}: HTTP ${response.status}`)
@@ -406,10 +407,11 @@ async function githubSeed(
   if (Number.isFinite(contentLength) && contentLength > MAX_REMOTE_SKILL_BYTES) {
     throw new Error(`remote SKILL.md exceeds ${MAX_REMOTE_SKILL_BYTES} bytes`)
   }
-  const raw = await response.text()
-  if (Buffer.byteLength(raw, 'utf8') > MAX_REMOTE_SKILL_BYTES) {
+  const bytes = Buffer.from(await response.arrayBuffer())
+  if (bytes.length > MAX_REMOTE_SKILL_BYTES) {
     throw new Error(`remote SKILL.md exceeds ${MAX_REMOTE_SKILL_BYTES} bytes`)
   }
+  const raw = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   const definition = parseSkillMarkdown(raw, '/skillflux-remote-preview')
   if (definition.description.length > 4_096) throw new Error('remote Skill description exceeds 4096 characters')
   return {
@@ -420,7 +422,7 @@ async function githubSeed(
     installs: 0,
     discoverySources: ['github'],
     path: hit.path,
-    skillFileHash: createHash('sha256').update(raw).digest('hex'),
+    skillFileHash: createHash('sha256').update(bytes).digest('hex'),
   }
 }
 
@@ -580,7 +582,7 @@ export class RemoteDiscoveryClient {
     const githubSeeds = await Promise.allSettled(githubHits.map(async hit => {
       const snapshot = snapshots.get(hit.repository.full_name)
       if (snapshot === undefined) throw new Error('repository metadata unavailable')
-      return await githubSeed(hit, snapshot, operationSignal)
+      return await githubSeed(hit, snapshot, operationSignal, this.githubToken!)
     }))
     if (githubSeeds.some(result => result.status === 'rejected')) degraded = true
     operationSignal.throwIfAborted()

@@ -472,12 +472,15 @@ available until a later policy run or explicit cleanup removes them.
 
 - Remote discovery accepts only public GitHub repositories from skills.sh or
   authenticated GitHub `SKILL.md` code search.
-- GitHub-discovered `SKILL.md` files are bounded to 256 KiB and must pass the
+- GitHub-discovered `SKILL.md` files are read from the immutable commit through
+  the authenticated GitHub Contents API, bounded to 256 KiB, and must pass the
   same supported frontmatter parser before they become candidates.
 - Before every new installation, SkillFlux enumerates up to 512 `SKILL.md`
-  files at the pinned commit through the GitHub tree API and requires exactly
-  one usable Skill with the requested name. This applies to skills.sh-only
-  results as well as GitHub Code Search results.
+  files at the pinned commit through the GitHub tree API, reads their exact
+  tree-bound blob SHAs through the Git Blob API, and requires exactly one usable
+  Skill with the requested name. It then selects only the regular files under
+  that Skill directory. This applies to skills.sh-only results as well as GitHub
+  Code Search results; `raw.githubusercontent.com` is not required.
 - The verified source SHA-256 must match both a prior GitHub search preview (if
   present) and the `SKILL.md` selected by the installer. Same-name files at
   multiple repository paths are therefore rejected even when their root bytes
@@ -492,10 +495,12 @@ available until a later policy run or explicit cleanup removes them.
   SkillFlux cache.
 - Each remote result is resolved to a 40-character commit SHA before SkillFlux
   creates its candidate ID.
-- Installation downloads that immutable GitHub codeload archive through the
-  pinned `skills@1.5.23` CLI.
-- Transport extraction is capped at 5,000 files. The selected Skill is
-  separately capped at 1,000 files and 10 MiB by default.
+- The built-in installer fetches only those selected Git blobs, validates each
+  response's declared size and recomputed Git blob SHA, and writes them as
+  non-executable regular files. It does not download or extract the whole
+  repository archive.
+- File-count and byte limits are checked from the pinned tree before download
+  and checked again from disk. The default limits are 1,000 files and 10 MiB.
 - SkillFlux checks paths, symlinks, frontmatter, file counts, byte counts, and a
   SHA-256 content manifest before mounting.
 - SkillFlux caches scripts as resources but never executes them.

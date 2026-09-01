@@ -90,6 +90,9 @@ focused pull request.
   freshness, owner type, and license as evidence rather than verification.
 - A remote provider failure may reduce discovery coverage, but must not weaken
   the immutable-commit or approval boundaries of candidates that remain.
+- The built-in installer must remain target-directory scoped: bind every file
+  to the pinned GitHub tree/blob SHA, reject symbolic links and path traversal,
+  and enforce file/byte limits before network download and again after writing.
 - Never persist raw discovery queries. Cache keys must remain one-way
   fingerprints, and explicit cancellation must never trigger stale fallback.
 - Installed-cache pruning must be deterministic, protect active and in-flight

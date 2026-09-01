@@ -1,5 +1,9 @@
 # Remote fallback validation — 2026-08-31
 
+> Historical pre-fix result. The pending online acceptance recorded here was
+> resolved by the targeted Git tree/blob installer; see
+> `remote-targeted-install-validation-2026-09-01.md`.
+
 ## Local checks
 
 - Full suite: 22 files, 160 tests passed.

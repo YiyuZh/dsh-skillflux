@@ -2,7 +2,7 @@ import { access, mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { isLoopbackProxyFailure, SkillCache } from '../src/cache.js'
 import { SkillCache as PublishedSkillCache } from '../lib/index.js'
 import { inspectSkillDirectory } from '../src/skill-file.js'
@@ -37,6 +37,7 @@ async function cachedFixture(): Promise<{ root: string; id: string; directory: s
 }
 
 afterEach(async () => {
+  vi.unstubAllGlobals()
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })))
 })
 
@@ -313,6 +314,50 @@ describe('persistent cache', () => {
     })
     expect(cacheCandidates([installed])[0]).toMatchObject({ name: 'demo', installs: 42, trustLevel: 'community' })
     expect((await cache.load(installed)).content).toContain('Use the remote demo')
+  })
+
+  it('uses verified GitHub blobs for the built-in target-directory installer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'skillflux-cache-github-'))
+    roots.push(root)
+    const downloadedMarkdown = '---\nname: demo\ndescription: GitHub blob install\n---\nUse the remote demo.\n'
+    const notes = 'Reference notes.\n'
+    const gitSha = (content: string): string => {
+      const bytes = Buffer.from(content)
+      return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+    }
+    const blobs = new Map([[gitSha(downloadedMarkdown), downloadedMarkdown], [gitSha(notes), notes]])
+    const candidate: RemoteCandidate = {
+      id: 'remote-github', origin: 'remote', name: 'demo', description: 'GitHub blob install',
+      source: 'owner/repo', ref: 'd'.repeat(40), score: 70, skillId: 'demo', installs: 42,
+      discoverySources: ['github'], qualityScore: 72, relevanceScore: 100, stars: 120, forks: 8,
+      recentlyActive: true, trustedSource: false, trustLevel: 'community',
+      qualityBreakdown: { relevance: 55, adoption: 4, repository: 5, freshness: 4, trust: 0, provenance: 4, total: 72 },
+      qualitySignals: ['content-pinned'], qualityWarnings: [],
+    }
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.includes('/git/trees/')) {
+        return new Response(JSON.stringify({
+          truncated: false,
+          tree: [
+            { path: 'skills/demo/SKILL.md', type: 'blob', mode: '100644', sha: gitSha(downloadedMarkdown), size: Buffer.byteLength(downloadedMarkdown) },
+            { path: 'skills/demo/references/notes.md', type: 'blob', mode: '100644', sha: gitSha(notes), size: Buffer.byteLength(notes) },
+          ],
+        }), { status: 200 })
+      }
+      const sha = url.split('/').at(-1)!
+      const content = blobs.get(sha)
+      if (content === undefined) return new Response(null, { status: 404 })
+      return new Response(JSON.stringify({
+        content: Buffer.from(content).toString('base64'), encoding: 'base64',
+        size: Buffer.byteLength(content), sha,
+      }), { status: 200 })
+    }))
+    const cache = new SkillCache({ root, maxFiles: 10, maxBytes: 10_000, installTimeoutMs: 1_000 })
+    const installed = await cache.install(candidate)
+    expect(await readFile(join(installed.directory, 'references', 'notes.md'), 'utf8')).toBe(notes)
+    expect((await cache.load(installed)).content).toContain('Use the remote demo')
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('codeload'))).toBe(false)
   })
 
   it('rejects an installed SKILL.md that differs from its unique pinned source', async () => {
