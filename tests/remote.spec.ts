@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -108,7 +109,7 @@ describe('remote discovery', () => {
       if (url === 'https://api.github.com/graphql') {
         return new Response(JSON.stringify({ data: { r0: graphqlRepository({ stargazerCount: 900 }) } }), { status: 200 })
       }
-      expect(url).toBe(`https://raw.githubusercontent.com/acme/agent-skills/${sha}/skills/pdf-reader/SKILL.md`)
+      expect(url).toBe(`https://api.github.com/repos/acme/agent-skills/contents/skills/pdf-reader/SKILL.md?ref=${sha}`)
       return new Response(skillMarkdown('pdf-reader', 'Read and analyze PDF documents with OCR.'), { status: 200 })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -131,6 +132,30 @@ describe('remote discovery', () => {
       trustLevel: 'community',
       qualitySignals: expect.arrayContaining(['content-pinned']),
     })
+  })
+
+  it('hashes GitHub preview bytes without losing a UTF-8 BOM', async () => {
+    const plain = skillMarkdown('pdf-reader', 'Read PDF documents with OCR.')
+    const bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(plain)])
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://api.github.com/search/code')) {
+        return new Response(JSON.stringify({
+          items: [{ path: 'skills/pdf-reader/SKILL.md', repository: { full_name: 'acme/agent-skills', private: false } }],
+        }), { status: 200 })
+      }
+      if (url === 'https://api.github.com/graphql') {
+        return new Response(JSON.stringify({ data: { r0: graphqlRepository() } }), { status: 200 })
+      }
+      return new Response(bytes, { status: 200 })
+    }))
+    const [candidate] = await new RemoteDiscoveryClient({
+      searchLimit: 5, timeoutMs: 1_000, providers: ['github'], githubToken: 'test-token',
+      now: () => Date.parse('2026-08-24T00:00:00Z'),
+    }).search('pdf reader')
+    expect(candidate?.name).toBe('pdf-reader')
+    expect(candidate?.skillFileHash).toBe(createHash('sha256').update(bytes).digest('hex'))
+    expect(candidate?.skillFileHash).not.toBe(createHash('sha256').update(plain).digest('hex'))
   })
 
   it('merges marketplace adoption with GitHub skill-level metadata', async () => {

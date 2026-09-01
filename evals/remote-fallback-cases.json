@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "cases": [
+    { "id": "first-success-stops", "policy": "automatic", "results": ["ok", "ok"], "attempts": [0], "outcomes": ["mounted"], "mounted": [0], "remaining": [] },
+    { "id": "verification-failure-recovers", "policy": "automatic", "results": ["verify-fail", "ok"], "attempts": [0, 1], "outcomes": ["mount-failed", "mounted"], "mounted": [1], "remaining": [] },
+    { "id": "installer-failure-recovers", "policy": "automatic", "results": ["install-fail", "ok"], "attempts": [0, 1], "outcomes": ["mount-failed", "mounted"], "mounted": [1], "remaining": [] },
+    { "id": "default-three-attempt-cap", "policy": "automatic", "results": ["verify-fail", "install-fail", "verify-fail", "ok"], "attempts": [0, 1, 2], "outcomes": ["mount-failed", "mount-failed", "mount-failed"], "mounted": [], "remaining": [3] },
+    { "id": "opt-out-of-fallback", "policy": "automatic", "limit": 1, "results": ["verify-fail", "ok"], "attempts": [0], "outcomes": ["mount-failed"], "mounted": [], "remaining": [1] },
+    { "id": "all-failed-clear-hints", "policy": "automatic", "results": ["verify-fail", "install-fail"], "attempts": [0, 1], "outcomes": ["mount-failed", "mount-failed"], "mounted": [], "remaining": [] },
+    { "id": "always-requires-explicit-mount", "policy": "always", "results": ["ok", "ok"], "attempts": [], "outcomes": [], "mounted": [], "remaining": [0, 1] },
+    { "id": "session-does-not-auto-install", "policy": "session", "results": ["ok", "ok"], "attempts": [], "outcomes": [], "mounted": [], "remaining": [0, 1] }
+  ]
+}

@@ -59,11 +59,17 @@ focused pull request.
    $env:GH_TOKEN = gh auth token
    $env:SKILLFLUX_REQUIRE_GITHUB = '1'
    corepack pnpm test:discovery-live
+   corepack pnpm test:runtime-live
    ```
 
    Never paste a token into source, configuration, fixtures, logs, or the pull
    request. A remote provider outage should be reported separately from an
    offline unit-test failure.
+
+   `test:runtime-live` uses a temporary DSH home and the real online discovery,
+   installer, scoped runtime, `skill` tool, and turn cleanup. It does not call an
+   LLM or execute downloaded Skill scripts. Set `SKILLFLUX_SMOKE_FAIL_FIRST=1`
+   for a controlled first-candidate installation failure during the online run.
 
 5. Commit the source, tests, documentation, evaluation fixtures, and regenerated
    `lib/` output, then push the topic branch and open a pull request against
@@ -84,6 +90,9 @@ focused pull request.
   freshness, owner type, and license as evidence rather than verification.
 - A remote provider failure may reduce discovery coverage, but must not weaken
   the immutable-commit or approval boundaries of candidates that remain.
+- The built-in installer must remain target-directory scoped: bind every file
+  to the pinned GitHub tree/blob SHA, reject symbolic links and path traversal,
+  and enforce file/byte limits before network download and again after writing.
 - Never persist raw discovery queries. Cache keys must remain one-way
   fingerprints, and explicit cancellation must never trigger stale fallback.
 - Installed-cache pruning must be deterministic, protect active and in-flight
@@ -104,6 +113,8 @@ Discovery cache policy changes should update
 [`evals/remote-cache-cases.json`](evals/remote-cache-cases.json).
 Installed cache governance changes should update
 [`evals/cache-governance-cases.json`](evals/cache-governance-cases.json).
+Automatic remote mount changes should update
+[`evals/remote-fallback-cases.json`](evals/remote-fallback-cases.json).
 PRs should pass typecheck,
 lint, tests, the routing evaluation, build, and package-content validation. Do
 not commit credentials, local DSH profiles, cache entries, or `.qartez` indexes.

@@ -6,7 +6,11 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { inspectSkillDirectory } from './skill-file.js'
 import { planCachePrune, type CachePrunePlan, type CachePrunePolicy, type CacheUsageEvidence } from './cache-governance.js'
-import { verifyUniqueRemoteSkill, type RemoteCandidateVerifier } from './remote-source.js'
+import {
+  materializeVerifiedRemoteSkill,
+  verifyUniqueRemoteSkill,
+  type RemoteCandidateVerifier,
+} from './remote-source.js'
 import type { CacheEntry, CacheManifest, RemoteCandidate } from './types.js'
 import type { SkillDefinition } from '@deepseek-ai/dsh-skill'
 
@@ -229,48 +233,53 @@ export class SkillCache {
         operationSignal,
       )
       operationSignal.throwIfAborted()
-      const source = immutableArchiveUrl(candidate.source, candidate.ref)
-      const args = [
-        skillsCliPath(), 'add', source, '--skill', candidate.skillId,
-        '--agent', 'codex', '--yes', '--copy',
-      ]
-      const baseEnvironment = {
-        ...process.env,
-        CI: '1',
-        NO_COLOR: '1',
-        SKILLS_NO_TELEMETRY: '1',
-        // This bounds the transport archive, which may contain many sibling
-        // skills. The selected skill is independently constrained by
-        // maxSkillFiles/maxSkillBytes before it enters the cache.
-        SKILLS_EXTRACT_MAX_FILES: '5000',
-      }
-      const execute = async (env: NodeJS.ProcessEnv): Promise<void> => {
-        if (this.options.runInstaller !== undefined) {
-          await withAbort(this.options.runInstaller({
-            executable: process.execPath,
-            args,
-            cwd: workspace,
-            timeoutMs: this.options.installTimeoutMs,
-            signal: operationSignal,
-            env,
-          }), operationSignal)
-        } else {
-          await execFileAsync(process.execPath, args, {
-            cwd: workspace,
-            timeout: this.options.installTimeoutMs,
-            maxBuffer: 2 * 1024 * 1024,
-            signal: operationSignal,
-            env,
-          })
+      if (this.options.runInstaller === undefined && verifiedSource.files !== undefined) {
+        await materializeVerifiedRemoteSkill(candidate, verifiedSource, downloaded, {
+          maxFiles: this.options.maxFiles,
+          maxBytes: this.options.maxBytes,
+        }, operationSignal)
+      } else {
+        const runInstaller = this.options.runInstaller
+        const source = immutableArchiveUrl(candidate.source, candidate.ref)
+        const args = [
+          skillsCliPath(), 'add', source, '--skill', candidate.skillId,
+          '--agent', 'codex', '--yes', '--copy',
+        ]
+        const baseEnvironment = {
+          ...process.env,
+          CI: '1',
+          NO_COLOR: '1',
+          SKILLS_NO_TELEMETRY: '1',
+          SKILLS_EXTRACT_MAX_FILES: '5000',
         }
-      }
-      try {
-        await execute(baseEnvironment)
-      } catch (error: unknown) {
-        if (!isLoopbackProxyFailure(error)) throw error
-        await rm(workspace, { recursive: true, force: true })
-        await mkdir(workspace, { recursive: true })
-        await execute(withoutLoopbackProxy(baseEnvironment))
+        const execute = async (env: NodeJS.ProcessEnv): Promise<void> => {
+          if (runInstaller === undefined) {
+            await execFileAsync(process.execPath, args, {
+              cwd: workspace,
+              timeout: this.options.installTimeoutMs,
+              maxBuffer: 2 * 1024 * 1024,
+              signal: operationSignal,
+              env,
+            })
+          } else {
+            await withAbort(runInstaller({
+              executable: process.execPath,
+              args,
+              cwd: workspace,
+              timeoutMs: this.options.installTimeoutMs,
+              signal: operationSignal,
+              env,
+            }), operationSignal)
+          }
+        }
+        try {
+          await execute(baseEnvironment)
+        } catch (error: unknown) {
+          if (!isLoopbackProxyFailure(error)) throw error
+          await rm(workspace, { recursive: true, force: true })
+          await mkdir(workspace, { recursive: true })
+          await execute(withoutLoopbackProxy(baseEnvironment))
+        }
       }
       await access(downloaded)
       operationSignal.throwIfAborted()

@@ -273,6 +273,7 @@ approvalPolicy: always       # always | session | automatic
 remoteDiscovery: automatic   # automatic | on-demand | off
 remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
+remoteAutoMountLimit: 3      # automatic approval only; 1 disables fallback
 remoteSearchTimeoutMs: 30000
 remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
@@ -409,10 +410,30 @@ current estimate and `/skillflux explain` marks rejected candidates as
 | --- | --- |
 | `always` | Request native DSH approval for every remote mount. This is the default. |
 | `session` | Request approval for the first successful install from a repository, then trust that repository for the current session. |
-| `automatic` | Download and mount the highest-ranked remote candidate without approval. Use only in a trusted environment. |
+| `automatic` | Try ranked remote candidates until one mounts, without approval. Use only in a trusted environment. |
 
 If approval is unavailable, rejected, or canceled, the remote mount fails
 closed.
+
+### Automatic remote fallback
+
+With `approvalPolicy: automatic`, a broken first result no longer blocks a
+usable second result. SkillFlux tries at most `remoteAutoMountLimit` candidates
+in discovery order (default **3**, allowed **1–5**), stopping after the first
+successful mount. Set it to `1` for single-candidate behavior.
+
+All attempts share one `installTimeoutMs` deadline, starting after discovery.
+The next candidate is not started after this deadline, explicit cancellation,
+or turn cleanup. In-flight lock acquisition and cleanup are awaited safely;
+the deadline is not a strict wall-clock bound on their completion.
+
+Every attempt still enforces current trust/owner policy, pinned-source
+verification, installed-content integrity, and catalog limits.
+`/skillflux explain` records `mount-failed`, `mount-timeout`, `budget-skipped`, or `mounted`.
+Failed candidates are removed from this turn's hint; unattempted candidates
+remain available. A new `skillflux_search` can retry a failure; failures are not
+persisted as a blacklist. `always`, `session`, and explicit `skillflux_mount`
+keep their existing approval behavior and never silently switch candidates.
 
 ## Model tools and user commands
 
@@ -451,12 +472,15 @@ available until a later policy run or explicit cleanup removes them.
 
 - Remote discovery accepts only public GitHub repositories from skills.sh or
   authenticated GitHub `SKILL.md` code search.
-- GitHub-discovered `SKILL.md` files are bounded to 256 KiB and must pass the
+- GitHub-discovered `SKILL.md` files are read from the immutable commit through
+  the authenticated GitHub Contents API, bounded to 256 KiB, and must pass the
   same supported frontmatter parser before they become candidates.
 - Before every new installation, SkillFlux enumerates up to 512 `SKILL.md`
-  files at the pinned commit through the GitHub tree API and requires exactly
-  one usable Skill with the requested name. This applies to skills.sh-only
-  results as well as GitHub Code Search results.
+  files at the pinned commit through the GitHub tree API, reads their exact
+  tree-bound blob SHAs through the Git Blob API, and requires exactly one usable
+  Skill with the requested name. It then selects only the regular files under
+  that Skill directory. This applies to skills.sh-only results as well as GitHub
+  Code Search results; `raw.githubusercontent.com` is not required.
 - The verified source SHA-256 must match both a prior GitHub search preview (if
   present) and the `SKILL.md` selected by the installer. Same-name files at
   multiple repository paths are therefore rejected even when their root bytes
@@ -471,10 +495,12 @@ available until a later policy run or explicit cleanup removes them.
   SkillFlux cache.
 - Each remote result is resolved to a 40-character commit SHA before SkillFlux
   creates its candidate ID.
-- Installation downloads that immutable GitHub codeload archive through the
-  pinned `skills@1.5.23` CLI.
-- Transport extraction is capped at 5,000 files. The selected Skill is
-  separately capped at 1,000 files and 10 MiB by default.
+- The built-in installer fetches only those selected Git blobs, validates each
+  response's declared size and recomputed Git blob SHA, and writes them as
+  non-executable regular files. It does not download or extract the whole
+  repository archive.
+- File-count and byte limits are checked from the pinned tree before download
+  and checked again from disk. The default limits are 1,000 files and 10 MiB.
 - SkillFlux checks paths, symlinks, frontmatter, file counts, byte counts, and a
   SHA-256 content manifest before mounting.
 - SkillFlux caches scripts as resources but never executes them.

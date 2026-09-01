@@ -96,6 +96,7 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   remoteDiscovery: 'automatic',
   remoteProviders: ['skills.sh', 'github'],
   remoteSearchLimit: 5,
+  remoteAutoMountLimit: 3,
   remoteSearchTimeoutMs: 30_000,
   remoteMinQualityScore: 35,
   remoteMinStars: 0,
@@ -318,6 +319,7 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
     remoteDiscovery: config.remoteDiscovery ?? DEFAULTS.remoteDiscovery,
     remoteProviders: remoteProviders(config.remoteProviders ?? DEFAULTS.remoteProviders),
     remoteSearchLimit: boundedInteger('remoteSearchLimit', config.remoteSearchLimit ?? DEFAULTS.remoteSearchLimit, 1, 25),
+    remoteAutoMountLimit: boundedInteger('remoteAutoMountLimit', config.remoteAutoMountLimit ?? DEFAULTS.remoteAutoMountLimit, 1, 5),
     remoteSearchTimeoutMs: boundedInteger(
       'remoteSearchTimeoutMs',
       config.remoteSearchTimeoutMs ?? DEFAULTS.remoteSearchTimeoutMs,
@@ -563,6 +565,7 @@ export class SkillFluxService extends Service {
     remoteDiscovery: z.union(['automatic', 'on-demand', 'off'] as const).default(DEFAULTS.remoteDiscovery),
     remoteProviders: z.array(z.union(['skills.sh', 'github'] as const)).default([...DEFAULTS.remoteProviders]),
     remoteSearchLimit: z.number().default(DEFAULTS.remoteSearchLimit),
+    remoteAutoMountLimit: z.number().default(DEFAULTS.remoteAutoMountLimit),
     remoteSearchTimeoutMs: z.number().default(DEFAULTS.remoteSearchTimeoutMs),
     remoteMinQualityScore: z.number().default(DEFAULTS.remoteMinQualityScore),
     remoteMinStars: z.number().default(DEFAULTS.remoteMinStars),
@@ -1287,21 +1290,41 @@ export class SkillFluxService extends Service {
     for (const candidate of remote) state.candidates.set(candidate.id, candidate)
     if (remote.length === 0) return updateRemoteCandidates(agent, [])
     if (this.config.approvalPolicy === 'automatic') {
-      try {
-        await this.mountCandidate(state, remote[0]!, signal, generation)
-        state.candidates.clear()
-        return updateRemoteCandidates(agent, [])
-      } catch (error: unknown) {
+      // Share one deadline across candidates so fallback cannot multiply the
+      // install budget. Await rollback/lock cleanup before trying another.
+      const deadline = AbortSignal.timeout(this.config.installTimeoutMs)
+      const mountSignal = AbortSignal.any([signal, deadline])
+      const mountEpochs = new Map(remote.map(candidate => [candidate.name, state.mountEpochs.get(candidate.name) ?? 0]))
+      for (const candidate of remote.slice(0, this.config.remoteAutoMountLimit)) {
+        const mountEpoch = mountEpochs.get(candidate.name)!
         signal.throwIfAborted()
-        if (error instanceof ExpiredAgentStateError) throw error
-        if (error instanceof CatalogBudgetExceededError) {
-          state.lastRouting.push({ ...routingTrace(remote[0]!, turn), outcome: 'budget-skipped' })
-        } else {
-          this.runtimeCtx.logger.warn(`SkillFlux automatic remote mount failed: ${errorMessage(error)}`)
+        this.assertMountCurrent(state, generation, candidate.name, mountEpoch)
+        if (deadline.aborted) break
+        try {
+          await this.mountCandidate(state, candidate, mountSignal, generation, mountEpoch)
+          state.candidates.clear()
+          return updateRemoteCandidates(agent, [])
+        } catch (error: unknown) {
+          signal.throwIfAborted()
+          this.assertMountCurrent(state, generation, candidate.name, mountEpoch)
+          if (error instanceof ExpiredAgentStateError) throw error
+          const outcome = error instanceof CatalogBudgetExceededError
+            ? 'budget-skipped'
+            : deadline.aborted || (error instanceof Error && error.name === 'TimeoutError')
+              ? 'mount-timeout'
+              : 'mount-failed'
+          state.lastRouting.push({ ...routingTrace(candidate, turn), outcome })
+          // Do not immediately offer an already-failed candidate back to the
+          // model. A new explicit search may retry it; no persistent ban.
+          state.candidates.delete(candidate.id)
+          this.runtimeCtx.logger.warn(
+            `SkillFlux automatic remote mount ${outcome} for ${candidate.name} from ${candidate.source}: ${errorMessage(error)}`,
+          )
+          if (deadline.aborted) break
         }
       }
     }
-    return updateRemoteCandidates(agent, remote)
+    return updateRemoteCandidates(agent, remote.filter(candidate => state.candidates.has(candidate.id)))
   }
 
   private async mountCandidate(
