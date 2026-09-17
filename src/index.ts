@@ -15,30 +15,36 @@ import {
   type SkillDefinition,
   type SkillInvocationSource,
 } from '@deepseek-ai/dsh-skill'
-import { defineTool, type PreToolDecision, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import { defineTool, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
+import { activateCandidate, usageIdentity, type ActivationHost, type CacheProcessLockRelease } from './activation.js'
+import { MOUNT_TOOL, registerApprovalGate, type ApprovalHost } from './approval.js'
 import { SkillCache, type CacheInventoryStats } from './cache.js'
 import type { CachePrunePlan } from './cache-governance.js'
 import { estimateCatalogTokens, updateCatalog, updateRemoteCandidates } from './catalog.js'
+import {
+  DiscoveryCoordinator,
+  automaticDiscoveryQuery,
+  dedupeByName,
+  governedCacheCandidates,
+  type DiscoveryHost,
+} from './discovery.js'
 import { EmbeddingRouter } from './embedding.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { RemoteDiscoveryCache } from './remote-cache.js'
-import { remoteTrustPolicyAllows } from './remote-governance.js'
-import { cacheCandidates, registryCandidates, selectCandidates, tokenize } from './router.js'
+import { registryCandidates } from './router.js'
+import { ExpiredAgentStateError, TurnStateRegistry, skillLookup, type AgentState } from './state.js'
 import { UsageStore } from './usage.js'
 import type {
   CacheEntry,
-  CachedCandidate,
   CatalogStats,
   EmbeddingRouterStats,
   MountedSkill,
   RemoteCandidate,
   RemoteDiscoveryCacheStats,
-  RemoteTrustLevel,
   ResolvedSkillFluxConfig,
   RoutingTrace,
   SkillFluxCandidate,
   SkillFluxConfig,
-  SkillUsageIdentity,
   SkillUsageRecord,
 } from './types.js'
 
@@ -86,7 +92,6 @@ export {
 export { UsageStore, type AdaptiveUsageOptions, type UsageStoreOptions } from './usage.js'
 
 export const name = 'skillflux'
-const MOUNT_TOOL = 'skillflux_mount'
 const OLLAMA_EMBEDDING_ENDPOINT = 'http://127.0.0.1:11434/api/embed'
 const OPENAI_EMBEDDING_ENDPOINT = 'https://api.openai.com/v1/embeddings'
 const DEFAULTS: ResolvedSkillFluxConfig = {
@@ -134,24 +139,6 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   routes: [],
 }
 
-interface AgentState {
-  readonly agent: Agent
-  turn?: number
-  generation: number
-  readonly mountEpochs: Map<string, number>
-  readonly active: Map<string, MountedSkill>
-  readonly disposers: Map<string, () => void>
-  readonly candidates: Map<string, SkillFluxCandidate>
-  lastRouting: RoutingTrace[]
-}
-
-class ExpiredAgentStateError extends Error {
-  constructor() {
-    super('SkillFlux mount expired because its turn or agent lifecycle ended')
-    this.name = 'ExpiredAgentStateError'
-  }
-}
-
 declare module '@deepseek-ai/cordis' {
   interface Context {
     skillFlux: SkillFluxService
@@ -196,11 +183,6 @@ function catalogTokenBudget(value: number): number {
   return boundedInteger('catalogTokenBudget', value, 64, 1_000_000)
 }
 
-interface CacheProcessLockRelease {
-  (): Promise<void>
-  readonly signal: AbortSignal
-}
-
 type CacheLockFunction = (file: string, options?: LockOptions) => Promise<() => Promise<void>>
 
 function remoteProviders(values: ResolvedSkillFluxConfig['remoteProviders']): ResolvedSkillFluxConfig['remoteProviders'] {
@@ -218,66 +200,6 @@ function remoteOwners(name: 'remoteTrustedOwners' | 'remoteBlockedOwners', value
   }
   return [...new Set(owners.map(owner => owner.toLocaleLowerCase('en-US')))]
     .sort((left, right) => left.localeCompare(right, 'en'))
-}
-
-function repositoryOwner(source: string): string {
-  return source.split('/')[0]?.toLocaleLowerCase('en-US') ?? ''
-}
-
-/**
- * Re-evaluate persisted evidence against the current owner configuration.
- * Legacy cache manifests are treated as community evidence because their
- * immutable commit and complete installed-directory hash are still known.
- */
-function currentCandidateTrust(
-  candidate: CachedCandidate | RemoteCandidate,
-  config: ResolvedSkillFluxConfig,
-): RemoteTrustLevel {
-  const owner = repositoryOwner(candidate.source)
-  if (config.remoteTrustedOwners.includes(owner)) return 'trusted'
-  const sources = new Set(candidate.discoverySources ?? [])
-  const contentPinned = candidate.origin === 'cache' || candidate.skillFileHash !== undefined
-  // Legacy cache entries have no label, but they still have an immutable ref
-  // and installed-directory hash. Keep the documented conservative fallback.
-  if (candidate.origin === 'cache' && candidate.trustLevel === undefined) return 'community'
-  if (candidate.trustLevel === 'corroborated') return 'corroborated'
-  if (candidate.trustLevel === 'community') return 'community'
-  // An explicit persisted `unverified` label may come from an `open` install.
-  // Once installed, pinned-source and complete-directory verification establish
-  // the same minimum provenance used for community evidence.
-  return sources.size >= 2 && contentPinned
-    ? 'corroborated'
-    : contentPinned
-      ? 'community'
-      : 'unverified'
-}
-
-function candidateGovernanceReason(
-  candidate: SkillFluxCandidate,
-  config: ResolvedSkillFluxConfig,
-): string | undefined {
-  if (candidate.origin === 'registry') return undefined
-  const owner = repositoryOwner(candidate.source)
-  if (config.remoteBlockedOwners.includes(owner)) {
-    return `repository owner "${owner}" is blocked by remoteBlockedOwners`
-  }
-  const trustLevel = currentCandidateTrust(candidate, config)
-  if (!remoteTrustPolicyAllows(trustLevel, config.remoteTrustPolicy)) {
-    return `candidate evidence level "${trustLevel}" does not satisfy remoteTrustPolicy "${config.remoteTrustPolicy}"`
-  }
-  return undefined
-}
-
-function governedCacheCandidates(
-  entries: readonly CacheEntry[],
-  config: ResolvedSkillFluxConfig,
-): CachedCandidate[] {
-  return cacheCandidates(entries).flatMap((candidate): CachedCandidate[] => {
-    if (candidate.origin !== 'cache') return []
-    if (candidateGovernanceReason(candidate, config) !== undefined) return []
-    const trustLevel = currentCandidateTrust(candidate, config)
-    return [{ ...candidate, trustLevel }]
-  })
 }
 
 function nonEmptyString(name: string, value: string): string {
@@ -493,14 +415,6 @@ function invokedSkillNames(messages: readonly UserMessage[]): string[] {
   return names
 }
 
-function skillLookup(agent: Agent, signal?: AbortSignal): { cwd?: string; scope: Agent; signal?: AbortSignal } {
-  return {
-    ...(agent.session.header.cwd === undefined ? {} : { cwd: agent.session.header.cwd }),
-    scope: agent,
-    ...(signal === undefined ? {} : { signal }),
-  }
-}
-
 interface SkillToolValue {
   readonly name: string
   readonly provider: string
@@ -621,8 +535,8 @@ export class SkillFluxService extends Service {
   private cacheMaintenanceQueue: Promise<void> = Promise.resolve()
   private autoPruneTask: Promise<void> | undefined
   private autoPruneRequested = false
-  private readonly stateByAgent = new WeakMap<Agent, AgentState>()
-  private readonly states = new Set<AgentState>()
+  private readonly turnStates: TurnStateRegistry
+  private readonly discovery: DiscoveryCoordinator
   private readonly trustedBySession = new WeakMap<Session, Set<string>>()
   private readonly cachePruneSessions = new WeakSet<Session>()
 
@@ -630,6 +544,7 @@ export class SkillFluxService extends Service {
     super(ctx, 'skillFlux')
     this.runtimeCtx = ctx
     this.config = resolveConfig(config)
+    this.turnStates = new TurnStateRegistry(message => { ctx.logger.warn(message) })
     this.cache = new SkillCache({
       root: dshHomePath('cache', 'skillflux'),
       maxFiles: this.config.maxSkillFiles,
@@ -674,12 +589,13 @@ export class SkillFluxService extends Service {
           minSimilarity: this.config.minEmbeddingSimilarity,
         })
       : undefined
+    this.discovery = new DiscoveryCoordinator(this.discoveryHost)
 
     const skillTool = this.createSkillTool()
     ctx.tools.register(skillTool)
     ctx.tools.register(this.createSearchTool())
     ctx.tools.register(this.createMountTool())
-    this.registerApprovalGate(ctx)
+    registerApprovalGate(ctx, this.approvalHost)
     this.registerCommand(ctx)
 
     // Registration order is intentional. Cordis waterfalls resume in reverse:
@@ -738,7 +654,7 @@ export class SkillFluxService extends Service {
     ctx.on('session/disposed', session => { this.disposeSession(session) })
     ctx.on('agent/disposed', ({ agent }) => { this.disposeAgent(agent) })
     ctx.effect(() => async () => {
-      for (const state of this.states) this.cleanupState(state, true)
+      this.turnStates.cleanupAll()
       await Promise.all(this.usageTasks)
       await this.usage?.flush()
       while (this.activeLeaseTasks.size > 0) await Promise.all(this.activeLeaseTasks)
@@ -747,30 +663,50 @@ export class SkillFluxService extends Service {
     })
   }
 
+  private get discoveryHost(): DiscoveryHost {
+    return {
+      runtimeCtx: this.runtimeCtx,
+      cache: this.cache,
+      remote: this.remote,
+      config: this.config,
+      embedding: this.embedding,
+      usage: this.usage,
+    }
+  }
+
+  private get activationHost(): ActivationHost {
+    return {
+      config: this.config,
+      cache: this.cache,
+      runtimeCtx: this.runtimeCtx,
+      usage: this.usage,
+      trustedBySession: this.trustedBySession,
+      cachePruneSessions: this.cachePruneSessions,
+      trackUsage: operation => { this.trackUsage(operation) },
+      acquireCacheLease: () => this.acquireCacheLease(),
+      trackActiveLeaseCleanup: operation => this.trackActiveLeaseCleanup(operation),
+      assertCapacity: (state, name) => { this.assertCapacity(state, name) },
+      assertCatalogBudget: (state, skill) => { this.assertCatalogBudget(state, skill) },
+      assertMountCurrent: (state, generation, name, mountEpoch) => { this.assertMountCurrent(state, generation, name, mountEpoch) },
+      rememberRouting: (state, mounted) => { this.rememberRouting(state, mounted) },
+      scheduleAutoPrune: () => { this.scheduleAutoPrune() },
+    }
+  }
+
+  private get approvalHost(): ApprovalHost {
+    return {
+      config: this.config,
+      trustedBySession: this.trustedBySession,
+      candidate: (agent, candidateId) => this.candidate(agent, candidateId),
+    }
+  }
+
   async discover(
     agent: Agent,
     query: string,
     options: { readonly remote?: boolean; readonly signal?: AbortSignal } = {},
   ): Promise<SkillFluxCandidate[]> {
-    const snapshot = await this.runtimeCtx.skills.snapshot(skillLookup(agent, options.signal))
-    options.signal?.throwIfAborted()
-    if (!snapshot.complete) throw new Error('SkillFlux discovery is incomplete; retry the search')
-    const installed = snapshot.skills.filter(isModelInvocable)
-    const cached = await this.cache.list()
-    options.signal?.throwIfAborted()
-    const local = dedupeByName([...registryCandidates(installed), ...governedCacheCandidates(cached, this.config)])
-    const selected = await this.selectLocalCandidates(
-      query,
-      local,
-      this.config.remoteSearchLimit,
-      this.config.remoteSearchLimit,
-      options.signal,
-    )
-    options.signal?.throwIfAborted()
-    if (options.remote !== true || this.config.remoteDiscovery === 'off') return selected
-    const remote = await this.remote.search(query, options.signal)
-    options.signal?.throwIfAborted()
-    return dedupeById([...selected, ...remote]).slice(0, this.config.remoteSearchLimit * 2)
+    return await this.discovery.discover(agent, query, options)
   }
 
   async mount(agent: Agent, candidateId: string, signal?: AbortSignal): Promise<MountedSkill> {
@@ -791,7 +727,7 @@ export class SkillFluxService extends Service {
   }
 
   unmount(agent: Agent, name?: string): void {
-    const state = this.stateByAgent.get(agent)
+    const state = this.turnStates.peek(agent)
     if (state === undefined) return
     if (name !== undefined) {
       state.mountEpochs.set(name, (state.mountEpochs.get(name) ?? 0) + 1)
@@ -823,7 +759,7 @@ export class SkillFluxService extends Service {
   }
 
   mounted(agent: Agent): readonly MountedSkill[] {
-    return [...(this.stateByAgent.get(agent)?.active.values() ?? [])]
+    return this.turnStates.mounted(agent)
   }
 
   catalogStats(agent: Agent): CatalogStats {
@@ -839,7 +775,7 @@ export class SkillFluxService extends Service {
   }
 
   lastRouting(agent: Agent): readonly RoutingTrace[] {
-    return (this.stateByAgent.get(agent)?.lastRouting ?? []).map(trace => ({ ...trace }))
+    return this.turnStates.lastRouting(agent)
   }
 
   async usageRecords(limit = 20): Promise<SkillUsageRecord[]> {
@@ -902,7 +838,7 @@ export class SkillFluxService extends Service {
         if (!isSkillName(args.name)) throw new Error(`invalid skill name "${args.name}"`)
         const agent = exec.agent
         if (agent === undefined) throw new Error('skill calls require an agent')
-        const active = this.stateByAgent.get(agent)?.active.get(args.name)
+        const active = this.turnStates.active(agent, args.name)
         if (active === undefined) throw new Error(`skill "${args.name}" is not mounted for this turn`)
         if (!isModelInvocable(active.definition)) throw new Error(`skill "${args.name}" is not model-invocable`)
         this.trackUsage(this.usage?.recordUse(usageIdentity(active)))
@@ -1040,28 +976,6 @@ export class SkillFluxService extends Service {
       },
       isConcurrencySafe: () => false,
       presentCall: args => ({ card: 'generic', title: 'Mount skill', kind: 'edit', rawInput: args.candidateId }),
-    })
-  }
-
-  private registerApprovalGate(ctx: Context): void {
-    ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
-      if (exec.name !== MOUNT_TOOL) return await next()
-      const downstream = await next()
-      if (downstream.kind !== 'allow') return downstream
-      const agent = exec.agent
-      const id = (exec.arguments as { candidateId?: unknown }).candidateId
-      if (agent === undefined || typeof id !== 'string') return { kind: 'deny', reason: 'invalid SkillFlux mount request' }
-      const candidate = this.stateByAgent.get(agent)?.candidates.get(id)
-      if (candidate === undefined) return { kind: 'deny', reason: 'SkillFlux candidate id is unknown or expired' }
-      const governanceReason = candidateGovernanceReason(candidate, this.config)
-      if (governanceReason !== undefined) return { kind: 'deny', reason: `SkillFlux mount denied: ${governanceReason}` }
-      if (candidate.origin !== 'remote' || this.config.approvalPolicy === 'automatic') return downstream
-      const trusted = this.trustedBySession.get(agent.session)
-      if (this.config.approvalPolicy === 'session' && trusted?.has(candidate.source) === true) return downstream
-      return {
-        kind: 'ask',
-        reason: `Install remote skill ${candidate.skillId} from ${candidate.source} at immutable commit ${candidate.ref}?`,
-      }
     })
   }
 
@@ -1229,7 +1143,7 @@ export class SkillFluxService extends Service {
     const local = dedupeByName(localPool)
     // Keep a few differently named fallbacks available: a corrupt top candidate
     // must not consume one of the bounded active slots for the entire turn.
-    const selected = await this.selectLocalCandidates(
+    const selected = await this.discovery.selectLocalCandidates(
       task,
       local,
       Math.min(local.length, this.config.maxActiveSkills * 3),
@@ -1334,172 +1248,7 @@ export class SkillFluxService extends Service {
     expectedGeneration = state.generation,
     expectedMountEpoch = state.mountEpochs.get(candidate.name) ?? 0,
   ): Promise<MountedSkill> {
-    signal?.throwIfAborted()
-    this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-    const governanceReason = candidateGovernanceReason(candidate, this.config)
-    if (governanceReason !== undefined) throw new Error(`SkillFlux mount denied: ${governanceReason}`)
-    const current = state.active.get(candidate.name)
-    if (current !== undefined) return current
-    this.assertCapacity(state, candidate.name)
-    this.assertCatalogBudget(state, candidate)
-    const lookup = skillLookup(state.agent, signal)
-    if (candidate.origin === 'registry') {
-      const definition = await this.runtimeCtx.skills.get(candidate.name, lookup)
-      signal?.throwIfAborted()
-      this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-      if (definition === undefined) throw new Error(`skill "${candidate.name}" is no longer available`)
-      if (definition.source !== candidate.summary.source || definition.provider !== candidate.summary.provider) {
-        throw new Error(`skill candidate "${candidate.name}" expired because its provider changed; search again`)
-      }
-      if (!isModelInvocable(definition)) throw new Error(`skill "${candidate.name}" is no longer model-invocable`)
-      const raced = state.active.get(definition.name)
-      if (raced !== undefined) return raced
-      this.assertCapacity(state, definition.name)
-      this.assertCatalogBudget(state, definition)
-      const mounted: MountedSkill = {
-        candidateId: candidate.id,
-        name: candidate.name,
-        origin: 'registry',
-        source: definition.source,
-        selection: candidate.selection ?? 'manual',
-        score: candidate.score,
-        ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
-        ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
-        definition,
-      }
-      state.active.set(candidate.name, mounted)
-      this.rememberRouting(state, mounted)
-      this.trackUsage(this.usage?.recordMount(usageIdentity(mounted)))
-      return mounted
-    }
-
-    const releaseLease = await this.acquireCacheLease()
-    const cacheSignal = releaseLease.signal === undefined
-      ? signal
-      : signal === undefined
-        ? releaseLease.signal
-        : AbortSignal.any([signal, releaseLease.signal])
-    try {
-      let entry: CacheEntry
-      if (candidate.origin === 'cache') {
-        const cached = await this.cache.get(candidate.cacheId)
-        cacheSignal?.throwIfAborted()
-        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-        if (cached === undefined) throw new Error(`cache entry "${candidate.cacheId}" no longer exists`)
-        const currentCachedCandidate = cacheCandidates([cached])[0]
-        if (currentCachedCandidate === undefined) throw new Error(`cache entry "${candidate.cacheId}" is invalid`)
-        const currentGovernanceReason = candidateGovernanceReason(currentCachedCandidate, this.config)
-        if (currentGovernanceReason !== undefined) {
-          throw new Error(`SkillFlux mount denied: ${currentGovernanceReason}`)
-        }
-        entry = cached
-      } else {
-        entry = await this.cache.install(candidate, cacheSignal)
-        cacheSignal?.throwIfAborted()
-        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-      }
-      const definition = await this.cache.load(entry, cacheSignal)
-      cacheSignal?.throwIfAborted()
-      this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-      if (!isModelInvocable(definition)) throw new Error(`skill "${definition.name}" is not model-invocable`)
-      const raced = state.active.get(definition.name)
-      if (raced !== undefined) {
-        await releaseLease()
-        cacheSignal?.throwIfAborted()
-        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-        if (state.active.get(raced.name) !== raced) throw new ExpiredAgentStateError()
-        return raced
-      }
-      this.assertCapacity(state, definition.name)
-      this.assertCatalogBudget(state, definition)
-      this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-      const releaseActiveLease = await this.cache.createActiveLease(entry.manifest.cacheId)
-      try {
-        cacheSignal?.throwIfAborted()
-        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-      } catch (error: unknown) {
-        await this.trackActiveLeaseCleanup(releaseActiveLease)
-        throw error
-      }
-      let dispose: () => void
-      try {
-        dispose = state.agent.ctx.skills.register({
-          name: definition.name,
-          description: definition.description,
-          ...(definition.whenToUse === undefined ? {} : { whenToUse: definition.whenToUse }),
-          invocation: definition.invocation,
-          source: 'runtime',
-          provider: 'skillflux-cache',
-          ...(definition.resourceBase === undefined ? {} : { resourceBase: definition.resourceBase }),
-          ...(definition.path === undefined ? {} : { path: definition.path }),
-          ...(definition.metadata === undefined ? {} : { metadata: definition.metadata }),
-          content: definition.content,
-        })
-      } catch (error: unknown) {
-        await this.trackActiveLeaseCleanup(releaseActiveLease)
-        throw error
-      }
-      let activeCleanupTask: Promise<void> | undefined
-      let runtimeDisposed = false
-      const disposeMounted = () => {
-        if (runtimeDisposed) return
-        runtimeDisposed = true
-        try {
-          dispose()
-        } finally {
-          activeCleanupTask = this.trackActiveLeaseCleanup(releaseActiveLease)
-        }
-      }
-      state.disposers.set(definition.name, disposeMounted)
-      const mounted: MountedSkill = {
-        candidateId: candidate.id,
-        name: definition.name,
-        origin: candidate.origin,
-        source: candidate.source,
-        cacheId: entry.manifest.cacheId,
-        selection: candidate.selection ?? 'manual',
-        score: candidate.score,
-        ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
-        ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
-        definition,
-      }
-      state.active.set(definition.name, mounted)
-      try {
-        await releaseLease()
-        cacheSignal?.throwIfAborted()
-        this.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
-        if (state.active.get(mounted.name) !== mounted) throw new ExpiredAgentStateError()
-      } catch (error: unknown) {
-        if (state.active.get(mounted.name) === mounted) {
-          state.active.delete(mounted.name)
-          if (state.disposers.get(mounted.name) === disposeMounted) state.disposers.delete(mounted.name)
-          try {
-            disposeMounted()
-          } catch (disposeError: unknown) {
-            this.runtimeCtx.logger.warn(`SkillFlux cancelled mount rollback failed: ${errorMessage(disposeError)}`)
-          }
-          if (activeCleanupTask !== undefined) await activeCleanupTask
-        }
-        throw error
-      }
-      this.rememberRouting(state, mounted)
-      this.trackUsage(this.usage?.recordMount(usageIdentity(mounted)))
-      if (candidate.origin === 'remote') {
-        this.cachePruneSessions.add(state.agent.session)
-        this.scheduleAutoPrune()
-        if (this.config.approvalPolicy === 'session') {
-          let trusted = this.trustedBySession.get(state.agent.session)
-          if (trusted === undefined) {
-            trusted = new Set()
-            this.trustedBySession.set(state.agent.session, trusted)
-          }
-          trusted.add(candidate.source)
-        }
-      }
-      return mounted
-    } finally {
-      await releaseLease()
-    }
+    return await activateCandidate(this.activationHost, state, candidate, signal, expectedGeneration, expectedMountEpoch)
   }
 
   private assertCapacity(state: AgentState, name: string): void {
@@ -1532,127 +1281,36 @@ export class SkillFluxService extends Service {
     ) <= this.config.catalogTokenBudget
   }
 
-  private async selectLocalCandidates(
-    query: string,
-    candidates: readonly SkillFluxCandidate[],
-    limit: number,
-    semanticTrigger: number,
-    signal?: AbortSignal,
-  ): Promise<SkillFluxCandidate[]> {
-    if (limit <= 0 || candidates.length === 0) return []
-    let boosts: ReadonlyMap<string, number> | undefined
-    if (this.config.adaptiveRouting && this.usage !== undefined) {
-      try {
-        boosts = await this.usage.boosts(candidates, {
-          maxBoost: this.config.adaptiveMaxBoost,
-          minUses: this.config.adaptiveMinUses,
-          halfLifeDays: this.config.adaptiveHalfLifeDays,
-        })
-        signal?.throwIfAborted()
-      } catch (error: unknown) {
-        signal?.throwIfAborted()
-        this.runtimeCtx.logger.warn(`SkillFlux adaptive routing failed open: ${errorMessage(error)}`)
-      }
-    }
-    const lexical = selectCandidates(query, candidates, {
-      limit,
-      minScore: this.config.minRouteScore,
-      routes: this.config.routes,
-      ...(boosts === undefined ? {} : { boosts }),
-    })
-    if (this.embedding === undefined || lexical.length >= semanticTrigger || lexical.length >= limit) return lexical
-    const selectedNames = new Set(lexical.map(candidate => candidate.name))
-    const remaining = candidates.filter(candidate => !selectedNames.has(candidate.name))
-    try {
-      const semantic = await this.embedding.rank(query, remaining, limit - lexical.length, signal)
-      signal?.throwIfAborted()
-      return [...lexical, ...semantic]
-    } catch (error: unknown) {
-      signal?.throwIfAborted()
-      this.runtimeCtx.logger.warn(`SkillFlux embedding routing failed open: ${errorMessage(error)}`)
-      return lexical
-    }
-  }
-
   private assertStateCurrent(state: AgentState, generation: number): void {
-    if (state.generation !== generation || this.stateByAgent.get(state.agent) !== state) {
-      throw new ExpiredAgentStateError()
-    }
+    this.turnStates.assertStateCurrent(state, generation)
   }
 
   private assertMountCurrent(state: AgentState, generation: number, name: string, mountEpoch: number): void {
-    this.assertStateCurrent(state, generation)
-    if ((state.mountEpochs.get(name) ?? 0) !== mountEpoch) throw new ExpiredAgentStateError()
+    this.turnStates.assertMountCurrent(state, generation, name, mountEpoch)
   }
 
   private beginTurn(agent: Agent, turn: number): AgentState {
-    const state = this.state(agent)
-    if (state.turn !== turn) {
-      this.cleanupState(state, false)
-      state.turn = turn
-      state.candidates.clear()
-      state.lastRouting = []
-    }
-    return state
+    return this.turnStates.beginTurn(agent, turn)
   }
 
   private state(agent: Agent): AgentState {
-    let state = this.stateByAgent.get(agent)
-    if (state === undefined) {
-      state = {
-        agent,
-        generation: 0,
-        mountEpochs: new Map(),
-        active: new Map(),
-        disposers: new Map(),
-        candidates: new Map(),
-        lastRouting: [],
-      }
-      this.stateByAgent.set(agent, state)
-      this.states.add(state)
-    }
-    return state
+    return this.turnStates.state(agent)
   }
 
   private cleanupState(state: AgentState, forget: boolean): void {
-    state.generation += 1
-    for (const dispose of [...state.disposers.values()].reverse()) {
-      try { dispose() } catch (error: unknown) {
-        this.runtimeCtx.logger.warn(`SkillFlux unmount failed: ${errorMessage(error)}`)
-      }
-    }
-    state.disposers.clear()
-    state.active.clear()
-    state.mountEpochs.clear()
-    if (forget) {
-      state.candidates.clear()
-      this.states.delete(state)
-      this.stateByAgent.delete(state.agent)
-    }
+    this.turnStates.cleanupState(state, forget)
   }
 
   private rememberRouting(state: AgentState, mounted: MountedSkill): void {
-    const trace: RoutingTrace = {
-      ...(state.turn === undefined ? {} : { turn: state.turn }),
-      candidateId: mounted.candidateId,
-      name: mounted.name,
-      origin: mounted.origin,
-      source: mounted.source,
-      selection: mounted.selection,
-      outcome: 'mounted',
-      score: mounted.score,
-      ...(mounted.baseScore === undefined ? {} : { baseScore: mounted.baseScore }),
-      ...(mounted.adaptiveBoost === undefined ? {} : { adaptiveBoost: mounted.adaptiveBoost }),
-    }
-    const index = state.lastRouting.findIndex(item => item.candidateId === trace.candidateId)
-    if (index === -1) state.lastRouting.push(trace)
-    else state.lastRouting[index] = trace
+    this.turnStates.rememberRouting(state, mounted)
   }
 
   private markRoutingOutcome(state: AgentState, candidateId: string, outcome: RoutingTrace['outcome']): void {
-    const index = state.lastRouting.findIndex(item => item.candidateId === candidateId)
-    const trace = state.lastRouting[index]
-    if (index !== -1 && trace !== undefined) state.lastRouting[index] = { ...trace, outcome }
+    this.turnStates.markRoutingOutcome(state, candidateId, outcome)
+  }
+
+  private candidate(agent: Agent, candidateId: string): SkillFluxCandidate | undefined {
+    return this.turnStates.candidate(agent, candidateId)
   }
 
   private trackUsage(operation: Promise<void> | undefined): void {
@@ -1667,11 +1325,7 @@ export class SkillFluxService extends Service {
   }
 
   private activeCacheIds(): Set<string> {
-    const activeIds = new Set<string>()
-    for (const state of this.states) {
-      for (const item of state.active.values()) if (item.cacheId !== undefined) activeIds.add(item.cacheId)
-    }
-    return activeIds
+    return this.turnStates.activeCacheIds()
   }
 
   private async acquireCacheLease(): Promise<CacheProcessLockRelease> {
@@ -1841,29 +1495,19 @@ export class SkillFluxService extends Service {
   }
 
   private cleanupSession(session: Session): void {
-    for (const state of this.states) {
-      if (state.agent.session !== session) continue
-      this.cleanupState(state, false)
-      state.candidates.clear()
-    }
+    this.turnStates.cleanupSession(session)
+    this.scheduleSessionCachePrune(session)
   }
 
   private disposeSession(session: Session): void {
-    for (const state of this.states) {
-      if (state.agent.session === session) this.cleanupState(state, true)
-    }
+    this.turnStates.disposeSession(session)
     this.trustedBySession.delete(session)
     this.scheduleSessionCachePrune(session)
   }
 
   private disposeAgent(agent: Agent): void {
-    const state = this.stateByAgent.get(agent)
-    const session = state?.agent.session
-    if (state !== undefined) this.cleanupState(state, true)
-    this.stateByAgent.delete(agent)
-    if (session !== undefined && ![...this.states].some(item => item.agent.session === session)) {
-      this.scheduleSessionCachePrune(session)
-    }
+    const session = this.turnStates.disposeAgent(agent)
+    if (session !== undefined) this.scheduleSessionCachePrune(session)
   }
 
   private scheduleSessionCachePrune(session: Session): void {
@@ -1871,23 +1515,6 @@ export class SkillFluxService extends Service {
     this.cachePruneSessions.delete(session)
     this.scheduleAutoPrune()
   }
-}
-
-function dedupeById(candidates: readonly SkillFluxCandidate[]): SkillFluxCandidate[] {
-  return [...new Map(candidates.map(candidate => [candidate.id, candidate])).values()]
-}
-
-function dedupeByName(candidates: readonly SkillFluxCandidate[]): SkillFluxCandidate[] {
-  const unique = new Map<string, SkillFluxCandidate>()
-  for (const candidate of candidates) if (!unique.has(candidate.name)) unique.set(candidate.name, candidate)
-  return [...unique.values()]
-}
-
-function automaticDiscoveryQuery(task: string): string {
-  return [...tokenize(task)]
-    .filter(token => token.length >= 2 && token.length <= 32 && !/^(?:sk|key|token)-?[a-z0-9]{12,}$/u.test(token))
-    .slice(0, 12)
-    .join(' ')
 }
 
 function routingTrace(candidate: SkillFluxCandidate, turn?: number): RoutingTrace {
@@ -1902,16 +1529,6 @@ function routingTrace(candidate: SkillFluxCandidate, turn?: number): RoutingTrac
     score: candidate.score,
     ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
     ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
-  }
-}
-
-function usageIdentity(mounted: MountedSkill): SkillUsageIdentity {
-  return {
-    candidateId: mounted.candidateId,
-    name: mounted.name,
-    origin: mounted.origin,
-    source: mounted.source,
-    ...(mounted.cacheId === undefined ? {} : { cacheId: mounted.cacheId }),
   }
 }
 
