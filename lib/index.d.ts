@@ -630,11 +630,14 @@ declare class SkillFluxService extends Service {
   private cacheMaintenanceQueue;
   private autoPruneTask;
   private autoPruneRequested;
-  private readonly stateByAgent;
-  private readonly states;
+  private readonly turnStates;
+  private readonly discovery;
   private readonly trustedBySession;
   private readonly cachePruneSessions;
   constructor(ctx: Context, config?: SkillFluxConfig);
+  private get discoveryHost();
+  private get activationHost();
+  private get approvalHost();
   discover(agent: Agent, query: string, options?: {
     readonly remote?: boolean;
     readonly signal?: AbortSignal;
@@ -659,7 +662,6 @@ declare class SkillFluxService extends Service {
   private createSkillTool;
   private createSearchTool;
   private createMountTool;
-  private registerApprovalGate;
   private registerExplicitInvocation;
   private registerCommand;
   private executeCommand;
@@ -668,7 +670,6 @@ declare class SkillFluxService extends Service {
   private assertCapacity;
   private assertCatalogBudget;
   private catalogFitsBudget;
-  private selectLocalCandidates;
   private assertStateCurrent;
   private assertMountCurrent;
   private beginTurn;
@@ -676,6 +677,7 @@ declare class SkillFluxService extends Service {
   private cleanupState;
   private rememberRouting;
   private markRoutingOutcome;
+  private candidate;
   private trackUsage;
   private activeCacheIds;
   private acquireCacheLease;
