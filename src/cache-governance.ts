@@ -11,6 +11,8 @@ export interface CacheUsageEvidence {
   readonly uses: number
   readonly lastMountedAt?: number
   readonly lastUsedAt?: number
+  /** Sum of recorded loaded-body token estimates for this cache version. */
+  readonly totalLoadedBodyTokens?: number
 }
 
 export interface CachePrunePolicy {
@@ -39,6 +41,7 @@ interface RankedEntry {
   readonly mounts: number
   readonly uses: number
   readonly lastActivityAt: number
+  readonly totalLoadedBodyTokens: number
 }
 
 function evidenceKey(source: string, name: string): string {
@@ -69,7 +72,8 @@ function validateEvidence(item: CacheUsageEvidence): void {
     || !validCount(item.mounts) || !validCount(item.uses)
     || (item.cacheId !== undefined && !/^[0-9a-f]{24}$/u.test(item.cacheId))
     || (item.lastMountedAt !== undefined && !validCount(item.lastMountedAt))
-    || (item.lastUsedAt !== undefined && !validCount(item.lastUsedAt))) {
+    || (item.lastUsedAt !== undefined && !validCount(item.lastUsedAt))
+    || (item.totalLoadedBodyTokens !== undefined && !validCount(item.totalLoadedBodyTokens))) {
     throw new Error('invalid cache usage evidence')
   }
 }
@@ -90,6 +94,9 @@ function mergeEvidence(
     uses: safeSum(previous.uses, item.uses),
     ...(lastMountedAt === 0 ? {} : { lastMountedAt }),
     ...(lastUsedAt === 0 ? {} : { lastUsedAt }),
+    ...(item.totalLoadedBodyTokens === undefined && previous.totalLoadedBodyTokens === undefined
+      ? {}
+      : { totalLoadedBodyTokens: safeSum(previous.totalLoadedBodyTokens ?? 0, item.totalLoadedBodyTokens ?? 0) }),
   }
 }
 
@@ -116,6 +123,12 @@ function evictionOrder(left: RankedEntry, right: RankedEntry): number {
   }
   if ((left.entry.manifest.installs ?? 0) !== (right.entry.manifest.installs ?? 0)) {
     return (left.entry.manifest.installs ?? 0) - (right.entry.manifest.installs ?? 0)
+  }
+  // Deterministic value-governance tie-break: among otherwise equal entries,
+  // the higher token-cost version is evicted first. Absent evidence, zero
+  // keeps the historical ordering intact.
+  if (left.totalLoadedBodyTokens !== right.totalLoadedBodyTokens) {
+    return right.totalLoadedBodyTokens - left.totalLoadedBodyTokens
   }
   return left.entry.manifest.cacheId.localeCompare(right.entry.manifest.cacheId, 'en')
 }
@@ -173,6 +186,7 @@ export function planCachePrune(
       mounts: item?.mounts ?? 0,
       uses: item?.uses ?? 0,
       lastActivityAt: Math.min(now, Math.max(installedAt, item?.lastMountedAt ?? 0, item?.lastUsedAt ?? 0)),
+      totalLoadedBodyTokens: item?.totalLoadedBodyTokens ?? 0,
     }
   })
   const protectedEntries = ranked.filter(item => active.has(item.entry.manifest.cacheId))

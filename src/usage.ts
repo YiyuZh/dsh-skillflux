@@ -217,6 +217,9 @@ export class UsageStore {
       uses: record.uses,
       ...(record.lastMountedAt === undefined ? {} : { lastMountedAt: record.lastMountedAt }),
       ...(record.lastUsedAt === undefined ? {} : { lastUsedAt: record.lastUsedAt }),
+      ...(record.totalLoadedBodyTokens === undefined
+        ? {}
+        : { totalLoadedBodyTokens: record.totalLoadedBodyTokens }),
     }))
   }
 
