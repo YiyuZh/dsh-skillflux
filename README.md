@@ -105,6 +105,9 @@ deleting cached files or text already stored in session history.
 - Discover candidates from the DSH Registry, the SkillFlux cache,
   [skills.sh](https://skills.sh/), and authenticated GitHub `SKILL.md` code
   search.
+- Serve skills published over the MCP Skills extension (`io.modelcontextprotocol/skills`):
+  a transport-agnostic client lists, validates, and content-binds skills from
+  any registered MCP source under the same approval and trust boundaries.
 - Re-rank remote matches by task relevance, marketplace adoption, repository
   activity, stars, forks, license metadata, content provenance, and configured
   owner policy. Every result carries an explainable evidence level and warnings.
@@ -119,6 +122,8 @@ deleting cached files or text already stored in session history.
 - Track per-source health with consecutive-failure cooldowns so a failing
   provider is skipped instead of retried every turn, and keep last-good
   catalogs through non-authoritative observations when discovery degrades.
+- Record per-skill catalog-footprint and loaded-body token telemetry with a
+  graceful fallback when the host token-meter service is absent.
 - Automatically prune idle and low-value installed Skill cache entries while
   protecting active and in-flight mounts.
 - Support per-remote-mount, per-repository/session, and automatic approval
@@ -690,6 +695,24 @@ carries over unchanged; the differences are behavioral:
 - The official DSH `tool-skill` consumer is disabled by the bundle patch in
   favor of SkillFlux's filtered catalog.
 
+## Migrating from v0.3
+
+v0.4 adds two optional subsystems. Existing configuration and behavior carry
+over unchanged:
+
+- MCP Skills sources. Call `ctx.skillFlux.registerMcpSource(label, client)`
+  with a transport-agnostic `McpSkillsClient` to serve skills published over
+  the MCP Skills extension. Entries are validated, content-bound by their
+  `[uri, digest, size]` set, and gated by the same approval and trust policy
+  as remote candidates. New configuration keys: `mcpDiscovery`,
+  `mcpTrustedServers`, `mcpBlockedServers`. Stdio/SSE transports are still
+  consumer-provided.
+- Token telemetry. When the host mounts the DSH token-meter service, usage
+  records gain per-skill catalog-footprint and loaded-body token counts plus
+  the estimator marker, surfaced by `/skillflux status` and
+  `/skillflux usage`. Existing usage documents load unchanged; only token
+  counts are stored.
+
 ## Known limitations
 
 - Hybrid quality depends on the configured embedding model. SkillFlux does not
@@ -717,6 +740,14 @@ carries over unchanged; the differences are behavioral:
 - A new upstream commit creates a new immutable cache entry. Value-aware
   governance may retain multiple versions until they become idle or exceed a
   configured limit.
+
+## Deferred and out of scope
+
+- LLM Router: no meaningful community traction in the last 30 days; not worth
+  the added dependency surface yet.
+- GUI marketplace: discovery stays provider and tool driven; no bundled UI.
+- Heavy malware scanning: SkillFlux keeps evidence-based trust and content
+  verification, but it is not a code security scanner.
 
 ## Development
 
