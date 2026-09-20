@@ -90,7 +90,7 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
   身份验证的 GitHub `SKILL.md` Code Search 发现候选。
 - 承载通过 MCP Skills 扩展（`io.modelcontextprotocol/skills`）发布的技能：
   与传输无关的客户端为任意已注册 MCP 来源执行列表、校验与内容绑定，并沿用
-  相同的审批与信任边界。
+  相同的审批与信任边界；随包提供零依赖 stdio 传输与一致性冒烟。
 - 根据任务相关性、市场安装量、仓库活跃度、stars、forks、license、内容来源及
   owner 策略重新排序，并为每个结果输出可解释的证据等级和告警。
 - 将远程候选固定到不可变的 GitHub commit SHA。
@@ -101,7 +101,10 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 - 跟踪各来源健康状态：连续失败进入冷却期并自动跳过，降级发现发布非权威观测
   以保留 last-good 目录。
 - 记录每个 Skill 的目录占用与加载正文 token 遥测，宿主 token-meter 服务缺失
-  时优雅降级为可移植估算。
+  时优雅降级为可移植估算；累计 token 总量作为已安装缓存裁剪的确定性 tie-break。
+- 摄入实验性的联邦生态索引，其咨询性的
+  `official | verified | community | unreviewed` 层级只作为证据出现，绝不
+  授予信任。
 - 通过当前 Agent 的 `ctx.skills` scope 注册缓存 Skill。
 - 每次加载前使用 SHA-256 manifest 校验缓存内容。
 - 自动清理闲置和低价值的已安装 Skill 缓存，同时保护活动挂载和正在加载的条目。
@@ -572,7 +575,8 @@ corepack pnpm eval
 测评包含 40 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
 场景、7 个目录预算场景、8 个远程质量两两对比场景、8 个远程证据治理场景、
 7 个远程缓存策略场景、8 个惰性远程回退场景、7 个已安装缓存治理场景和
-7 个 Provider 原生惰性运行时场景、12 个 MCP 来源条目契约场景，
+7 个 Provider 原生惰性运行时场景、12 个 MCP 来源条目契约场景、
+10 个注册表来源条目契约场景，
 覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、
 语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期、价值淘汰、
 活动挂载保护、惰性下载、审批、并发隔离、取消传播与负例拒绝。
@@ -591,6 +595,7 @@ corepack pnpm eval
 | 远程缓存策略边界正确率 | 100.0% |
 | 已安装缓存治理边界正确率 | 100.0% |
 | MCP 来源条目契约正确率 | 100.0% |
+| 注册表来源条目契约正确率 | 100.0% |
 
 这些结果验证确定性 Router 和向量排序契约。语义向量是合成数据，不代表某个
 embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测评格式和限制见
@@ -627,6 +632,22 @@ v0.4 新增两个可选子系统，现有配置与行为全部保持兼容：
 - Token 遥测。宿主挂载 DSH token-meter 服务后，使用统计会新增每个 Skill 的
   目录占用与加载正文 token 计数以及估算器标记，并显示在 `/skillflux status`
   与 `/skillflux usage` 中。旧的 usage 文档可直接加载；只存储 token 计数。
+
+## 从 v0.4 迁移
+
+v0.5 新增三项可选能力，无破坏性变更，也未引入新的运行时依赖：
+
+- 随包 stdio MCP 传输。`McpStdioTransport` 通过 LSP 风格帧 JSON-RPC 与子进程
+  MCP 服务器通信，可像其他传输一样注册；SSE/HTTP 传输仍由接入方提供。
+  `pnpm test:mcp-live` 会运行随包一致性冒烟，包含篡改 digest 的 fail-closed
+  场景。
+- 联邦注册表索引（实验性）。`registryDiscovery: automatic` 开启后，
+  `registerRegistryIndex(label, transport)` 会把固定版本的条目送入同一条
+  远程管线。咨询性的 `official | verified | community | unreviewed` 层级只是
+  证据，不会改变信任或审批边界。
+- Token 价值治理。累计正文 token 加入缓存裁剪证据：在最近使用、次数和挂载
+  次数相同的版本之间，优先淘汰 token 成本更高的版本；缺少证据时保持历史顺序
+  不变。
 
 ## 已知限制
 
