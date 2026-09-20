@@ -76,27 +76,33 @@ try {
     () => Promise.resolve({ kind: 'enter', messages }),
   )
   assert.equal(decision.kind, 'enter')
+  assert.equal(context.skillFlux.mounted(agent).length, 0, 'lazy discovery must not mount candidates')
+  const catalog = decision.kind === 'enter'
+    ? decision.messages.find(message => message.source.kind === 'skill-catalog')
+    : undefined
+  assert(catalog !== undefined, 'lazy discovery did not publish a skill catalog')
+  const names = catalog.source.entries.map(entry => entry.name)
+  assert(names.length >= 1, 'lazy discovery published no usable candidates')
+  const name = names[0]
+  // The body downloads and loads lazily through the skill tool.
+  const result = await context.tools.execute({
+    callId: CallId('runtime-smoke-read-skill'), name: 'skill', arguments: { name }, agent, signal,
+  })
+  assert(result.isError === false, `skill tool failed: ${result.error?.message}`)
+  assert(JSON.stringify(result).includes(name), 'skill tool did not deliver lazy instructions')
   const traces = context.skillFlux.lastRouting(agent)
   console.log(JSON.stringify({ task, injectedFailures, installationFailures, elapsedMs: Date.now() - startedAt, traces }, null, 2))
-  const mounted = context.skillFlux.mounted(agent)
-  assert.equal(mounted.length, 1, 'live candidates did not yield one installable Skill; see traces/provider errors')
   if (failFirst) {
     assert.equal(injectedFailures, 1)
     assert.equal(traces[0]?.outcome, 'mount-failed')
-    assert.equal(traces.at(-1)?.outcome, 'mounted')
+    assert.equal(traces.at(-1)?.outcome, 'loaded')
   }
-  const result = await context.tools.execute({
-    callId: CallId('runtime-smoke-read-skill'), name: 'skill', arguments: { name: mounted[0].name }, agent, signal,
-  })
-  assert(mounted[0].definition.content.length > 0)
-  const encodedInstructions = JSON.stringify(mounted[0].definition.content).slice(1, -1)
-  assert(JSON.stringify(result).includes(encodedInstructions), 'skill tool did not deliver mounted instructions')
   context.emit(scopeTarget(session, undefined), 'session/event', session, {
     type: 'turn/end', seq: 1, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } },
   })
   assert.equal(context.skillFlux.mounted(agent).length, 0)
   assert.equal((await context.skills.snapshot({ scope: agent })).skills.length, 0)
-  console.log(JSON.stringify({ source: mounted[0].source, skill: mounted[0].name, instructionsDelivered: true, unmounted: true }))
+  console.log(JSON.stringify({ skill: name, instructionsDelivered: true, released: true }))
 } finally {
   try {
     for (const dispose of disposers.reverse()) await dispose()
