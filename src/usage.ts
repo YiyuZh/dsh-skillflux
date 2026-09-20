@@ -46,7 +46,7 @@ function validRecord(value: unknown): value is SkillUsageRecord {
   const item = value as Record<string, unknown>
   return boundedString(item.candidateId, 512)
     && boundedString(item.name, 128)
-    && (item.origin === 'registry' || item.origin === 'cache' || item.origin === 'remote')
+    && (item.origin === 'registry' || item.origin === 'cache' || item.origin === 'remote' || item.origin === 'mcp')
     && boundedString(item.source, 2_048)
     && (item.cacheId === undefined || (typeof item.cacheId === 'string' && CACHE_ID.test(item.cacheId)))
     && count(item.mounts)

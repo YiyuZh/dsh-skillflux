@@ -307,4 +307,27 @@ describe('SkillFlux MCP source integration', () => {
     const blocked = await blockedRestart.skillFlux.discover(fakeAgent(blockedRestart), 'refunds')
     expect(blocked.some(candidate => candidate.origin === 'mcp')).toBe(false)
   })
+
+  it('persists bounded usage metadata for MCP mounts', async () => {
+    const context = await setup({ usageTracking: true })
+    const transport = new FakeMcpServerTransport(
+      [validRefundsEntry()],
+      { 'skill://refunds/SKILL.md': SKILL_CONTENT },
+    )
+    context.skillFlux.registerMcpSource('docs-server', new McpSkillsClient(transport))
+    const agent = fakeAgent(context)
+    const candidates = await context.skillFlux.discover(agent, 'refunds')
+    const mcp = candidates.find((candidate): candidate is McpCandidate => candidate.origin === 'mcp')!
+    const internals = context.skillFlux as unknown as {
+      state: (target: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+    }
+    internals.state(agent).candidates.set(mcp.id, mcp)
+    await context.skillFlux.mount(agent, mcp.id)
+    expect(await context.skillFlux.usageRecords()).toMatchObject([{
+      name: 'refunds',
+      origin: 'mcp',
+      source: 'docs-server',
+      mounts: 1,
+    }])
+  })
 })
