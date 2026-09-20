@@ -424,13 +424,30 @@ Records are stored atomically in
 The file also has a hard 2 MiB limit; least-recently-useful records are evicted
 first when either bound is reached.
 SkillFlux stores only the candidate ID, Skill name, origin, source, counters,
-and timestamps. It does not store task text, Skill instructions, or resources.
+token counts, and timestamps. It does not store task text, Skill instructions,
+or resources.
 
 The boost is capped by `adaptiveMaxBoost`, requires at least
 `adaptiveMinUses` successful loads, and halves after
 `adaptiveHalfLifeDays` without use. A telemetry read or write failure falls
 open to normal routing. Set `usageTracking: false` to disable persistence; in
 that case `adaptiveRouting` must also remain false.
+
+### Token telemetry
+
+When the host mounts the DSH token-meter service, SkillFlux prices the catalog
+entry lines and each loaded SKILL.md body with the native estimator. When the
+service is absent, it falls back to the same portable estimate the catalog
+budget uses (`ceil(UTF-8 bytes / 3)`). No package dependency is added for this:
+the optional `ctx.tokenMeter` service is resolved at runtime and any failure
+degrades silently to the portable estimate.
+
+Per-skill token counts are appended to the usage records and shown by
+`/skillflux status` and `/skillflux usage`: the catalog footprint at the last
+mount, the loaded-body tokens at the last load, and their running total, plus
+which estimator produced them. Only token counts are persisted; task text,
+Skill instructions, and resources never reach `usage.json`. Token telemetry is
+observability only and never changes routing, approval, or pruning decisions.
 
 ### Catalog context budget
 

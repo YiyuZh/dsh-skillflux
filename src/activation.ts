@@ -34,6 +34,7 @@ export interface ActivationHost {
   assertCatalogBudget(state: AgentState, skill: Pick<SkillDefinition, 'name' | 'description'>): void
   assertMountCurrent(state: AgentState, generation: number, name: string, mountEpoch: number): void
   rememberRouting(state: AgentState, mounted: MountedSkill): void
+  recordMountTelemetry(state: AgentState, mounted: MountedSkill): void
   scheduleAutoPrune(): void
 }
 
@@ -91,6 +92,7 @@ export async function activateCandidate(
     state.active.set(candidate.name, mounted)
     host.rememberRouting(state, mounted)
     host.trackUsage(host.usage?.recordMount(usageIdentity(mounted)))
+    host.recordMountTelemetry(state, mounted)
     return mounted
   }
 
@@ -213,6 +215,7 @@ export async function activateCandidate(
     }
     host.rememberRouting(state, mounted)
     host.trackUsage(host.usage?.recordMount(usageIdentity(mounted)))
+    host.recordMountTelemetry(state, mounted)
     if (candidate.origin === 'remote' || candidate.origin === 'mcp') {
       host.cachePruneSessions.add(state.agent.session)
       host.scheduleAutoPrune()

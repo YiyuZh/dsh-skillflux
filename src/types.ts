@@ -26,6 +26,7 @@ export type RouterMode = 'lexical' | 'hybrid'
 export type EmbeddingProvider = 'ollama' | 'openai-compatible'
 export type McpDiscovery = 'automatic' | 'off'
 export type CandidateSelection = 'rule' | 'lexical' | 'embedding' | 'remote-quality' | 'manual'
+export type TokenEstimatorKind = 'token-meter' | 'portable'
 
 export interface RouteRule {
   matchAll?: string[]
@@ -333,6 +334,15 @@ export interface SkillUsageRecord extends SkillUsageIdentity {
   readonly uses: number
   readonly lastMountedAt?: number
   readonly lastUsedAt?: number
+  /** Estimated catalog footprint tokens at the most recent mount. */
+  readonly catalogFootprintTokens?: number
+  /** Estimated tokens of the SKILL.md body at the most recent load. */
+  readonly loadedBodyTokens?: number
+  /** Sum of every recorded loaded-body estimate. */
+  readonly totalLoadedBodyTokens?: number
+  readonly lastLoadedAt?: number
+  /** Estimator that produced the token fields: native token-meter or portable. */
+  readonly tokenEstimator?: TokenEstimatorKind
 }
 
 export interface CacheManifest {

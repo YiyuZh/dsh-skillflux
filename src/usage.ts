@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { lock } from 'proper-lockfile'
-import type { SkillFluxCandidate, SkillUsageIdentity, SkillUsageRecord } from './types.js'
+import type {
+  SkillFluxCandidate,
+  SkillUsageIdentity,
+  SkillUsageRecord,
+  TokenEstimatorKind,
+} from './types.js'
 import type { CacheUsageEvidence } from './cache-governance.js'
 
 const USAGE_VERSION = 1
@@ -29,6 +34,12 @@ export interface AdaptiveUsageOptions {
   readonly halfLifeDays: number
 }
 
+export interface SkillUsageTelemetry {
+  readonly loadedBodyTokens?: number
+  readonly catalogFootprintTokens?: number
+  readonly estimator?: TokenEstimatorKind
+}
+
 function boundedString(value: unknown, maximum: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= maximum
 }
@@ -53,6 +64,13 @@ function validRecord(value: unknown): value is SkillUsageRecord {
     && count(item.uses)
     && timestamp(item.lastMountedAt)
     && timestamp(item.lastUsedAt)
+    && (item.catalogFootprintTokens === undefined || count(item.catalogFootprintTokens))
+    && (item.loadedBodyTokens === undefined || count(item.loadedBodyTokens))
+    && (item.totalLoadedBodyTokens === undefined || count(item.totalLoadedBodyTokens))
+    && timestamp(item.lastLoadedAt)
+    && (item.tokenEstimator === undefined
+      || item.tokenEstimator === 'token-meter'
+      || item.tokenEstimator === 'portable')
 }
 
 function validDocument(value: unknown): value is UsageDocument {
@@ -124,6 +142,57 @@ export class UsageStore {
         uses: increment(previous.uses),
         ...(previous.lastMountedAt === undefined ? {} : { lastMountedAt: previous.lastMountedAt }),
         lastUsedAt: this.currentTime(),
+      })
+    })
+  }
+
+  /**
+   * Merge bounded token telemetry into a usage record. Only token counts are
+   * stored; skill bodies and task text never reach the usage document.
+   */
+  async recordTelemetry(identity: SkillUsageIdentity, telemetry: SkillUsageTelemetry): Promise<void> {
+    const loadedBodyTokens = telemetry.loadedBodyTokens
+    if (loadedBodyTokens !== undefined && !count(loadedBodyTokens)) {
+      throw new Error('invalid loaded body token estimate')
+    }
+    const catalogFootprintTokens = telemetry.catalogFootprintTokens
+    if (catalogFootprintTokens !== undefined && !count(catalogFootprintTokens)) {
+      throw new Error('invalid catalog footprint token estimate')
+    }
+    if (telemetry.estimator !== undefined
+      && telemetry.estimator !== 'token-meter'
+      && telemetry.estimator !== 'portable') {
+      throw new Error('invalid token estimator kind')
+    }
+    await this.enqueue(async records => {
+      const previous = records.get(identity.candidateId) ?? identityRecord(identity)
+      records.set(identity.candidateId, {
+        ...identityRecord(identity),
+        mounts: previous.mounts,
+        uses: previous.uses,
+        ...(previous.lastMountedAt === undefined ? {} : { lastMountedAt: previous.lastMountedAt }),
+        ...(previous.lastUsedAt === undefined ? {} : { lastUsedAt: previous.lastUsedAt }),
+        ...(previous.catalogFootprintTokens === undefined
+          ? {}
+          : { catalogFootprintTokens: previous.catalogFootprintTokens }),
+        ...(previous.loadedBodyTokens === undefined ? {} : { loadedBodyTokens: previous.loadedBodyTokens }),
+        ...(previous.totalLoadedBodyTokens === undefined
+          ? {}
+          : { totalLoadedBodyTokens: previous.totalLoadedBodyTokens }),
+        ...(previous.lastLoadedAt === undefined ? {} : { lastLoadedAt: previous.lastLoadedAt }),
+        ...(previous.tokenEstimator === undefined ? {} : { tokenEstimator: previous.tokenEstimator }),
+        ...(loadedBodyTokens === undefined
+          ? {}
+          : {
+              loadedBodyTokens,
+              totalLoadedBodyTokens: Math.min(
+                Number.MAX_SAFE_INTEGER,
+                (previous.totalLoadedBodyTokens ?? 0) + loadedBodyTokens,
+              ),
+              lastLoadedAt: this.currentTime(),
+            }),
+        ...(catalogFootprintTokens === undefined ? {} : { catalogFootprintTokens }),
+        ...(telemetry.estimator === undefined ? {} : { tokenEstimator: telemetry.estimator }),
       })
     })
   }
