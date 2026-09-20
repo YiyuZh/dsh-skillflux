@@ -88,6 +88,9 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 - 可选使用保守的 token 估算预算限制 Skill 目录提示。
 - 从 DSH Registry、SkillFlux 缓存、[skills.sh](https://skills.sh/) 和经过
   身份验证的 GitHub `SKILL.md` Code Search 发现候选。
+- 承载通过 MCP Skills 扩展（`io.modelcontextprotocol/skills`）发布的技能：
+  与传输无关的客户端为任意已注册 MCP 来源执行列表、校验与内容绑定，并沿用
+  相同的审批与信任边界。
 - 根据任务相关性、市场安装量、仓库活跃度、stars、forks、license、内容来源及
   owner 策略重新排序，并为每个结果输出可解释的证据等级和告警。
 - 将远程候选固定到不可变的 GitHub commit SHA。
@@ -97,6 +100,8 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
   时自动联网补齐剩余槽位。
 - 跟踪各来源健康状态：连续失败进入冷却期并自动跳过，降级发现发布非权威观测
   以保留 last-good 目录。
+- 记录每个 Skill 的目录占用与加载正文 token 遥测，宿主 token-meter 服务缺失
+  时优雅降级为可移植估算。
 - 通过当前 Agent 的 `ctx.skills` scope 注册缓存 Skill。
 - 每次加载前使用 SHA-256 manifest 校验缓存内容。
 - 自动清理闲置和低价值的已安装 Skill 缓存，同时保护活动挂载和正在加载的条目。
@@ -582,6 +587,19 @@ v0.3 将 SkillFlux 变为 Provider 原生惰性运行时。大部分配置保持
 - bundle patch 会禁用官方 DSH `tool-skill` 消费者，改用 SkillFlux 自己的过滤
   目录。
 
+## 从 v0.3 迁移
+
+v0.4 新增两个可选子系统，现有配置与行为全部保持兼容：
+
+- MCP Skills 来源。调用 `ctx.skillFlux.registerMcpSource(label, client)`，
+  传入与传输无关的 `McpSkillsClient`，即可承载通过 MCP Skills 扩展发布的
+  技能。条目先通过校验，内容按其 `[uri, digest, size]` 集合绑定，并沿用与
+  远程候选相同的审批与信任策略。新增配置键：`mcpDiscovery`、
+  `mcpTrustedServers`、`mcpBlockedServers`。stdio/SSE 传输仍由接入方提供。
+- Token 遥测。宿主挂载 DSH token-meter 服务后，使用统计会新增每个 Skill 的
+  目录占用与加载正文 token 计数以及估算器标记，并显示在 `/skillflux status`
+  与 `/skillflux usage` 中。旧的 usage 文档可直接加载；只存储 token 计数。
+
 ## 已知限制
 
 - Hybrid 效果取决于配置的 embedding 模型，SkillFlux 不负责下载或管理模型。
@@ -603,6 +621,13 @@ v0.3 将 SkillFlux 变为 Provider 原生惰性运行时。大部分配置保持
 - 卸载无法删除已经写入 session history 的文本。
 - 上游出现新 commit 时会形成新的不可变缓存；价值感知治理可能保留多个版本，
   直到其闲置或超过配置限制。
+
+## 暂缓与范围外
+
+- LLM Router：最近 30 天社区无明显热度，暂不值得引入额外的依赖面。
+- GUI 市场：发现仍以 Provider 与工具驱动，不内置界面。
+- 重型恶意代码扫描：SkillFlux 保持基于证据的信任与内容校验，但并非代码
+  安全审计器。
 
 ## 开发与测试
 
