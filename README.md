@@ -107,7 +107,8 @@ deleting cached files or text already stored in session history.
   search.
 - Serve skills published over the MCP Skills extension (`io.modelcontextprotocol/skills`):
   a transport-agnostic client lists, validates, and content-binds skills from
-  any registered MCP source under the same approval and trust boundaries.
+  any registered MCP source under the same approval and trust boundaries, with
+  a bundled zero-dependency stdio transport and a checked-in conformance smoke.
 - Re-rank remote matches by task relevance, marketplace adoption, repository
   activity, stars, forks, license metadata, content provenance, and configured
   owner policy. Every result carries an explainable evidence level and warnings.
@@ -123,7 +124,11 @@ deleting cached files or text already stored in session history.
   provider is skipped instead of retried every turn, and keep last-good
   catalogs through non-authoritative observations when discovery degrades.
 - Record per-skill catalog-footprint and loaded-body token telemetry with a
-  graceful fallback when the host token-meter service is absent.
+  graceful fallback when the host token-meter service is absent; running token
+  totals act as a deterministic eviction tie-break in installed-cache pruning.
+- Ingest experimental federated ecosystem indexes, whose advisory
+  `official | verified | community | unreviewed` tiers surface as evidence
+  without ever granting trust.
 - Automatically prune idle and low-value installed Skill cache entries while
   protecting active and in-flight mounts.
 - Support per-remote-mount, per-repository/session, and automatic approval
@@ -677,7 +682,8 @@ The suite contains 40 lexical cases, 4 adaptive safety cases, 8
 provider-independent semantic-vector cases, 7 catalog-budget cases, 8
 remote-quality pairwise cases, 8 remote evidence-governance cases, 7 remote-cache
 policy cases, 8 lazy remote-fallback cases, 7 installed-cache governance cases,
-7 provider-native lazy-runtime cases, and 12 MCP source entry-contract cases
+7 provider-native lazy-runtime cases, 12 MCP source entry-contract cases, and
+10 registry source entry-contract cases
 covering English, Chinese, normalization, rules, thresholds, capacity, ranking,
 content deduplication,
 semantic top-k, context budgets, freshness, evidence policy, adoption, cache
@@ -697,6 +703,7 @@ expiry, value-aware eviction, active-mount protection, and negative rejection.
 | Remote-cache policy boundaries | 100.0% |
 | Installed-cache governance boundaries | 100.0% |
 | MCP source entry contract | 100.0% |
+| Registry source entry contract | 100.0% |
 
 These results verify the deterministic router and vector-ranking contracts
 against checked-in inputs. The semantic vectors are synthetic, so these results
@@ -744,6 +751,25 @@ over unchanged:
   the estimator marker, surfaced by `/skillflux status` and
   `/skillflux usage`. Existing usage documents load unchanged; only token
   counts are stored.
+
+## Migrating from v0.4
+
+v0.5 adds three optional capabilities with no breaking changes and no new
+runtime dependencies:
+
+- Bundled stdio MCP transport. `McpStdioTransport` speaks LSP-style framed
+  JSON-RPC to a child MCP server; register it like any other transport.
+  SSE/HTTP transports remain consumer-provided. `pnpm test:mcp-live` runs the
+  checked-in conformance smoke, including a tampered-digest fail-closed run.
+- Federated registry indexes (experimental). With `registryDiscovery:
+  automatic`, `registerRegistryIndex(label, transport)` feeds pinned entries
+  through the same remote pipeline. The advisory
+  `official | verified | community | unreviewed` tier is evidence only and
+  never changes trust or approval boundaries.
+- Token value governance. Running body-token totals join cache-pruning
+  evidence: among versions tied on recency, uses, and mounts, the higher
+  token-cost version is evicted first. Absent evidence the historical order
+  is unchanged.
 
 ## Known limitations
 
