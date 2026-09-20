@@ -40,6 +40,11 @@ import {
 import { SKILLFLUX_PROVIDER, SkillFluxProviderManager } from './provider.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { RemoteDiscoveryCache } from './remote-cache.js'
+import {
+  RegistryIndexClient,
+  type RegistryIndexEntry,
+  type RegistryIndexTransport,
+} from './registry-source.js'
 import { cacheCandidates, registryCandidates, routeScore } from './router.js'
 import { ExpiredAgentStateError, TurnStateRegistry, skillLookup, type AgentState } from './state.js'
 import {
@@ -105,6 +110,15 @@ export {
   type RemoteDiscoveryCacheState,
 } from './remote-cache.js'
 export { UsageStore, type AdaptiveUsageOptions, type UsageStoreOptions } from './usage.js'
+export {
+  REGISTRY_MAX_DESCRIPTION_LENGTH,
+  REGISTRY_MAX_ENTRIES,
+  RegistryIndexClient,
+  validateRegistryIndexEntry,
+  type RegistryIndexEntry,
+  type RegistryIndexListing,
+  type RegistryIndexTransport,
+} from './registry-source.js'
 export {
   MCP_MAX_LIST_PAGES,
   MCP_MAX_RESOURCES_PER_SKILL,
@@ -188,6 +202,7 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   mcpDiscovery: 'automatic',
   mcpTrustedServers: [],
   mcpBlockedServers: [],
+  registryDiscovery: 'off',
   routes: [],
 }
 
@@ -453,6 +468,7 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
     mcpDiscovery: config.mcpDiscovery ?? DEFAULTS.mcpDiscovery,
     mcpTrustedServers: mcpServerLabels('mcpTrustedServers', config.mcpTrustedServers ?? DEFAULTS.mcpTrustedServers),
     mcpBlockedServers: mcpServerLabels('mcpBlockedServers', config.mcpBlockedServers ?? DEFAULTS.mcpBlockedServers),
+    registryDiscovery: config.registryDiscovery ?? DEFAULTS.registryDiscovery,
     routes: config.routes ?? DEFAULTS.routes,
   }
   if (resolved.adaptiveRouting && !resolved.usageTracking) {
@@ -560,7 +576,7 @@ export class SkillFluxService extends Service {
     minRouteScore: z.number().default(DEFAULTS.minRouteScore),
     approvalPolicy: z.union(['always', 'session', 'automatic'] as const).default(DEFAULTS.approvalPolicy),
     remoteDiscovery: z.union(['automatic', 'on-demand', 'off'] as const).default(DEFAULTS.remoteDiscovery),
-    remoteProviders: z.array(z.union(['skills.sh', 'github'] as const)).default([...DEFAULTS.remoteProviders]),
+    remoteProviders: z.array(z.union(['skills.sh', 'github', 'registry-index'] as const)).default([...DEFAULTS.remoteProviders]),
     remoteSearchLimit: z.number().default(DEFAULTS.remoteSearchLimit),
     remoteAutoMountLimit: z.number().default(DEFAULTS.remoteAutoMountLimit),
     remoteSearchTimeoutMs: z.number().default(DEFAULTS.remoteSearchTimeoutMs),
@@ -603,6 +619,7 @@ export class SkillFluxService extends Service {
     mcpDiscovery: z.union(['automatic', 'off'] as const).default(DEFAULTS.mcpDiscovery),
     mcpTrustedServers: z.array(z.string()).default([]),
     mcpBlockedServers: z.array(z.string()).default([]),
+    registryDiscovery: z.union(['automatic', 'off'] as const).default(DEFAULTS.registryDiscovery),
     routes: z.array(routeRuleSchema).default([]),
   })
 
@@ -627,6 +644,7 @@ export class SkillFluxService extends Service {
   private readonly discovery: DiscoveryCoordinator
   private readonly providers: SkillFluxProviderManager
   private readonly mcpSources = new Map<string, McpSkillsClient>()
+  private readonly registryIndexes = new Map<string, RegistryIndexClient>()
   private readonly trustedBySession = new WeakMap<Session, Set<string>>()
   private readonly cachePruneSessions = new WeakSet<Session>()
 
@@ -648,6 +666,37 @@ export class SkillFluxService extends Service {
       maxEntries: this.config.remoteCacheMaxEntries,
       warn: message => { ctx.logger.warn(message) },
     })
+    const registryPort = {
+      listSeeds: async (signal?: AbortSignal) => {
+        const labels = [...this.registryIndexes.keys()].sort((left, right) => left.localeCompare(right, 'en'))
+        let seeds: RegistryIndexEntry[] = []
+        let partial = false
+        for (const label of labels) {
+          try {
+            const listing = await this.registryIndexes.get(label)!.listEntries(signal)
+            signal?.throwIfAborted()
+            seeds = [...seeds, ...listing.entries]
+            if (listing.partial) partial = true
+          } catch (error: unknown) {
+            signal?.throwIfAborted()
+            this.runtimeCtx.logger.warn(
+              `SkillFlux registry index "${label}" discovery failed open: ${errorMessage(error)}`,
+            )
+            partial = true
+          }
+        }
+        const seen = new Set<string>()
+        return {
+          seeds: seeds.filter(seed => {
+            const key = `${seed.source}\0${seed.ref}\0${seed.name}`
+            if (seen.has(key)) return false
+            seen.add(key)
+            return true
+          }),
+          partial,
+        }
+      },
+    }
     this.remote = new RemoteDiscoveryClient({
       searchLimit: this.config.remoteSearchLimit,
       timeoutMs: this.config.remoteSearchTimeoutMs,
@@ -661,6 +710,8 @@ export class SkillFluxService extends Service {
       cache: discoveryCache,
       healthFailureThreshold: this.config.remoteHealthFailureThreshold,
       healthCooldownMs: this.config.remoteHealthCooldownMs,
+      registryDiscovery: this.config.registryDiscovery,
+      registry: registryPort,
     })
     this.usage = this.config.usageTracking
       ? new UsageStore({
@@ -857,6 +908,28 @@ export class SkillFluxService extends Service {
 
   mcpSourceLabels(): readonly string[] {
     return [...this.mcpSources.keys()].sort((left, right) => left.localeCompare(right, 'en'))
+  }
+
+  /**
+   * Register one federated ecosystem index under a host-assigned label. Index
+   * entries are advisory: they join the existing immutable-commit, evidence,
+   * and approval pipeline and never grant trust by themselves.
+   */
+  registerRegistryIndex(label: string, transport: RegistryIndexTransport): void {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(label)) {
+      throw new Error(`invalid host-assigned registry index label "${label}"`)
+    }
+    this.registryIndexes.set(label, new RegistryIndexClient(transport))
+    this.providers.invalidate()
+  }
+
+  unregisterRegistryIndex(label: string): void {
+    this.registryIndexes.delete(label)
+    this.providers.invalidate()
+  }
+
+  registryIndexLabels(): readonly string[] {
+    return [...this.registryIndexes.keys()].sort((left, right) => left.localeCompare(right, 'en'))
   }
 
   async discover(
@@ -1217,12 +1290,14 @@ export class SkillFluxService extends Service {
         : `Remote discovery cache: ${discoveryCache.enabled ? 'on' : 'off'}; ${discoveryCache.entries}/${this.config.remoteCacheMaxEntries} entries; hits ${discoveryCache.hits}, misses ${discoveryCache.misses}, stale fallbacks ${discoveryCache.staleHits}.`
       const mcpLabels = this.mcpSourceLabels()
       const mcpStatus = `MCP sources: ${mcpLabels.length === 0 ? 'none registered' : mcpLabels.join(', ')}; discovery ${this.config.mcpDiscovery}; ${this.config.mcpTrustedServers.length} trusted server(s); ${this.config.mcpBlockedServers.length} blocked server(s).`
+      const registryLabels = this.registryIndexLabels()
+      const registryStatus = `Registry indexes: ${registryLabels.length === 0 ? 'none registered' : registryLabels.join(', ')}; discovery ${this.config.registryDiscovery}.`
       const idlePolicy = this.config.cacheMaxIdleDays === 0 ? 'off' : `${this.config.cacheMaxIdleDays} days`
       const invalidCacheStatus = installedCache.invalidEntries === 0 ? '' : `; invalid entries ${installedCache.invalidEntries} (use cache clean all)`
       const installedCacheStatus = `Installed Skill cache: ${installedCache.entries}/${this.config.cacheMaxEntries} entries, ${installedCache.totalBytes}/${this.config.cacheMaxTotalBytes} bytes; auto prune ${this.config.cacheAutoPrune ? 'on' : 'off'}; idle limit ${idlePolicy}${invalidCacheStatus}.`
       return {
         kind: 'success',
-        text: `${router}\n${telemetry}\n${tokenTelemetry}\n${discovery}\n${discoveryCacheStatus}\n${mcpStatus}\n${installedCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
+        text: `${router}\n${telemetry}\n${tokenTelemetry}\n${discovery}\n${discoveryCacheStatus}\n${mcpStatus}\n${registryStatus}\n${installedCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
           : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
       }

@@ -1,4 +1,5 @@
 import type {
+  RegistryTier,
   RemoteCandidate,
   RemoteQualityBreakdown,
   RemoteQualitySignal,
@@ -19,6 +20,8 @@ export interface RemoteEvidenceInput {
   readonly hasLicense: boolean
   readonly discoverySourceCount?: number
   readonly contentPinned?: boolean
+  /** Advisory ecosystem tier; evidence, never a trust grant. */
+  readonly registryTier?: RegistryTier
   readonly now: number
 }
 
@@ -63,9 +66,17 @@ export function remoteQualityEvidence(input: RemoteEvidenceInput): RemoteQuality
         : age <= 365
           ? 3
           : 0
+  const tierTrust = input.registryTier === 'official'
+    ? 3
+    : input.registryTier === 'verified'
+      ? 2
+      : input.registryTier === 'community'
+        ? 1
+        : 0
   const trust = (input.trustedSource ? 10 : 0)
     + (input.organizationOwned ? 3 : 0)
     + (input.hasLicense ? 2 : 0)
+    + tierTrust
   const crossSource = (input.discoverySourceCount ?? 1) > 1
   const contentPinned = input.contentPinned === true
   const provenance = (crossSource ? 4 : 0) + (contentPinned ? 4 : 0)
@@ -80,6 +91,9 @@ export function remoteQualityEvidence(input: RemoteEvidenceInput): RemoteQuality
   if (input.organizationOwned) signals.push('organization-owned')
   if (input.installs > 0) signals.push('market-adoption')
   if (input.stars > 0 || input.forks > 0) signals.push('repository-adoption')
+  if (input.registryTier === 'official') signals.push('ecosystem-official')
+  else if (input.registryTier === 'verified') signals.push('ecosystem-verified')
+  else if (input.registryTier === 'community') signals.push('ecosystem-community')
 
   const warnings: RemoteQualityWarning[] = []
   if (!crossSource) warnings.push('single-source')
@@ -88,6 +102,7 @@ export function remoteQualityEvidence(input: RemoteEvidenceInput): RemoteQuality
   else if (age > input.recentActivityDays * 3) warnings.push('stale-activity')
   if (!input.hasLicense) warnings.push('license-missing')
   if (input.installs < 10 && input.stars < 5 && input.forks < 2) warnings.push('low-adoption')
+  if (input.registryTier === 'unreviewed') warnings.push('ecosystem-unreviewed')
 
   const hasCommunityEvidence = contentPinned
     || (input.hasLicense && freshness > 0 && (input.installs > 0 || input.stars > 0 || input.forks > 0))

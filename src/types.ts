@@ -2,9 +2,11 @@ import type { SkillDefinition, SkillSummary } from '@deepseek-ai/dsh-skill'
 
 export type ApprovalPolicy = 'always' | 'session' | 'automatic'
 export type RemoteDiscovery = 'automatic' | 'on-demand' | 'off'
-export type RemoteDiscoveryProvider = 'skills.sh' | 'github'
+export type RemoteDiscoveryProvider = 'skills.sh' | 'github' | 'registry-index'
 export type RemoteTrustPolicy = 'open' | 'community' | 'corroborated' | 'trusted'
 export type RemoteTrustLevel = 'unverified' | 'community' | 'corroborated' | 'trusted'
+export type RegistryTier = 'official' | 'verified' | 'community' | 'unreviewed'
+export type RegistryDiscovery = 'off' | 'automatic'
 export type RemoteQualitySignal =
   | 'trusted-owner'
   | 'cross-source'
@@ -14,6 +16,9 @@ export type RemoteQualitySignal =
   | 'organization-owned'
   | 'market-adoption'
   | 'repository-adoption'
+  | 'ecosystem-official'
+  | 'ecosystem-verified'
+  | 'ecosystem-community'
 export type RemoteQualityWarning =
   | 'single-source'
   | 'content-not-previewed'
@@ -21,6 +26,7 @@ export type RemoteQualityWarning =
   | 'stale-activity'
   | 'license-missing'
   | 'low-adoption'
+  | 'ecosystem-unreviewed'
 export type CandidateOrigin = 'registry' | 'cache' | 'remote' | 'mcp'
 export type RouterMode = 'lexical' | 'hybrid'
 export type EmbeddingProvider = 'ollama' | 'openai-compatible'
@@ -57,6 +63,8 @@ export interface SkillFluxConfig {
   readonly remoteHealthFailureThreshold?: number
   /** How long a repeatedly failing source stays skipped. */
   readonly remoteHealthCooldownMs?: number
+  /** Federated ecosystem-index ingestion; experimental and off by default. */
+  readonly registryDiscovery?: RegistryDiscovery
   readonly cacheAutoPrune?: boolean
   readonly cacheMaxEntries?: number
   readonly cacheMaxTotalBytes?: number
@@ -110,6 +118,7 @@ export interface ResolvedSkillFluxConfig {
   readonly remoteCacheMaxEntries: number
   readonly remoteHealthFailureThreshold: number
   readonly remoteHealthCooldownMs: number
+  readonly registryDiscovery: RegistryDiscovery
   readonly cacheAutoPrune: boolean
   readonly cacheMaxEntries: number
   readonly cacheMaxTotalBytes: number

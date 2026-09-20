@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "registry-minimal-valid",
+      "name": "minimal pinned entry",
+      "entry": {
+        "name": "pdf-reader",
+        "description": "Read PDF documents",
+        "source": "acme/skills",
+        "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tier": "community"
+      },
+      "expect": "accept"
+    },
+    {
+      "id": "registry-full-valid",
+      "name": "entry with optional evidence",
+      "entry": {
+        "name": "refunds",
+        "description": "Process customer refunds",
+        "source": "acme/skills",
+        "ref": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "tier": "official",
+        "installs": 12,
+        "license": "MIT",
+        "whenToUse": "When processing refunds"
+      },
+      "expect": "accept"
+    },
+    {
+      "id": "registry-unpinned-ref",
+      "name": "mutable ref",
+      "entry": {
+        "name": "pdf-reader",
+        "description": "Read PDF documents",
+        "source": "acme/skills",
+        "ref": "main",
+        "tier": "community"
+      },
+      "expect": "reject"
+    },
+    {
+      "id": "registry-uppercase-ref",
+      "name": "non-lowercase commit",
+      "entry": {
+        "name": "pdf-reader",
+        "description": "Read PDF documents",
+        "source": "acme/skills",
+        "ref": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+        "tier": "community"
+      },
+      "expect": "reject"
+    },
+    {
+      "id": "registry-invalid-name",
+      "name": "invalid skill name",
+      "entry": {
+        "name": "PDF Reader",
+        "description": "Read PDF documents",
+        "source": "acme/skills",
+        "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tier": "community"
+      },
+      "expect": "reject"
+    },
+    {
+      "id": "registry-invalid-source",
+      "name": "invalid repository source",
+      "entry": {
+        "name": "pdf-reader",
+        "description": "Read PDF documents",
+        "source": "https://github.com/acme/skills",
+        "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tier": "community"
+      },
+      "expect": "reject"
+    },
+    {
+      "id": "registry-unknown-tier",
+      "name": "unknown tier",
+      "entry": {
+        "name": "pdf-reader",
+        "description": "Read PDF documents",
+        "source": "acme/skills",
+        "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tier": "elite"
+      },
+      "expect": "reject"
+    },
+    {
+      "id": "registry-negative-installs",
+      "name": "negative install count",
+      "entry": {
+        "name": "pdf-reader",
+        "description": "Read PDF documents",
+        "source": "acme/skills",
+        "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tier": "community",
+        "installs": -1
+      },
+      "expect": "reject"
+    },
+    {
+      "id": "registry-empty-description",
+      "name": "empty description",
+      "entry": {
+        "name": "pdf-reader",
+        "description": "   ",
+        "source": "acme/skills",
+        "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tier": "community"
+      },
+      "expect": "reject"
+    },
+    {
+      "id": "registry-unreviewed-tier",
+      "name": "unreviewed tier accepted as evidence",
+      "entry": {
+        "name": "experiment",
+        "description": "Unreviewed experiment",
+        "source": "acme/skills",
+        "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "tier": "unreviewed"
+      },
+      "expect": "accept"
+    }
+  ]
+}
