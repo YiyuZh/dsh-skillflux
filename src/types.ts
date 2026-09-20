@@ -21,9 +21,10 @@ export type RemoteQualityWarning =
   | 'stale-activity'
   | 'license-missing'
   | 'low-adoption'
-export type CandidateOrigin = 'registry' | 'cache' | 'remote'
+export type CandidateOrigin = 'registry' | 'cache' | 'remote' | 'mcp'
 export type RouterMode = 'lexical' | 'hybrid'
 export type EmbeddingProvider = 'ollama' | 'openai-compatible'
+export type McpDiscovery = 'automatic' | 'off'
 export type CandidateSelection = 'rule' | 'lexical' | 'embedding' | 'remote-quality' | 'manual'
 
 export interface RouteRule {
@@ -80,6 +81,11 @@ export interface SkillFluxConfig {
   readonly adaptiveMaxBoost?: number
   readonly adaptiveMinUses?: number
   readonly adaptiveHalfLifeDays?: number
+  readonly mcpDiscovery?: McpDiscovery
+  /** Host-assigned MCP server labels whose skills may carry `trusted` evidence. */
+  readonly mcpTrustedServers?: string[]
+  /** Host-assigned MCP server labels whose skills are always refused. */
+  readonly mcpBlockedServers?: string[]
   readonly routes?: RouteRule[]
 }
 
@@ -127,6 +133,9 @@ export interface ResolvedSkillFluxConfig {
   readonly adaptiveMaxBoost: number
   readonly adaptiveMinUses: number
   readonly adaptiveHalfLifeDays: number
+  readonly mcpDiscovery: McpDiscovery
+  readonly mcpTrustedServers: readonly string[]
+  readonly mcpBlockedServers: readonly string[]
   readonly routes: readonly RouteRule[]
 }
 
@@ -208,6 +217,51 @@ export interface RemoteCandidate extends CandidateRoutingMetadata {
   readonly skillFileHash?: string
 }
 
+/** One digest-bound file of an MCP-served skill. */
+export interface McpSkillResource {
+  /** Resource URI of the file, `sha256:{hex}` digest, and raw byte length. */
+  readonly uri: string
+  readonly digest: string
+  readonly size: number
+}
+
+/** The required fields of an MCP Skill frontmatter, with passthrough extras. */
+export interface McpSkillFrontmatter {
+  readonly name: string
+  readonly description: string
+  readonly [key: string]: unknown
+}
+
+/** A validated `skills/list` or `skills/get` entry with an array `resources` set. */
+export interface McpSkillEntry {
+  /** Resource URI of the skill's SKILL.md. */
+  readonly uri: string
+  /** The SKILL.md frontmatter rendered verbatim as a JSON object. */
+  readonly frontmatter: Readonly<McpSkillFrontmatter>
+  /** Complete, digest-bound enumeration of every file in the skill. */
+  readonly resources: readonly McpSkillResource[]
+}
+
+export interface McpCandidate extends CandidateRoutingMetadata {
+  readonly id: string
+  readonly origin: 'mcp'
+  /** Catalog name; disambiguated with path segments when a listing collides. */
+  readonly name: string
+  readonly description: string
+  readonly whenToUse?: string
+  /** Host-assigned server label; the origin half of the skill identity. */
+  readonly source: string
+  readonly serverLabel: string
+  /** Resource URI of the skill's SKILL.md. */
+  readonly skillUri: string
+  /** One-way fingerprint of the sorted `[uri, digest, size]` set. */
+  readonly contentBoundKey: string
+  readonly frontmatter: Readonly<McpSkillFrontmatter>
+  readonly resources: readonly McpSkillResource[]
+  readonly score: number
+  readonly trustLevel: RemoteTrustLevel
+}
+
 export interface RemoteQualityBreakdown {
   readonly relevance: number
   readonly adoption: number
@@ -218,7 +272,7 @@ export interface RemoteQualityBreakdown {
   readonly total: number
 }
 
-export type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate
+export type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate | McpCandidate
 
 /** Per-turn provider catalog: metadata-only candidates plus discovery completeness. */
 export interface SkillFluxCatalog {
@@ -283,6 +337,8 @@ export interface SkillUsageRecord extends SkillUsageIdentity {
 
 export interface CacheManifest {
   readonly version: 1
+  /** `github` is implied when absent for manifests written before v0.4. */
+  readonly origin?: 'github' | 'mcp'
   readonly cacheId: string
   readonly source: string
   readonly ref: string
@@ -300,6 +356,14 @@ export interface CacheManifest {
   readonly sourcePath?: string
   /** SHA-256 of the unique pinned source SKILL.md. */
   readonly sourceSkillFileHash?: string
+  /** Present only for MCP-origin installations; carries the content-bound set. */
+  readonly mcp?: {
+    readonly serverLabel: string
+    readonly skillUri: string
+    readonly contentBoundKey: string
+    readonly frontmatter: Readonly<McpSkillFrontmatter>
+    readonly resources: readonly McpSkillResource[]
+  }
   readonly installedAt: string
   readonly fileCount: number
   readonly totalBytes: number

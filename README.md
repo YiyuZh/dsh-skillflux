@@ -353,6 +353,9 @@ adaptiveRouting: false
 adaptiveMaxBoost: 6
 adaptiveMinUses: 2
 adaptiveHalfLifeDays: 30
+mcpDiscovery: automatic        # automatic | off; gates registered MCP Skills sources
+mcpTrustedServers: []          # host-assigned labels allowed trusted evidence
+mcpBlockedServers: []          # host-assigned labels whose skills are always refused
 routes: []
 ```
 
@@ -480,6 +483,33 @@ remain available. A new `skillflux_search` can retry a failure; failures are not
 persisted as a blacklist. `always`, `session`, and explicit `skillflux_mount`
 keep their existing approval behavior and never silently switch candidates.
 
+### MCP Skills sources
+
+SkillFlux can serve skills published over the Model Context Protocol Skills
+extension (`io.modelcontextprotocol/skills`, SEP-2640). A transport-agnostic
+`McpSkillsClient` speaks `skills/list`, `skills/get`, and `resources/read` over
+any injected transport; the host assigns each source a stable label, which is
+the origin half of every skill identity:
+
+```ts
+import { McpSkillsClient, McpTransport } from 'dsh-skillflux'
+
+const transport: McpTransport = { request: (method, params) => rpc(method, params) }
+ctx.skillFlux.registerMcpSource('docs-server', new McpSkillsClient(transport))
+```
+
+Listings flow through the same trust and approval boundaries as remote
+candidates. Every entry is validated against the extension contract, a skill
+whose `resources` is `"dynamic"` is refused because it cannot be content-bound,
+and approvals bind to the sorted `[uri, digest, size]` set. Files are fetched
+lazily through `resources/read`, digest- and size-verified, frontmatter-verified
+against the entry, and materialized under a cache id that encodes the server
+label, SKILL.md URI, and content-bound key; changed content lands at a fresh
+id and never overwrites an approved snapshot. MCP content is always tagged with
+its server label, never executes during discovery or loading, and never
+silently shadows a same-named skill from another origin. A source that cannot
+be listed fails open for that turn and is reported as non-authoritative.
+
 ## Model tools and user commands
 
 The model can use:
@@ -561,6 +591,13 @@ available until a later policy run or explicit cleanup removes them.
 - The remote discovery cache persists only a query/configuration fingerprint and
   bounded, validated candidate metadata. It never stores the query text or API
   credentials.
+- MCP Skills sources are addressed by a host-assigned label, never by the
+  server's self-reported name. Entries are validated before they become
+  candidates, `"dynamic"` skills are refused, and every loaded byte is checked
+  against the held `[uri, digest, size]` set plus a field-by-field frontmatter
+  comparison. Approvals bind to that content set; a changed set lands at a new
+  cache id and requires fresh approval. Cached MCP files are re-digested on
+  every load and never acquire filesystem-skill trust.
 - `GITHUB_TOKEN` or `GH_TOKEN` is optional. It enables broad GitHub code search
   and batched repository enrichment; SkillFlux doesn't persist it.
 
@@ -586,8 +623,9 @@ The suite contains 40 lexical cases, 4 adaptive safety cases, 8
 provider-independent semantic-vector cases, 7 catalog-budget cases, 8
 remote-quality pairwise cases, 8 remote evidence-governance cases, 7 remote-cache
 policy cases, 8 lazy remote-fallback cases, 7 installed-cache governance cases,
-and 7 provider-native lazy-runtime cases covering English, Chinese,
-normalization, rules, thresholds, capacity, ranking, content deduplication,
+7 provider-native lazy-runtime cases, and 12 MCP source entry-contract cases
+covering English, Chinese, normalization, rules, thresholds, capacity, ranking,
+content deduplication,
 semantic top-k, context budgets, freshness, evidence policy, adoption, cache
 expiry, value-aware eviction, active-mount protection, and negative rejection.
 
@@ -604,6 +642,7 @@ expiry, value-aware eviction, active-mount protection, and negative rejection.
 | Remote evidence-governance boundaries | 100.0% |
 | Remote-cache policy boundaries | 100.0% |
 | Installed-cache governance boundaries | 100.0% |
+| MCP source entry contract | 100.0% |
 
 These results verify the deterministic router and vector-ranking contracts
 against checked-in inputs. The semantic vectors are synthetic, so these results
@@ -643,6 +682,10 @@ carries over unchanged; the differences are behavioral:
   passed by the registry.
 - Semantic fallback considers at most `embeddingCandidateLimit` local
   candidates in current Registry/cache order.
+- MCP loading ships the transport-agnostic JSON-RPC client and the in-process
+  test transport. Stdio/SSE adapters are consumer-provided for now, and skills
+  whose `resources` is `"dynamic"` are refused because they cannot be
+  content-bound.
 - Catalog token counts are portable estimates, not exact counts from the
   configured chat model. They exclude loaded Skill bodies, tool schemas, and
   other session history.

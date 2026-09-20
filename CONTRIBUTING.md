@@ -115,6 +115,9 @@ Installed cache governance changes should update
 [`evals/cache-governance-cases.json`](evals/cache-governance-cases.json).
 Automatic remote mount changes should update
 [`evals/remote-fallback-cases.json`](evals/remote-fallback-cases.json).
+MCP Skills source changes (entry validation, digest/size verification, name
+disambiguation, or content-bound governance) should update
+[`evals/mcp-source-cases.json`](evals/mcp-source-cases.json).
 Provider lifecycle, lazy-download, approval, concurrency, or turn-release
 changes should extend
 [`tests/provider-eval.spec.ts`](tests/provider-eval.spec.ts).

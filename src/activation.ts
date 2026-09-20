@@ -26,6 +26,7 @@ export interface ActivationHost {
   readonly usage: UsageStore | undefined
   readonly trustedBySession: WeakMap<Session, Set<string>>
   readonly cachePruneSessions: WeakSet<Session>
+  mcpReader(serverLabel: string, uri: string, signal?: AbortSignal): Promise<Buffer>
   trackUsage(operation: Promise<void> | undefined): void
   acquireCacheLease(): Promise<CacheProcessLockRelease>
   trackActiveLeaseCleanup(operation: () => Promise<void>): Promise<void>
@@ -113,6 +114,14 @@ export async function activateCandidate(
         throw new Error(`SkillFlux mount denied: ${currentGovernanceReason}`)
       }
       entry = cached
+    } else if (candidate.origin === 'mcp') {
+      entry = await host.cache.installMcp(
+        candidate,
+        (uri, readSignal) => host.mcpReader(candidate.serverLabel, uri, readSignal),
+        cacheSignal,
+      )
+      cacheSignal?.throwIfAborted()
+      host.assertMountCurrent(state, expectedGeneration, candidate.name, expectedMountEpoch)
     } else {
       entry = await host.cache.install(candidate, cacheSignal)
       cacheSignal?.throwIfAborted()
@@ -204,7 +213,7 @@ export async function activateCandidate(
     }
     host.rememberRouting(state, mounted)
     host.trackUsage(host.usage?.recordMount(usageIdentity(mounted)))
-    if (candidate.origin === 'remote') {
+    if (candidate.origin === 'remote' || candidate.origin === 'mcp') {
       host.cachePruneSessions.add(state.agent.session)
       host.scheduleAutoPrune()
       if (host.config.approvalPolicy === 'session') {

@@ -11,9 +11,10 @@ type RemoteTrustPolicy = 'open' | 'community' | 'corroborated' | 'trusted';
 type RemoteTrustLevel = 'unverified' | 'community' | 'corroborated' | 'trusted';
 type RemoteQualitySignal = 'trusted-owner' | 'cross-source' | 'content-pinned' | 'recent-activity' | 'declared-license' | 'organization-owned' | 'market-adoption' | 'repository-adoption';
 type RemoteQualityWarning = 'single-source' | 'content-not-previewed' | 'activity-unknown' | 'stale-activity' | 'license-missing' | 'low-adoption';
-type CandidateOrigin = 'registry' | 'cache' | 'remote';
+type CandidateOrigin = 'registry' | 'cache' | 'remote' | 'mcp';
 type RouterMode = 'lexical' | 'hybrid';
 type EmbeddingProvider = 'ollama' | 'openai-compatible';
+type McpDiscovery = 'automatic' | 'off';
 type CandidateSelection = 'rule' | 'lexical' | 'embedding' | 'remote-quality' | 'manual';
 interface RouteRule {
   matchAll?: string[];
@@ -68,6 +69,11 @@ interface SkillFluxConfig {
   readonly adaptiveMaxBoost?: number;
   readonly adaptiveMinUses?: number;
   readonly adaptiveHalfLifeDays?: number;
+  readonly mcpDiscovery?: McpDiscovery;
+  /** Host-assigned MCP server labels whose skills may carry `trusted` evidence. */
+  readonly mcpTrustedServers?: string[];
+  /** Host-assigned MCP server labels whose skills are always refused. */
+  readonly mcpBlockedServers?: string[];
   readonly routes?: RouteRule[];
 }
 interface ResolvedSkillFluxConfig {
@@ -114,6 +120,9 @@ interface ResolvedSkillFluxConfig {
   readonly adaptiveMaxBoost: number;
   readonly adaptiveMinUses: number;
   readonly adaptiveHalfLifeDays: number;
+  readonly mcpDiscovery: McpDiscovery;
+  readonly mcpTrustedServers: readonly string[];
+  readonly mcpBlockedServers: readonly string[];
   readonly routes: readonly RouteRule[];
 }
 interface EmbeddingRouterStats {
@@ -188,6 +197,47 @@ interface RemoteCandidate extends CandidateRoutingMetadata {
   readonly path?: string;
   readonly skillFileHash?: string;
 }
+/** One digest-bound file of an MCP-served skill. */
+interface McpSkillResource {
+  /** Resource URI of the file, `sha256:{hex}` digest, and raw byte length. */
+  readonly uri: string;
+  readonly digest: string;
+  readonly size: number;
+}
+/** The required fields of an MCP Skill frontmatter, with passthrough extras. */
+interface McpSkillFrontmatter {
+  readonly name: string;
+  readonly description: string;
+  readonly [key: string]: unknown;
+}
+/** A validated `skills/list` or `skills/get` entry with an array `resources` set. */
+interface McpSkillEntry {
+  /** Resource URI of the skill's SKILL.md. */
+  readonly uri: string;
+  /** The SKILL.md frontmatter rendered verbatim as a JSON object. */
+  readonly frontmatter: Readonly<McpSkillFrontmatter>;
+  /** Complete, digest-bound enumeration of every file in the skill. */
+  readonly resources: readonly McpSkillResource[];
+}
+interface McpCandidate extends CandidateRoutingMetadata {
+  readonly id: string;
+  readonly origin: 'mcp';
+  /** Catalog name; disambiguated with path segments when a listing collides. */
+  readonly name: string;
+  readonly description: string;
+  readonly whenToUse?: string;
+  /** Host-assigned server label; the origin half of the skill identity. */
+  readonly source: string;
+  readonly serverLabel: string;
+  /** Resource URI of the skill's SKILL.md. */
+  readonly skillUri: string;
+  /** One-way fingerprint of the sorted `[uri, digest, size]` set. */
+  readonly contentBoundKey: string;
+  readonly frontmatter: Readonly<McpSkillFrontmatter>;
+  readonly resources: readonly McpSkillResource[];
+  readonly score: number;
+  readonly trustLevel: RemoteTrustLevel;
+}
 interface RemoteQualityBreakdown {
   readonly relevance: number;
   readonly adoption: number;
@@ -197,7 +247,7 @@ interface RemoteQualityBreakdown {
   readonly provenance: number;
   readonly total: number;
 }
-type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate;
+type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate | McpCandidate;
 /** Per-turn provider catalog: metadata-only candidates plus discovery completeness. */
 interface SkillFluxCatalog {
   readonly candidates: readonly SkillFluxCandidate[];
@@ -254,6 +304,8 @@ interface SkillUsageRecord extends SkillUsageIdentity {
 }
 interface CacheManifest {
   readonly version: 1;
+  /** `github` is implied when absent for manifests written before v0.4. */
+  readonly origin?: 'github' | 'mcp';
   readonly cacheId: string;
   readonly source: string;
   readonly ref: string;
@@ -271,6 +323,14 @@ interface CacheManifest {
   readonly sourcePath?: string;
   /** SHA-256 of the unique pinned source SKILL.md. */
   readonly sourceSkillFileHash?: string;
+  /** Present only for MCP-origin installations; carries the content-bound set. */
+  readonly mcp?: {
+    readonly serverLabel: string;
+    readonly skillUri: string;
+    readonly contentBoundKey: string;
+    readonly frontmatter: Readonly<McpSkillFrontmatter>;
+    readonly resources: readonly McpSkillResource[];
+  };
   readonly installedAt: string;
   readonly fileCount: number;
   readonly totalBytes: number;
@@ -333,6 +393,80 @@ type RemoteCandidateVerifier = (candidate: Pick<RemoteCandidate, 'source' | 'ref
  */
 declare function verifyUniqueRemoteSkill(candidate: Pick<RemoteCandidate, 'source' | 'ref' | 'skillId' | 'path' | 'skillFileHash'>, signal?: AbortSignal): Promise<VerifiedRemoteSkill>;
 //#endregion
+//#region src/mcp-source.d.ts
+declare const MCP_SKILLS_EXTENSION = "io.modelcontextprotocol/skills";
+declare const MCP_MAX_RESOURCES_PER_SKILL = 512;
+declare const MCP_MAX_SKILL_BYTES: number;
+declare const MCP_MAX_LIST_PAGES = 10;
+/**
+ * Transport-agnostic JSON-RPC client for the MCP Skills extension
+ * (`io.modelcontextprotocol/skills`). The transport only moves requests and
+ * results; every response is validated and every retrieved byte is verified
+ * against the entry digest before it is considered skill content.
+ *
+ * This adapter performs discovery and loading only. It never executes skill
+ * content and never opens a general MCP dispatch sandbox.
+ */
+interface McpTransport {
+  /**
+   * Issue one JSON-RPC request and resolve with its `result`, or reject with
+   * an `McpError` carrying the JSON-RPC error code, or any other Error.
+   */
+  request(method: string, params?: unknown): Promise<unknown>;
+}
+declare class McpError extends Error {
+  readonly code: number;
+  constructor(code: number, message: string);
+}
+/** Fetch the raw bytes for one verified resource URI. */
+type McpResourceReader = (uri: string, signal?: AbortSignal) => Promise<Buffer>;
+declare function assertMcpServerLabel(label: string): void;
+/** The skill's root URI: its SKILL.md URI with the `/SKILL.md` suffix removed. */
+declare function mcpSkillRoot(skillUri: string): string | undefined;
+/**
+ * Map a resource URI to its path relative to the skill directory root, or
+ * undefined when the URI is outside the skill's directory or unsafe.
+ */
+declare function mcpRelativePath(skillUri: string, resourceUri: string): string | undefined;
+declare function parseMcpSkillResource(value: unknown): McpSkillResource | undefined;
+/**
+ * Validate one `Skill` entry per SEP-2640 and the stable skills.mdx. Entries
+ * whose `resources` is `"dynamic"` cannot be content-bound and are refused.
+ */
+declare function validateMcpSkillEntry(value: unknown): McpSkillEntry | undefined;
+/** One-way fingerprint of the content-bound set: sorted `[uri, digest, size]`. */
+declare function mcpContentBoundKey(entry: Pick<McpSkillEntry, 'resources'>): string;
+/** Field-by-field JSON equality for the frontmatter verification requirement. */
+declare function mcpFrontmatterEqual(parsed: unknown, expected: unknown): boolean;
+interface McpCandidateOptions {
+  /** Host-assigned labels whose skills may carry `trusted` evidence. */
+  readonly trustedServers?: readonly string[];
+}
+/** Build governed candidates for one host-assigned server label. */
+declare function mcpCandidates(serverLabel: string, entries: readonly McpSkillEntry[], options?: McpCandidateOptions): McpCandidate[];
+interface McpSkillListing {
+  readonly entries: McpSkillEntry[];
+  /** True when pagination was truncated or any entry was invalid and dropped. */
+  readonly partial: boolean;
+}
+declare class McpSkillsClient {
+  private readonly transport;
+  constructor(transport: McpTransport);
+  /**
+   * Enumerate a server's skills through `skills/list`, following pagination
+   * up to `MCP_MAX_LIST_PAGES`. Invalid entries are dropped and reported via
+   * `partial`; this never weakens the entry validation at load time.
+   */
+  listSkills(signal?: AbortSignal): Promise<McpSkillListing>;
+  /** Fetch and validate one skill entry by its SKILL.md URI. */
+  getSkill(uri: string, signal?: AbortSignal): Promise<McpSkillEntry>;
+  /**
+   * Read one resource through `resources/read` and return its raw bytes.
+   * Digest and size verification happens at the cache/install boundary.
+   */
+  readResource(uri: string, signal?: AbortSignal): Promise<Buffer>;
+}
+//#endregion
 //#region src/cache.d.ts
 declare function isLoopbackProxyFailure(error: unknown): boolean;
 interface CacheManagerOptions {
@@ -371,6 +505,13 @@ declare class SkillCache {
   get(id: string): Promise<CacheEntry | undefined>;
   find(source: string, ref: string, skillId: string): Promise<CacheEntry | undefined>;
   load(entry: CacheEntry, signal?: AbortSignal): Promise<SkillDefinition>;
+  /**
+   * Download, digest-verify, and materialize an MCP-served skill bound to its
+   * content set. The cache id encodes the host-assigned server label, the
+   * SKILL.md URI, and the content-bound key, so a changed `resources` set
+   * lands at a fresh directory and never overwrites an approved snapshot.
+   */
+  installMcp(candidate: McpCandidate, readResource: McpResourceReader, signal?: AbortSignal): Promise<CacheEntry>;
   install(candidate: RemoteCandidate, signal?: AbortSignal): Promise<CacheEntry>;
   clean(selector: string, active?: ReadonlySet<string>, signal?: AbortSignal): Promise<{
     removed: string[];
@@ -662,12 +803,21 @@ declare class SkillFluxService extends Service {
   private readonly turnStates;
   private readonly discovery;
   private readonly providers;
+  private readonly mcpSources;
   private readonly trustedBySession;
   private readonly cachePruneSessions;
   constructor(ctx: Context, config?: SkillFluxConfig);
   private get discoveryHost();
   private get activationHost();
   private get approvalHost();
+  /**
+   * Register one MCP Skills source under a host-assigned label. The label is
+   * the origin half of every skill identity; it never comes from the server's
+   * self-reported name. Registering the same label replaces the prior client.
+   */
+  registerMcpSource(label: string, client: McpSkillsClient): void;
+  unregisterMcpSource(label: string): void;
+  mcpSourceLabels(): readonly string[];
   discover(agent: Agent, query: string, options?: {
     readonly remote?: boolean;
     readonly signal?: AbortSignal;
@@ -710,7 +860,20 @@ declare class SkillFluxService extends Service {
   private markRoutingOutcome;
   private recordRoutingOutcome;
   private candidate;
-  private publishedRemote;
+  private publishedCandidate;
+  private readMcpResource;
+  /**
+   * List every registered MCP source, validate its entries, and build scored
+   * candidates. A failing source is skipped with a warning and marks the
+   * observation non-authoritative; it never fails the whole discovery pass.
+   */
+  private listMcpCandidates;
+  /**
+   * Fetch MCP candidates for one turn, apply the catalog budget, and register
+   * them for lazy mount. A listing failure keeps local and remote candidates
+   * usable and only marks the published observation non-authoritative.
+   */
+  private collectMcpCandidates;
   private skillDefinition;
   private loadProviderBody;
   private loadOne;
@@ -730,5 +893,5 @@ declare class SkillFluxService extends Service {
   private scheduleSessionCachePrune;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, routeScore, selectCandidates, tokenize, verifyUniqueRemoteSkill };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, MCP_MAX_LIST_PAGES, MCP_MAX_RESOURCES_PER_SKILL, MCP_MAX_SKILL_BYTES, MCP_SKILLS_EXTENSION, type McpCandidate, type McpCandidateOptions, type McpDiscovery, McpError, type McpResourceReader, type McpSkillEntry, type McpSkillFrontmatter, type McpSkillListing, type McpSkillResource, McpSkillsClient, type McpTransport, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, assertMcpServerLabel, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, mcpCandidates, mcpContentBoundKey, mcpFrontmatterEqual, mcpRelativePath, mcpSkillRoot, name, normalizeText, parseMcpSkillResource, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, routeScore, selectCandidates, tokenize, validateMcpSkillEntry, verifyUniqueRemoteSkill };
 //# sourceMappingURL=index.d.ts.map

@@ -297,6 +297,9 @@ adaptiveRouting: false
 adaptiveMaxBoost: 6
 adaptiveMinUses: 2
 adaptiveHalfLifeDays: 30
+mcpDiscovery: automatic        # automatic | off；控制已注册 MCP Skills 来源
+mcpTrustedServers: []          # 允许携带 trusted 证据的主机指定来源标签
+mcpBlockedServers: []          # 始终拒绝的主机指定来源标签
 routes: []
 ```
 
@@ -409,6 +412,29 @@ catalogTokenBudget: 512
 仍可使用；重新执行 `skillflux_search` 可以重试，不会形成持久黑名单。
 `always`、`session` 和显式 `skillflux_mount` 的审批行为不变，也不会静默换候选。
 
+### MCP Skills 来源
+
+SkillFlux 可以承载通过 MCP Skills 扩展（`io.modelcontextprotocol/skills`，
+SEP-2640）发布的技能。与传输无关的 `McpSkillsClient` 会在任意注入的传输层上
+调用 `skills/list`、`skills/get` 与 `resources/read`；主机为每个来源分配一个稳定
+标签，该标签是每个技能身份中的来源半边：
+
+```ts
+import { McpSkillsClient, McpTransport } from 'dsh-skillflux'
+
+const transport: McpTransport = { request: (method, params) => rpc(method, params) }
+ctx.skillFlux.registerMcpSource('docs-server', new McpSkillsClient(transport))
+```
+
+列表与远程候选走相同的信任与审批边界。每个条目都按扩展契约校验，`resources`
+为 `"dynamic"` 的技能因无法内容绑定而被拒绝；审批绑定到排序后的
+`[uri, digest, size]` 集合。文件通过 `resources/read` 惰性获取，逐字节校验
+digest 与 size，再把 SKILL.md 的 frontmatter 与条目逐字段比对，最终落到一个编码
+了来源标签、SKILL.md URI 与内容绑定键的缓存 id 下；内容变化会落到新 id，绝不
+覆盖已审批快照。MCP 内容始终带有来源标签，发现与加载期间从不执行，也不会静默
+遮蔽其他来源的同名技能。无法列出某个来源时，本回合 fail-open 并标记为
+非权威观测。
+
 ## 模型工具和用户命令
 
 模型可以使用：
@@ -474,6 +500,11 @@ catalogTokenBudget: 512
   原文。
 - 远程发现缓存只持久化查询/配置指纹和有界、经过校验的候选元数据，不保存查询
   原文或 API 凭据。
+- MCP Skills 来源只以主机分配的标签寻址，绝不使用服务器自报名称。条目先通过
+  校验才能成为候选，`"dynamic"` 技能被拒绝，加载的每个字节都要对照持有的
+  `[uri, digest, size]` 集合并逐字段比对 frontmatter。审批绑定该内容集合；集合
+  变化会落到新缓存 id 并需要重新审批，缓存文件每次加载都会重新计算 digest，
+  且绝不获得本地文件系统技能的信任。
 - 可选的 `GITHUB_TOKEN` 或 `GH_TOKEN` 会启用 GitHub Code Search 和批量仓库
   元数据补全；SkillFlux 不会持久化它。
 
@@ -496,7 +527,7 @@ corepack pnpm eval
 测评包含 40 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
 场景、7 个目录预算场景、8 个远程质量两两对比场景、8 个远程证据治理场景、
 7 个远程缓存策略场景、8 个惰性远程回退场景、7 个已安装缓存治理场景和
-7 个 Provider 原生惰性运行时场景，
+7 个 Provider 原生惰性运行时场景、12 个 MCP 来源条目契约场景，
 覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、
 语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期、价值淘汰、
 活动挂载保护、惰性下载、审批、并发隔离、取消传播与负例拒绝。
@@ -514,6 +545,7 @@ corepack pnpm eval
 | 远程证据治理边界正确率 | 100.0% |
 | 远程缓存策略边界正确率 | 100.0% |
 | 已安装缓存治理边界正确率 | 100.0% |
+| MCP 来源条目契约正确率 | 100.0% |
 
 这些结果验证确定性 Router 和向量排序契约。语义向量是合成数据，不代表某个
 embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测评格式和限制见
@@ -544,6 +576,9 @@ v0.3 将 SkillFlux 变为 Provider 原生惰性运行时。大部分配置保持
   `ctx.skills`，因此按 Agent 解析的目录通过注册表传入的 lookup scope 路由。
 - 语义补位最多处理当前 Registry/缓存顺序中的 `embeddingCandidateLimit` 个本地
   候选。
+- MCP 加载目前内置与传输无关的 JSON-RPC 客户端和进程内测试传输；stdio/SSE
+  适配器暂由接入方提供，`resources` 为 `"dynamic"` 的技能因无法内容绑定而被
+  拒绝。
 - 目录 token 数是可移植估算值，不是当前聊天模型 tokenizer 的精确计数；它不
   包含已加载的 Skill 正文、工具 schema 或其他 session history。
 - 没有 `GITHUB_TOKEN` 或 `GH_TOKEN` 时无法使用 GitHub Code Search，但

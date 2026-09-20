@@ -1,0 +1,212 @@
+{
+  "version": 1,
+  "cases": [
+  {
+    "id": "mcp-minimal-valid",
+    "name": "minimal single-file skill",
+    "description": "A SKILL.md-only entry with a valid digest and size is accepted",
+    "entry": {
+      "uri": "skill://git-workflow/SKILL.md",
+      "frontmatter": { "name": "git-workflow", "description": "Follow team git conventions" },
+      "resources": [
+        {
+          "uri": "skill://git-workflow/SKILL.md",
+          "digest": "sha256:b95a384300adeea2d902f7d19cd7c04b378ef58e09759107b9c7db4dcacbaa25",
+          "size": 190
+        }
+      ]
+    },
+    "expect": "accept"
+  },
+  {
+    "id": "mcp-nested-with-files",
+    "name": "nested path with supporting files",
+    "description": "A prefixed skill path with supporting files is accepted",
+    "entry": {
+      "uri": "skill://acme/billing/refunds/SKILL.md",
+      "frontmatter": { "name": "refunds", "description": "Process refunds", "license": "Apache-2.0" },
+      "resources": [
+        {
+          "uri": "skill://acme/billing/refunds/SKILL.md",
+          "digest": "sha256:ae7bc7e45f44a6381977ef1f772cbad6e38d8ec78903ea7b87abb373815a8f89",
+          "size": 175
+        },
+        {
+          "uri": "skill://acme/billing/refunds/examples/email.md",
+          "digest": "sha256:a724fa5ed3b9e39c0e731fe1f0e866eb46d23969af25ecf0d5f41982e3e36bea",
+          "size": 58
+        }
+      ]
+    },
+    "expect": "accept"
+  },
+  {
+    "id": "mcp-dynamic-refused",
+    "name": "dynamic resources refused",
+    "description": "A skill with resources set to dynamic cannot be content-bound",
+    "entry": {
+      "uri": "skill://reports/daily/SKILL.md",
+      "frontmatter": { "name": "daily", "description": "Assemble today's report" },
+      "resources": "dynamic"
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-final-segment-mismatch",
+    "name": "uri final segment differs from frontmatter name",
+    "description": "The skill path must end with the declared name",
+    "entry": {
+      "uri": "skill://wrong-name/SKILL.md",
+      "frontmatter": { "name": "git-workflow", "description": "Follow team git conventions" },
+      "resources": [
+        {
+          "uri": "skill://wrong-name/SKILL.md",
+          "digest": "sha256:b95a384300adeea2d902f7d19cd7c04b378ef58e09759107b9c7db4dcacbaa25",
+          "size": 190
+        }
+      ]
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-skill-file-missing",
+    "name": "resources omit the SKILL.md entry",
+    "description": "The resources set must include the skill's own SKILL.md",
+    "entry": {
+      "uri": "skill://pdf-processing/SKILL.md",
+      "frontmatter": { "name": "pdf-processing", "description": "Extract PDF documents" },
+      "resources": [
+        {
+          "uri": "skill://pdf-processing/templates/invoice.md",
+          "digest": "sha256:61f4ea6d2c75fde1b4977219e7e3107d491c3c26aefb6686e84d6281c088d9ee",
+          "size": 29
+        }
+      ]
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-traversal-resource",
+    "name": "resource escapes the skill directory",
+    "description": "A resource with a parent segment is refused",
+    "entry": {
+      "uri": "skill://pdf-processing/SKILL.md",
+      "frontmatter": { "name": "pdf-processing", "description": "Extract PDF documents" },
+      "resources": [
+        {
+          "uri": "skill://pdf-processing/SKILL.md",
+          "digest": "sha256:99b737495721155ece826d57521e2d66141ebdc1344a400487481ea2642ab19e",
+          "size": 151
+        },
+        {
+          "uri": "skill://pdf-processing/../outside.md",
+          "digest": "sha256:61f4ea6d2c75fde1b4977219e7e3107d491c3c26aefb6686e84d6281c088d9ee",
+          "size": 29
+        }
+      ]
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-duplicate-uri",
+    "name": "duplicate resource uri",
+    "description": "Each resource uri must appear exactly once",
+    "entry": {
+      "uri": "skill://pdf-processing/SKILL.md",
+      "frontmatter": { "name": "pdf-processing", "description": "Extract PDF documents" },
+      "resources": [
+        {
+          "uri": "skill://pdf-processing/SKILL.md",
+          "digest": "sha256:99b737495721155ece826d57521e2d66141ebdc1344a400487481ea2642ab19e",
+          "size": 151
+        },
+        {
+          "uri": "skill://pdf-processing/SKILL.md",
+          "digest": "sha256:99b737495721155ece826d57521e2d66141ebdc1344a400487481ea2642ab19e",
+          "size": 151
+        }
+      ]
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-invalid-digest",
+    "name": "malformed digest",
+    "description": "Digests must be lowercase sha256 hex with the sha256 prefix",
+    "entry": {
+      "uri": "skill://git-workflow/SKILL.md",
+      "frontmatter": { "name": "git-workflow", "description": "Follow team git conventions" },
+      "resources": [
+        {
+          "uri": "skill://git-workflow/SKILL.md",
+          "digest": "b95a384300adeea2d902f7d19cd7c04b378ef58e09759107b9c7db4dcacbaa25",
+          "size": 190
+        }
+      ]
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-negative-size",
+    "name": "negative resource size",
+    "description": "Sizes must be non-negative safe integers",
+    "entry": {
+      "uri": "skill://git-workflow/SKILL.md",
+      "frontmatter": { "name": "git-workflow", "description": "Follow team git conventions" },
+      "resources": [
+        {
+          "uri": "skill://git-workflow/SKILL.md",
+          "digest": "sha256:b95a384300adeea2d902f7d19cd7c04b378ef58e09759107b9c7db4dcacbaa25",
+          "size": -1
+        }
+      ]
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-invalid-name",
+    "name": "invalid skill name",
+    "description": "Frontmatter names must satisfy the Agent Skills naming rules",
+    "entry": {
+      "uri": "skill://Git Workflow/SKILL.md",
+      "frontmatter": { "name": "Git Workflow", "description": "Follow team git conventions" },
+      "resources": [
+        {
+          "uri": "skill://Git Workflow/SKILL.md",
+          "digest": "sha256:b95a384300adeea2d902f7d19cd7c04b378ef58e09759107b9c7db4dcacbaa25",
+          "size": 190
+        }
+      ]
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-empty-description",
+    "name": "empty description",
+    "description": "Descriptions are required and non-empty",
+    "entry": {
+      "uri": "skill://git-workflow/SKILL.md",
+      "frontmatter": { "name": "git-workflow", "description": "   " },
+      "resources": [
+        {
+          "uri": "skill://git-workflow/SKILL.md",
+          "digest": "sha256:b95a384300adeea2d902f7d19cd7c04b378ef58e09759107b9c7db4dcacbaa25",
+          "size": 190
+        }
+      ]
+    },
+    "expect": "reject"
+  },
+  {
+    "id": "mcp-zero-resources",
+    "name": "empty resources array",
+    "description": "A complete resources array is required and never empty",
+    "entry": {
+      "uri": "skill://git-workflow/SKILL.md",
+      "frontmatter": { "name": "git-workflow", "description": "Follow team git conventions" },
+      "resources": []
+    },
+    "expect": "reject"
+  }
+  ]
+}
