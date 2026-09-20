@@ -7,11 +7,13 @@ import "@deepseek-ai/dsh-session";
 //#region src/types.d.ts
 type ApprovalPolicy = 'always' | 'session' | 'automatic';
 type RemoteDiscovery = 'automatic' | 'on-demand' | 'off';
-type RemoteDiscoveryProvider = 'skills.sh' | 'github';
+type RemoteDiscoveryProvider = 'skills.sh' | 'github' | 'registry-index';
 type RemoteTrustPolicy = 'open' | 'community' | 'corroborated' | 'trusted';
 type RemoteTrustLevel = 'unverified' | 'community' | 'corroborated' | 'trusted';
-type RemoteQualitySignal = 'trusted-owner' | 'cross-source' | 'content-pinned' | 'recent-activity' | 'declared-license' | 'organization-owned' | 'market-adoption' | 'repository-adoption';
-type RemoteQualityWarning = 'single-source' | 'content-not-previewed' | 'activity-unknown' | 'stale-activity' | 'license-missing' | 'low-adoption';
+type RegistryTier = 'official' | 'verified' | 'community' | 'unreviewed';
+type RegistryDiscovery = 'off' | 'automatic';
+type RemoteQualitySignal = 'trusted-owner' | 'cross-source' | 'content-pinned' | 'recent-activity' | 'declared-license' | 'organization-owned' | 'market-adoption' | 'repository-adoption' | 'ecosystem-official' | 'ecosystem-verified' | 'ecosystem-community';
+type RemoteQualityWarning = 'single-source' | 'content-not-previewed' | 'activity-unknown' | 'stale-activity' | 'license-missing' | 'low-adoption' | 'ecosystem-unreviewed';
 type CandidateOrigin = 'registry' | 'cache' | 'remote' | 'mcp';
 type RouterMode = 'lexical' | 'hybrid';
 type EmbeddingProvider = 'ollama' | 'openai-compatible';
@@ -46,6 +48,8 @@ interface SkillFluxConfig {
   readonly remoteHealthFailureThreshold?: number;
   /** How long a repeatedly failing source stays skipped. */
   readonly remoteHealthCooldownMs?: number;
+  /** Federated ecosystem-index ingestion; experimental and off by default. */
+  readonly registryDiscovery?: RegistryDiscovery;
   readonly cacheAutoPrune?: boolean;
   readonly cacheMaxEntries?: number;
   readonly cacheMaxTotalBytes?: number;
@@ -98,6 +102,7 @@ interface ResolvedSkillFluxConfig {
   readonly remoteCacheMaxEntries: number;
   readonly remoteHealthFailureThreshold: number;
   readonly remoteHealthCooldownMs: number;
+  readonly registryDiscovery: RegistryDiscovery;
   readonly cacheAutoPrune: boolean;
   readonly cacheMaxEntries: number;
   readonly cacheMaxTotalBytes: number;
@@ -535,6 +540,47 @@ declare class SkillCache {
   private read;
 }
 //#endregion
+//#region src/registry-source.d.ts
+declare const REGISTRY_MAX_ENTRIES = 1000;
+declare const REGISTRY_MAX_DESCRIPTION_LENGTH = 4096;
+/** One validated entry from a federated ecosystem index. */
+interface RegistryIndexEntry {
+  readonly name: string;
+  readonly description: string;
+  /** Public GitHub repository, e.g. `owner/repo`. */
+  readonly source: string;
+  /** Immutable 40-character commit that the entry is pinned to. */
+  readonly ref: string;
+  /** Advisory ecosystem tier; evidence, never a trust grant. */
+  readonly tier: RegistryTier;
+  readonly installs?: number;
+  readonly license?: string;
+  readonly whenToUse?: string;
+}
+/**
+ * Transport for one federated ecosystem index. Entries are advisory: they
+ * flow into the same immutable-commit, evidence, and approval pipeline as
+ * every other remote candidate.
+ */
+interface RegistryIndexTransport {
+  list(signal?: AbortSignal): Promise<{
+    entries: readonly unknown[];
+    partial: boolean;
+  }>;
+}
+declare function validateRegistryIndexEntry(value: unknown): RegistryIndexEntry | undefined;
+interface RegistryIndexListing {
+  readonly entries: RegistryIndexEntry[];
+  /** True when the index reported truncation or any entry was invalid. */
+  readonly partial: boolean;
+}
+/** Validate and bound one index listing; invalid entries are dropped. */
+declare class RegistryIndexClient {
+  private readonly transport;
+  constructor(transport: RegistryIndexTransport);
+  listEntries(signal?: AbortSignal): Promise<RegistryIndexListing>;
+}
+//#endregion
 //#region src/router.d.ts
 declare function normalizeText(value: string): string;
 declare function tokenize(value: string): Set<string>;
@@ -650,6 +696,8 @@ interface RemoteEvidenceInput {
   readonly hasLicense: boolean;
   readonly discoverySourceCount?: number;
   readonly contentPinned?: boolean;
+  /** Advisory ecosystem tier; evidence, never a trust grant. */
+  readonly registryTier?: RegistryTier;
   readonly now: number;
 }
 interface RemoteQualityEvidence {
@@ -708,6 +756,12 @@ declare class RemoteDiscoveryCache {
 }
 //#endregion
 //#region src/remote.d.ts
+interface RegistryDiscoveryPort {
+  listSeeds(signal?: AbortSignal): Promise<{
+    seeds: RegistryIndexEntry[];
+    partial: boolean;
+  }>;
+}
 interface RemoteDiscoveryOptions {
   readonly searchLimit: number;
   readonly timeoutMs: number;
@@ -723,6 +777,8 @@ interface RemoteDiscoveryOptions {
   readonly cache?: RemoteDiscoveryCache;
   readonly healthFailureThreshold?: number;
   readonly healthCooldownMs?: number;
+  readonly registryDiscovery?: 'off' | 'automatic';
+  readonly registry?: RegistryDiscoveryPort;
 }
 interface RemoteQualityInput extends RemoteEvidenceInput {}
 interface RemoteSearchObservation {
@@ -913,6 +969,7 @@ declare class SkillFluxService extends Service {
   private readonly discovery;
   private readonly providers;
   private readonly mcpSources;
+  private readonly registryIndexes;
   private readonly trustedBySession;
   private readonly cachePruneSessions;
   constructor(ctx: Context, config?: SkillFluxConfig);
@@ -928,6 +985,14 @@ declare class SkillFluxService extends Service {
   registerMcpSource(label: string, client: McpSkillsClient): void;
   unregisterMcpSource(label: string): void;
   mcpSourceLabels(): readonly string[];
+  /**
+   * Register one federated ecosystem index under a host-assigned label. Index
+   * entries are advisory: they join the existing immutable-commit, evidence,
+   * and approval pipeline and never grant trust by themselves.
+   */
+  registerRegistryIndex(label: string, transport: RegistryIndexTransport): void;
+  unregisterRegistryIndex(label: string): void;
+  registryIndexLabels(): readonly string[];
   discover(agent: Agent, query: string, options?: {
     readonly remote?: boolean;
     readonly signal?: AbortSignal;
@@ -1003,5 +1068,5 @@ declare class SkillFluxService extends Service {
   private scheduleSessionCachePrune;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, MCP_MAX_LIST_PAGES, MCP_MAX_RESOURCES_PER_SKILL, MCP_MAX_SKILL_BYTES, MCP_SKILLS_EXTENSION, type McpCandidate, type McpCandidateOptions, type McpDiscovery, McpError, type McpResourceReader, type McpSkillEntry, type McpSkillFrontmatter, type McpSkillListing, type McpSkillResource, McpSkillsClient, McpStdioTransport, type McpStdioTransportOptions, type McpTransport, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, type TokenEstimate, type TokenEstimatorKind, type TokenMeterLike, type TokenMeterMeasurement, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, assertMcpServerLabel, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogEntries, estimateCatalogTokens, estimateTextTokens, estimateWithMeter, inspectSkillDirectory, isLoopbackProxyFailure, mcpCandidates, mcpContentBoundKey, mcpFrontmatterEqual, mcpRelativePath, mcpSkillRoot, name, normalizeText, parseMcpSkillResource, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, resolveTokenMeter, routeScore, selectCandidates, tokenize, validateMcpSkillEntry, verifyUniqueRemoteSkill };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, MCP_MAX_LIST_PAGES, MCP_MAX_RESOURCES_PER_SKILL, MCP_MAX_SKILL_BYTES, MCP_SKILLS_EXTENSION, type McpCandidate, type McpCandidateOptions, type McpDiscovery, McpError, type McpResourceReader, type McpSkillEntry, type McpSkillFrontmatter, type McpSkillListing, type McpSkillResource, McpSkillsClient, McpStdioTransport, type McpStdioTransportOptions, type McpTransport, type MountedSkill, REGISTRY_MAX_DESCRIPTION_LENGTH, REGISTRY_MAX_ENTRIES, type RegistryCandidate, type RegistryDiscovery, RegistryIndexClient, type RegistryIndexEntry, type RegistryIndexListing, type RegistryIndexTransport, type RegistryTier, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, type TokenEstimate, type TokenEstimatorKind, type TokenMeterLike, type TokenMeterMeasurement, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, assertMcpServerLabel, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogEntries, estimateCatalogTokens, estimateTextTokens, estimateWithMeter, inspectSkillDirectory, isLoopbackProxyFailure, mcpCandidates, mcpContentBoundKey, mcpFrontmatterEqual, mcpRelativePath, mcpSkillRoot, name, normalizeText, parseMcpSkillResource, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, resolveTokenMeter, routeScore, selectCandidates, tokenize, validateMcpSkillEntry, validateRegistryIndexEntry, verifyUniqueRemoteSkill };
 //# sourceMappingURL=index.d.ts.map

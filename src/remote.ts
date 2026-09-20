@@ -9,6 +9,7 @@ import {
   type RemoteEvidenceInput,
 } from './remote-governance.js'
 import { RemoteDiscoveryCache } from './remote-cache.js'
+import type { RegistryIndexEntry } from './registry-source.js'
 import { parseSkillMarkdown } from './skill-file.js'
 import type {
   RemoteCandidate,
@@ -80,8 +81,16 @@ interface CandidateSeed {
   readonly description: string
   readonly installs: number
   readonly discoverySources: readonly RemoteDiscoveryProvider[]
+  /** Immutable ref supplied by the seed itself, when the source provides one. */
+  readonly ref?: string
+  /** Advisory ecosystem tier; evidence, never a trust grant. */
+  readonly registryTier?: RegistryIndexEntry['tier']
   readonly path?: string
   readonly skillFileHash?: string
+}
+
+export interface RegistryDiscoveryPort {
+  listSeeds(signal?: AbortSignal): Promise<{ seeds: RegistryIndexEntry[]; partial: boolean }>
 }
 
 export interface RemoteDiscoveryOptions {
@@ -99,6 +108,8 @@ export interface RemoteDiscoveryOptions {
   readonly cache?: RemoteDiscoveryCache
   readonly healthFailureThreshold?: number
   readonly healthCooldownMs?: number
+  readonly registryDiscovery?: 'off' | 'automatic'
+  readonly registry?: RegistryDiscoveryPort
 }
 
 export interface RemoteQualityInput extends RemoteEvidenceInput {}
@@ -126,7 +137,7 @@ export interface RemoteSearchObservation {
 type ProviderOutcome = {
   readonly provider: RemoteDiscoveryProvider
   readonly status: 'ok'
-  readonly value: CandidateSeed[] | GithubCodeSearchItem[]
+  readonly value: CandidateSeed[] | GithubCodeSearchItem[] | RegistryIndexEntry[]
 } | {
   readonly provider: RemoteDiscoveryProvider
   readonly status: 'error'
@@ -135,7 +146,7 @@ type ProviderOutcome = {
 
 function discoveryCacheKey(
   query: string,
-  options: Required<Omit<RemoteDiscoveryOptions, 'githubToken' | 'now' | 'cache'>>,
+  options: Required<Omit<RemoteDiscoveryOptions, 'githubToken' | 'now' | 'cache' | 'registry'>>,
   githubSearchEnabled: boolean,
 ): string {
   return createHash('sha256').update(JSON.stringify({
@@ -150,6 +161,7 @@ function discoveryCacheKey(
     trustedOwners: options.trustedOwners,
     blockedOwners: options.blockedOwners,
     githubSearchEnabled,
+    registryDiscovery: options.registryDiscovery,
   })).digest('hex')
 }
 
@@ -449,7 +461,7 @@ function mergeSeeds(seeds: readonly CandidateSeed[], refBySource: ReadonlyMap<st
   const merged = new Map<string, CandidateSeed>()
   const ambiguous = new Set<string>()
   for (const seed of seeds) {
-    const ref = refBySource.get(seed.source)?.ref
+    const ref = seed.ref ?? refBySource.get(seed.source)?.ref
     if (ref === undefined) continue
     const key = `${seed.source}\0${ref}\0${seed.skillId}`
     if (ambiguous.has(key)) continue
@@ -482,7 +494,8 @@ function mergeSeeds(seeds: readonly CandidateSeed[], refBySource: ReadonlyMap<st
 }
 
 export class RemoteDiscoveryClient {
-  private readonly options: Required<Omit<RemoteDiscoveryOptions, 'githubToken' | 'now' | 'cache'>>
+  private readonly options: Required<Omit<RemoteDiscoveryOptions, 'githubToken' | 'now' | 'cache' | 'registry'>>
+    & { readonly registry: RegistryDiscoveryPort | undefined }
   private readonly githubToken: string | undefined
   private readonly now: () => number
   private readonly cache: RemoteDiscoveryCache | undefined
@@ -506,6 +519,8 @@ export class RemoteDiscoveryClient {
       blockedOwners: options.blockedOwners ?? [],
       healthFailureThreshold: options.healthFailureThreshold ?? 3,
       healthCooldownMs: options.healthCooldownMs ?? 60_000,
+      registryDiscovery: options.registryDiscovery ?? 'off',
+      registry: options.registry,
     }
     this.githubToken = configuredGithubToken(options.githubToken)
     this.now = options.now ?? Date.now
@@ -605,6 +620,17 @@ export class RemoteDiscoveryClient {
         (error): ProviderOutcome => ({ provider: 'github', status: 'error', error }),
       ))
     }
+    if (this.options.registryDiscovery === 'automatic'
+      && this.options.registry !== undefined
+      && this.providerAvailable('registry-index')) {
+      providerTasks.push(this.options.registry.listSeeds(operationSignal).then(
+        (listing): ProviderOutcome => {
+          if (listing.partial) throw new Error('registry index listing is partial')
+          return { provider: 'registry-index', status: 'ok', value: listing.seeds }
+        },
+        (error): ProviderOutcome => ({ provider: 'registry-index', status: 'error', error }),
+      ))
+    }
     if (providerTasks.length === 0) {
       if (this.options.providers.length === 1 && this.options.providers[0] === 'github') {
         throw new Error('GitHub Skill search requires GITHUB_TOKEN or GH_TOKEN')
@@ -633,9 +659,22 @@ export class RemoteDiscoveryClient {
     const githubHits = fulfilled.flatMap(result => result.provider === 'github'
       ? result.value as GithubCodeSearchItem[]
       : []).filter(hit => !blocked(hit.repository.full_name))
+    const registrySeeds = fulfilled.flatMap(result => result.provider === 'registry-index'
+      ? (result.value as RegistryIndexEntry[]).map(seed => ({
+          source: seed.source,
+          skillId: seed.name,
+          name: seed.name,
+          description: seed.description,
+          installs: seed.installs ?? 0,
+          discoverySources: ['registry-index'] as const,
+          ref: seed.ref,
+          registryTier: seed.tier,
+        }))
+      : []).filter(seed => !blocked(seed.source))
     const sources = [...new Set([
       ...skillsSeeds.map(seed => seed.source),
       ...githubHits.map(hit => hit.repository.full_name),
+      ...registrySeeds.map(seed => seed.source),
     ])]
     const snapshots = await resolveRepositories(sources, operationSignal, this.githubToken)
     if (snapshots.size < sources.length) degraded = true
@@ -650,6 +689,7 @@ export class RemoteDiscoveryClient {
     const seeds = mergeSeeds([
       ...skillsSeeds,
       ...githubSeeds.flatMap(result => result.status === 'fulfilled' ? [result.value] : []),
+      ...registrySeeds,
     ], snapshots)
     const trustedOwners = new Set(this.options.trustedOwners.map(owner => owner.toLocaleLowerCase('en-US')))
     const now = this.now()
@@ -657,6 +697,7 @@ export class RemoteDiscoveryClient {
       const snapshot = snapshots.get(seed.source)
       if (snapshot === undefined || snapshot.archived || snapshot.disabled || snapshot.private
         || snapshot.stars < this.options.minStars) return []
+      const ref = seed.ref ?? snapshot.ref
       const relevanceScore = routeScore(normalized, { name: seed.name, description: seed.description })
       if (relevanceScore === 0) return []
       const owner = seed.source.split('/')[0]?.toLocaleLowerCase('en-US') ?? ''
@@ -673,6 +714,7 @@ export class RemoteDiscoveryClient {
         hasLicense: snapshot.license !== undefined,
         discoverySourceCount: seed.discoverySources.length,
         contentPinned: seed.path !== undefined && seed.skillFileHash !== undefined,
+        ...(seed.registryTier === undefined ? {} : { registryTier: seed.registryTier }),
         now,
       })
       const qualityScore = evidence.breakdown.total
@@ -680,12 +722,12 @@ export class RemoteDiscoveryClient {
       if (!remoteTrustPolicyAllows(evidence.trustLevel, this.options.trustPolicy)) return []
       const age = activityAgeDays(snapshot.pushedAt, now)
       return [{
-        id: candidateId('remote', seed.source, snapshot.ref, seed.skillId),
+        id: candidateId('remote', seed.source, ref, seed.skillId),
         origin: 'remote',
         name: seed.name,
         description: seed.description,
         source: seed.source,
-        ref: snapshot.ref,
+        ref,
         score: qualityScore,
         selection: 'remote-quality',
         baseScore: relevanceScore,

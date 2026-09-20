@@ -361,6 +361,7 @@ adaptiveHalfLifeDays: 30
 mcpDiscovery: automatic        # automatic | off; gates registered MCP Skills sources
 mcpTrustedServers: []          # host-assigned labels allowed trusted evidence
 mcpBlockedServers: []          # host-assigned labels whose skills are always refused
+registryDiscovery: off         # off | automatic; experimental federated index ingestion
 routes: []
 ```
 
@@ -539,6 +540,26 @@ id and never overwrites an approved snapshot. MCP content is always tagged with
 its server label, never executes during discovery or loading, and never
 silently shadows a same-named skill from another origin. A source that cannot
 be listed fails open for that turn and is reported as non-authoritative.
+
+### Federated registry indexes (experimental)
+
+`registryDiscovery: automatic` (off by default) lets the host register a
+federated ecosystem index whose entries flow into the same immutable-commit,
+evidence, and approval pipeline as every other remote candidate:
+
+```ts
+import type { RegistryIndexTransport } from 'dsh-skillflux'
+
+const transport: RegistryIndexTransport = { list: () => index.fetch() }
+ctx.skillFlux.registerRegistryIndex('ds-ecosystem', transport)
+```
+
+Each entry is pinned to a 40-character commit and carries an advisory
+`official | verified | community | unreviewed` tier. Tiers surface as quality
+signals and warnings; they never grant trust, never bypass `remoteTrustPolicy`
+or blocked owners, and never change the content-pinning requirements. A
+partial or failing index listing degrades the discovery observation without
+weakening the candidates that remain. Index queries are never persisted.
 
 ## Model tools and user commands
 

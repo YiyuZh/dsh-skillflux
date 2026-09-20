@@ -305,6 +305,7 @@ adaptiveHalfLifeDays: 30
 mcpDiscovery: automatic        # automatic | off；控制已注册 MCP Skills 来源
 mcpTrustedServers: []          # 允许携带 trusted 证据的主机指定来源标签
 mcpBlockedServers: []          # 始终拒绝的主机指定来源标签
+registryDiscovery: off         # off | automatic；实验性的联邦索引摄入
 routes: []
 ```
 
@@ -459,6 +460,24 @@ digest 与 size，再把 SKILL.md 的 frontmatter 与条目逐字段比对，最
 覆盖已审批快照。MCP 内容始终带有来源标签，发现与加载期间从不执行，也不会静默
 遮蔽其他来源的同名技能。无法列出某个来源时，本回合 fail-open 并标记为
 非权威观测。
+
+### 联邦注册表索引（实验性）
+
+`registryDiscovery: automatic`（默认关闭）允许宿主注册联邦生态索引，其条目会
+进入与其他远程候选完全相同的不可变 commit、证据与审批管线：
+
+```ts
+import type { RegistryIndexTransport } from 'dsh-skillflux'
+
+const transport: RegistryIndexTransport = { list: () => index.fetch() }
+ctx.skillFlux.registerRegistryIndex('ds-ecosystem', transport)
+```
+
+每个条目固定到 40 位 commit，并携带咨询性的
+`official | verified | community | unreviewed` 层级。层级只作为质量信号与
+告警出现：它绝不授予信任、绝不绕过 `remoteTrustPolicy` 或屏蔽 owner，也不
+改变内容固定的要求。部分或失败的索引列表会降级发现观测，但不会削弱保留下来的
+候选。索引查询从不持久化。
 
 ## 模型工具和用户命令
 

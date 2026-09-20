@@ -122,6 +122,9 @@ MCP transport changes should update
 [`tests/mcp-transport.spec.ts`](tests/mcp-transport.spec.ts) and the
 [`scripts/mcp-skills-server.mjs`](scripts/mcp-skills-server.mjs) conformance
 fixture.
+Federated registry index changes (entry validation, tier evidence, or seed
+resolution) should update
+[`evals/registry-source-cases.json`](evals/registry-source-cases.json).
 Provider lifecycle, lazy-download, approval, concurrency, or turn-release
 changes should extend
 [`tests/provider-eval.spec.ts`](tests/provider-eval.spec.ts).
