@@ -484,4 +484,56 @@ describe('remote discovery', () => {
     expect(recent).toBeGreaterThan(maintained)
     expect(maintained).toBeGreaterThan(stale)
   })
+
+  it('degrades a repeatedly failing source and skips it during the cooldown', async () => {
+    let nowMs = Date.parse('2026-08-24T00:00:00Z')
+    const fetchMock = vi.fn(async () => new Response('down', { status: 500 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new RemoteDiscoveryClient({
+      searchLimit: 5,
+      timeoutMs: 1_000,
+      providers: ['skills.sh'],
+      healthFailureThreshold: 2,
+      healthCooldownMs: 60_000,
+      now: () => nowMs,
+    })
+    await expect(client.searchWithStatus('pdf')).rejects.toThrow('skills.sh search failed')
+    await expect(client.searchWithStatus('pdf')).rejects.toThrow('skills.sh search failed')
+    expect(client.remoteSourceHealth()).toEqual([
+      { provider: 'skills.sh', consecutiveFailures: 2, cooldownUntil: nowMs + 60_000 },
+    ])
+    const skipped = await client.searchWithStatus('pdf')
+    expect(skipped).toEqual({ candidates: [], complete: false })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    nowMs += 61_000
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ skills: [] }), { status: 200 }))
+    const recovered = await client.searchWithStatus('pdf')
+    expect(recovered).toEqual({ candidates: [], complete: true })
+    expect(client.remoteSourceHealth()).toEqual([
+      { provider: 'skills.sh', consecutiveFailures: 0 },
+    ])
+  })
+
+  it('reports an incomplete observation when one of several providers fails', async () => {
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.startsWith('https://skills.sh/')) return new Response('down', { status: 500 })
+      if (url.startsWith('https://api.github.com/search/code')) {
+        return new Response(JSON.stringify({ items: [] }), { status: 200 })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new RemoteDiscoveryClient({
+      searchLimit: 5,
+      timeoutMs: 1_000,
+      providers: ['skills.sh', 'github'],
+      githubToken: 'test-token',
+      now: () => Date.parse('2026-08-24T00:00:00Z'),
+    })
+    const observation = await client.searchWithStatus('pdf')
+    expect(observation).toEqual({ candidates: [], complete: false })
+    expect(client.remoteSourceHealth().map(item => item.consecutiveFailures)).toEqual([1, 0])
+  })
 })

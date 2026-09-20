@@ -273,7 +273,7 @@ approvalPolicy: always       # always | session | automatic
 remoteDiscovery: automatic   # automatic | on-demand | off
 remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
-remoteAutoMountLimit: 3      # automatic approval only; 1 disables fallback
+remoteAutoMountLimit: 3      # max remote candidates published for lazy activation; 1 disables fallback
 remoteSearchTimeoutMs: 30000
 remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
@@ -284,6 +284,8 @@ remoteBlockedOwners: []
 remoteCacheTtlMs: 300000                  # 0 disables
 remoteCacheStaleIfErrorMs: 86400000       # additional stale window
 remoteCacheMaxEntries: 100
+remoteHealthFailureThreshold: 3           # consecutive failures before a source is degraded
+remoteHealthCooldownMs: 60000             # degraded source skip window
 cacheAutoPrune: true
 cacheMaxEntries: 100
 cacheMaxTotalBytes: 536870912              # 512 MiB across installed Skills

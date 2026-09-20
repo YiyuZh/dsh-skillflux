@@ -14,6 +14,7 @@ import type {
   RemoteCandidate,
   RemoteDiscoveryCacheStats,
   RemoteDiscoveryProvider,
+  RemoteSourceHealth,
   RemoteTrustPolicy,
 } from './types.js'
 
@@ -96,6 +97,8 @@ export interface RemoteDiscoveryOptions {
   readonly githubToken?: string
   readonly now?: () => number
   readonly cache?: RemoteDiscoveryCache
+  readonly healthFailureThreshold?: number
+  readonly healthCooldownMs?: number
 }
 
 export interface RemoteQualityInput extends RemoteEvidenceInput {}
@@ -112,6 +115,22 @@ function boundedQuery(query: string): string {
 interface RemoteSearchResult {
   readonly candidates: RemoteCandidate[]
   readonly degraded: boolean
+}
+
+export interface RemoteSearchObservation {
+  readonly candidates: RemoteCandidate[]
+  /** True when discovery completed without provider failures or stale fallback. */
+  readonly complete: boolean
+}
+
+type ProviderOutcome = {
+  readonly provider: RemoteDiscoveryProvider
+  readonly status: 'ok'
+  readonly value: CandidateSeed[] | GithubCodeSearchItem[]
+} | {
+  readonly provider: RemoteDiscoveryProvider
+  readonly status: 'error'
+  readonly error: unknown
 }
 
 function discoveryCacheKey(
@@ -467,6 +486,7 @@ export class RemoteDiscoveryClient {
   private readonly githubToken: string | undefined
   private readonly now: () => number
   private readonly cache: RemoteDiscoveryCache | undefined
+  private readonly health = new Map<RemoteDiscoveryProvider, { failures: number; cooldownUntil: number }>()
 
   constructor(searchLimit: number, timeoutMs: number)
   constructor(options: RemoteDiscoveryOptions)
@@ -484,6 +504,8 @@ export class RemoteDiscoveryClient {
       trustPolicy: options.trustPolicy ?? 'community',
       trustedOwners: options.trustedOwners ?? [],
       blockedOwners: options.blockedOwners ?? [],
+      healthFailureThreshold: options.healthFailureThreshold ?? 3,
+      healthCooldownMs: options.healthCooldownMs ?? 60_000,
     }
     this.githubToken = configuredGithubToken(options.githubToken)
     this.now = options.now ?? Date.now
@@ -495,32 +517,67 @@ export class RemoteDiscoveryClient {
   }
 
   async search(query: string, signal?: AbortSignal): Promise<RemoteCandidate[]> {
+    const observation = await this.searchWithStatus(query, signal)
+    return observation.candidates
+  }
+
+  async searchWithStatus(query: string, signal?: AbortSignal): Promise<RemoteSearchObservation> {
     const normalized = boundedQuery(query)
-    if (normalized.length === 0) return []
+    if (normalized.length === 0) return { candidates: [], complete: true }
     signal?.throwIfAborted()
     const key = discoveryCacheKey(normalized, this.options, this.githubSearchEnabled)
     const cached = await this.cache?.get(key)
     signal?.throwIfAborted()
-    if (cached?.state === 'fresh') return [...cached.candidates]
+    if (cached?.state === 'fresh') return { candidates: [...cached.candidates], complete: true }
     const operationSignal = timeoutSignal(signal, this.options.timeoutMs)
     try {
       const live = await this.searchLive(normalized, operationSignal)
       if (cached?.state === 'stale' && live.degraded && live.candidates.length === 0) {
         this.cache?.recordStaleHit()
-        return [...cached.candidates]
+        return { candidates: [...cached.candidates], complete: false }
       }
       if (!live.degraded || (cached === undefined && live.candidates.length > 0)) {
         await this.cache?.put(key, live.candidates)
       }
-      return live.candidates
+      return { candidates: live.candidates, complete: !live.degraded }
     } catch (error: unknown) {
       signal?.throwIfAborted()
       if (cached?.state === 'stale') {
         this.cache?.recordStaleHit()
-        return [...cached.candidates]
+        return { candidates: [...cached.candidates], complete: false }
       }
       throw error
     }
+  }
+
+  remoteSourceHealth(): RemoteSourceHealth[] {
+    const nowMs = this.now()
+    return this.options.providers.map(provider => {
+      const entry = this.health.get(provider)
+      return {
+        provider,
+        consecutiveFailures: entry?.failures ?? 0,
+        ...(entry !== undefined && entry.cooldownUntil > nowMs ? { cooldownUntil: entry.cooldownUntil } : {}),
+      }
+    })
+  }
+
+  private providerAvailable(provider: RemoteDiscoveryProvider): boolean {
+    const entry = this.health.get(provider)
+    return entry === undefined || entry.cooldownUntil <= this.now()
+  }
+
+  private recordHealth(provider: RemoteDiscoveryProvider, success: boolean): void {
+    if (success) {
+      this.health.delete(provider)
+      return
+    }
+    const current = this.health.get(provider)
+    const failures = (current?.failures ?? 0) + 1
+    const cooldownUntil = failures >= this.options.healthFailureThreshold
+      ? this.now() + this.options.healthCooldownMs
+      : (current?.cooldownUntil ?? 0)
+    this.health.set(provider, { failures, cooldownUntil })
   }
 
   async discoveryCacheStats(): Promise<RemoteDiscoveryCacheStats | undefined> {
@@ -535,31 +592,35 @@ export class RemoteDiscoveryClient {
     const poolLimit = this.githubToken === undefined
       ? this.options.searchLimit
       : Math.min(20, Math.max(this.options.searchLimit, this.options.searchLimit * 2))
-    const providerTasks: Array<Promise<{
-      provider: RemoteDiscoveryProvider
-      value: CandidateSeed[] | GithubCodeSearchItem[]
-    }>> = []
-    if (this.options.providers.includes('skills.sh')) {
-      providerTasks.push(searchSkillsSh(normalized, poolLimit, operationSignal)
-        .then(value => ({ provider: 'skills.sh' as const, value })))
+    const providerTasks: Array<Promise<ProviderOutcome>> = []
+    if (this.options.providers.includes('skills.sh') && this.providerAvailable('skills.sh')) {
+      providerTasks.push(searchSkillsSh(normalized, poolLimit, operationSignal).then(
+        (value): ProviderOutcome => ({ provider: 'skills.sh', status: 'ok', value }),
+        (error): ProviderOutcome => ({ provider: 'skills.sh', status: 'error', error }),
+      ))
     }
-    if (this.options.providers.includes('github') && this.githubToken !== undefined) {
-      providerTasks.push(searchGithub(normalized, poolLimit, operationSignal, this.githubToken)
-        .then(value => ({ provider: 'github' as const, value })))
+    if (this.options.providers.includes('github') && this.githubToken !== undefined && this.providerAvailable('github')) {
+      providerTasks.push(searchGithub(normalized, poolLimit, operationSignal, this.githubToken).then(
+        (value): ProviderOutcome => ({ provider: 'github', status: 'ok', value }),
+        (error): ProviderOutcome => ({ provider: 'github', status: 'error', error }),
+      ))
     }
     if (providerTasks.length === 0) {
       if (this.options.providers.length === 1 && this.options.providers[0] === 'github') {
         throw new Error('GitHub Skill search requires GITHUB_TOKEN or GH_TOKEN')
       }
-      return { candidates: [], degraded: false }
+      return { candidates: [], degraded: true }
     }
-    const providerResults = await Promise.allSettled(providerTasks)
+    const outcomes = await Promise.all(providerTasks)
     operationSignal.throwIfAborted()
-    const fulfilled = providerResults.flatMap(result => result.status === 'fulfilled' ? [result.value] : [])
-    let degraded = providerResults.some(result => result.status === 'rejected')
+    for (const outcome of outcomes) this.recordHealth(outcome.provider, outcome.status === 'ok')
+    const fulfilled = outcomes.flatMap(outcome => outcome.status === 'ok'
+      ? [{ provider: outcome.provider, value: outcome.value }]
+      : [])
+    let degraded = outcomes.some(outcome => outcome.status === 'error')
     if (fulfilled.length === 0) {
-      const rejected = providerResults.find(result => result.status === 'rejected')
-      throw rejected?.reason instanceof Error ? rejected.reason : new Error('remote Skill discovery failed')
+      const failed = outcomes.find(outcome => outcome.status === 'error')
+      throw failed?.error instanceof Error ? failed.error : new Error('remote Skill discovery failed')
     }
     const blockedOwners = new Set(this.options.blockedOwners.map(owner => owner.toLocaleLowerCase('en-US')))
     const blocked = (source: string): boolean => {

@@ -39,6 +39,10 @@ interface SkillFluxConfig {
   readonly remoteCacheTtlMs?: number;
   readonly remoteCacheStaleIfErrorMs?: number;
   readonly remoteCacheMaxEntries?: number;
+  /** Consecutive provider failures that trigger a cooldown. */
+  readonly remoteHealthFailureThreshold?: number;
+  /** How long a repeatedly failing source stays skipped. */
+  readonly remoteHealthCooldownMs?: number;
   readonly cacheAutoPrune?: boolean;
   readonly cacheMaxEntries?: number;
   readonly cacheMaxTotalBytes?: number;
@@ -84,6 +88,8 @@ interface ResolvedSkillFluxConfig {
   readonly remoteCacheTtlMs: number;
   readonly remoteCacheStaleIfErrorMs: number;
   readonly remoteCacheMaxEntries: number;
+  readonly remoteHealthFailureThreshold: number;
+  readonly remoteHealthCooldownMs: number;
   readonly cacheAutoPrune: boolean;
   readonly cacheMaxEntries: number;
   readonly cacheMaxTotalBytes: number;
@@ -197,6 +203,11 @@ interface SkillFluxCatalog {
   readonly candidates: readonly SkillFluxCandidate[];
   /** Whether the current discovery is authoritative and may be cached. */
   readonly complete: boolean;
+}
+interface RemoteSourceHealth {
+  readonly provider: RemoteDiscoveryProvider;
+  readonly consecutiveFailures: number;
+  readonly cooldownUntil?: number;
 }
 interface MountedSkill {
   readonly candidateId: string;
@@ -558,18 +569,30 @@ interface RemoteDiscoveryOptions {
   readonly githubToken?: string;
   readonly now?: () => number;
   readonly cache?: RemoteDiscoveryCache;
+  readonly healthFailureThreshold?: number;
+  readonly healthCooldownMs?: number;
 }
 interface RemoteQualityInput extends RemoteEvidenceInput {}
+interface RemoteSearchObservation {
+  readonly candidates: RemoteCandidate[];
+  /** True when discovery completed without provider failures or stale fallback. */
+  readonly complete: boolean;
+}
 declare function remoteQualityScore(input: RemoteQualityInput): number;
 declare class RemoteDiscoveryClient {
   private readonly options;
   private readonly githubToken;
   private readonly now;
   private readonly cache;
+  private readonly health;
   constructor(searchLimit: number, timeoutMs: number);
   constructor(options: RemoteDiscoveryOptions);
   get githubSearchEnabled(): boolean;
   search(query: string, signal?: AbortSignal): Promise<RemoteCandidate[]>;
+  searchWithStatus(query: string, signal?: AbortSignal): Promise<RemoteSearchObservation>;
+  remoteSourceHealth(): RemoteSourceHealth[];
+  private providerAvailable;
+  private recordHealth;
   discoveryCacheStats(): Promise<RemoteDiscoveryCacheStats | undefined>;
   clearDiscoveryCache(): Promise<number>;
   private searchLive;
@@ -707,5 +730,5 @@ declare class SkillFluxService extends Service {
   private scheduleSessionCachePrune;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, routeScore, selectCandidates, tokenize, verifyUniqueRemoteSkill };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, routeScore, selectCandidates, tokenize, verifyUniqueRemoteSkill };
 //# sourceMappingURL=index.d.ts.map

@@ -114,6 +114,8 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   remoteCacheTtlMs: 5 * 60_000,
   remoteCacheStaleIfErrorMs: 24 * 60 * 60_000,
   remoteCacheMaxEntries: 100,
+  remoteHealthFailureThreshold: 3,
+  remoteHealthCooldownMs: 60_000,
   cacheAutoPrune: true,
   cacheMaxEntries: 100,
   cacheMaxTotalBytes: 512 * 1024 * 1024,
@@ -289,6 +291,18 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
       config.remoteCacheMaxEntries ?? DEFAULTS.remoteCacheMaxEntries,
       1,
       1_000,
+    ),
+    remoteHealthFailureThreshold: boundedInteger(
+      'remoteHealthFailureThreshold',
+      config.remoteHealthFailureThreshold ?? DEFAULTS.remoteHealthFailureThreshold,
+      1,
+      100,
+    ),
+    remoteHealthCooldownMs: boundedInteger(
+      'remoteHealthCooldownMs',
+      config.remoteHealthCooldownMs ?? DEFAULTS.remoteHealthCooldownMs,
+      0,
+      3_600_000,
     ),
     cacheAutoPrune: config.cacheAutoPrune ?? DEFAULTS.cacheAutoPrune,
     cacheMaxEntries: boundedInteger(
@@ -493,6 +507,8 @@ export class SkillFluxService extends Service {
     remoteCacheTtlMs: z.number().default(DEFAULTS.remoteCacheTtlMs),
     remoteCacheStaleIfErrorMs: z.number().default(DEFAULTS.remoteCacheStaleIfErrorMs),
     remoteCacheMaxEntries: z.number().default(DEFAULTS.remoteCacheMaxEntries),
+    remoteHealthFailureThreshold: z.number().default(DEFAULTS.remoteHealthFailureThreshold),
+    remoteHealthCooldownMs: z.number().default(DEFAULTS.remoteHealthCooldownMs),
     cacheAutoPrune: z.boolean().default(DEFAULTS.cacheAutoPrune),
     cacheMaxEntries: z.number().default(DEFAULTS.cacheMaxEntries),
     cacheMaxTotalBytes: z.number().default(DEFAULTS.cacheMaxTotalBytes),
@@ -572,6 +588,8 @@ export class SkillFluxService extends Service {
       trustedOwners: this.config.remoteTrustedOwners,
       blockedOwners: this.config.remoteBlockedOwners,
       cache: discoveryCache,
+      healthFailureThreshold: this.config.remoteHealthFailureThreshold,
+      healthCooldownMs: this.config.remoteHealthCooldownMs,
     })
     this.usage = this.config.usageTracking
       ? new UsageStore({
@@ -1051,8 +1069,15 @@ export class SkillFluxService extends Service {
         : `Router: hybrid (${this.config.embeddingProvider}, ${this.config.embeddingModel}); embedding requests ${stats?.requests ?? 0}, cache ${stats?.cacheEntries ?? 0}/${this.config.embeddingCacheSize}.`
       const telemetry = `Usage tracking: ${this.config.usageTracking ? 'on' : 'off'}; adaptive routing: ${this.config.adaptiveRouting ? 'on' : 'off'}.`
       const catalogBudget = catalog.budget === undefined ? 'off' : String(catalog.budget)
+      const sourceHealth = this.remote.remoteSourceHealth()
       const discovery = `Remote discovery: ${this.config.remoteDiscovery}; providers ${this.config.remoteProviders
-        .map(provider => provider === 'github' && !this.remote.githubSearchEnabled ? 'github (token unavailable)' : provider)
+        .map(provider => {
+          if (provider === 'github' && !this.remote.githubSearchEnabled) return 'github (token unavailable)'
+          const health = sourceHealth.find(item => item.provider === provider)
+          if (health?.cooldownUntil !== undefined) return `${provider} (degraded, ${health.consecutiveFailures} failures)`
+          if ((health?.consecutiveFailures ?? 0) > 0) return `${provider} (${health?.consecutiveFailures ?? 0} failures)`
+          return provider
+        })
         .join(', ')}; evidence policy ${this.config.remoteTrustPolicy}; quality >= ${this.config.remoteMinQualityScore}; stars >= ${this.config.remoteMinStars}; recent window ${this.config.remoteRecentActivityDays} days; ${this.config.remoteBlockedOwners.length} blocked owner(s).`
       const discoveryCacheStatus = discoveryCache === undefined
         ? 'Remote discovery cache: unavailable.'
@@ -1223,42 +1248,55 @@ export class SkillFluxService extends Service {
       }
       if (!accepted && budgetSkipped) this.markRoutingOutcome(state, candidate.id, 'budget-skipped')
     }
-    state.published = { candidates: published, complete: true }
-    this.providers.invalidate(agent)
-    if (state.active.size > 0 || published.length > 0 || this.config.remoteDiscovery !== 'automatic') {
+    if (this.config.remoteDiscovery !== 'automatic') {
+      state.published = { candidates: published, complete: true }
+      this.providers.invalidate(agent)
       return updateRemoteCandidates(agent, [])
     }
-    let discoveredRemote: RemoteCandidate[]
+    const localFilled = state.active.size + published.length >= this.config.maxActiveSkills
+    if (localFilled) {
+      // A confident local shortlist fills every slot; skip pointless traffic.
+      state.published = { candidates: published, complete: true }
+      this.providers.invalidate(agent)
+      return updateRemoteCandidates(agent, [])
+    }
+    let remoteCandidates: RemoteCandidate[] = []
+    let remoteComplete = false
     try {
-      discoveredRemote = await this.remote.search(automaticDiscoveryQuery(task), signal)
+      const observation = await this.remote.searchWithStatus(automaticDiscoveryQuery(task), signal)
       signal.throwIfAborted()
       this.assertStateCurrent(state, generation)
+      remoteCandidates = observation.candidates
+      remoteComplete = observation.complete
     } catch (error: unknown) {
       signal.throwIfAborted()
       if (error instanceof ExpiredAgentStateError) throw error
       this.runtimeCtx.logger.warn(`SkillFlux remote discovery skipped: ${errorMessage(error)}`)
-      // Incomplete observation: keep the last-good catalog contract by
-      // publishing an empty but non-authoritative provider observation.
-      state.published = { candidates: [], complete: false }
+      // Keep local candidates visible but mark the observation
+      // non-authoritative so the registry retains its last-good catalog.
+      state.published = { candidates: published, complete: false }
       this.providers.invalidate(agent)
       return updateRemoteCandidates(agent, [])
     }
+    const remainingSlots = this.config.maxActiveSkills - state.active.size - published.length
     const remote: RemoteCandidate[] = []
-    for (const candidate of discoveredRemote) {
+    for (const candidate of remoteCandidates) {
       if (this.catalogFitsBudget(state, candidate)) remote.push(candidate)
       else state.lastRouting.push({ ...routingTrace(candidate, turn), outcome: 'budget-skipped' })
     }
     for (const candidate of remote) state.candidates.set(candidate.id, candidate)
     if (remote.length === 0) {
-      state.published = { candidates: [], complete: true }
+      state.published = { candidates: published, complete: remoteComplete }
       this.providers.invalidate(agent)
       return updateRemoteCandidates(agent, [])
     }
     // Publish remote metadata for lazy activation; approval happens when the
     // model actually calls `skill`, just before the provider downloads.
     // Blocked or under-trust candidates stay out of the model-facing catalog.
-    const publishable = remote.filter(candidate => candidateGovernanceReason(candidate, this.config) === undefined)
-    state.published = { candidates: publishable.slice(0, this.config.remoteAutoMountLimit), complete: true }
+    const publishable = remote
+      .filter(candidate => candidateGovernanceReason(candidate, this.config) === undefined)
+      .slice(0, Math.min(this.config.remoteAutoMountLimit, remainingSlots))
+    state.published = { candidates: [...published, ...publishable], complete: remoteComplete }
     this.providers.invalidate(agent)
     return updateRemoteCandidates(agent, remote.filter(candidate => state.candidates.has(candidate.id)))
   }
