@@ -29,18 +29,25 @@ import {
   governedCacheCandidates,
   retriedSnapshot,
   type DiscoveryHost,
+  type McpDiscoveryPort,
 } from './discovery.js'
 import { EmbeddingRouter } from './embedding.js'
+import {
+  McpSkillsClient,
+  assertMcpServerLabel,
+  mcpCandidates,
+} from './mcp-source.js'
 import { SKILLFLUX_PROVIDER, SkillFluxProviderManager } from './provider.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { RemoteDiscoveryCache } from './remote-cache.js'
-import { cacheCandidates, registryCandidates } from './router.js'
+import { cacheCandidates, registryCandidates, routeScore } from './router.js'
 import { ExpiredAgentStateError, TurnStateRegistry, skillLookup, type AgentState } from './state.js'
 import { UsageStore } from './usage.js'
 import type {
   CacheEntry,
   CatalogStats,
   EmbeddingRouterStats,
+  McpCandidate,
   MountedSkill,
   RemoteCandidate,
   RemoteDiscoveryCacheStats,
@@ -93,6 +100,26 @@ export {
   type RemoteDiscoveryCacheState,
 } from './remote-cache.js'
 export { UsageStore, type AdaptiveUsageOptions, type UsageStoreOptions } from './usage.js'
+export {
+  MCP_MAX_LIST_PAGES,
+  MCP_MAX_RESOURCES_PER_SKILL,
+  MCP_MAX_SKILL_BYTES,
+  MCP_SKILLS_EXTENSION,
+  McpError,
+  McpSkillsClient,
+  assertMcpServerLabel,
+  mcpCandidates,
+  mcpContentBoundKey,
+  mcpFrontmatterEqual,
+  mcpRelativePath,
+  mcpSkillRoot,
+  parseMcpSkillResource,
+  validateMcpSkillEntry,
+  type McpCandidateOptions,
+  type McpResourceReader,
+  type McpSkillListing,
+  type McpTransport,
+} from './mcp-source.js'
 
 export const name = 'skillflux'
 const OLLAMA_EMBEDDING_ENDPOINT = 'http://127.0.0.1:11434/api/embed'
@@ -141,6 +168,9 @@ const DEFAULTS: ResolvedSkillFluxConfig = {
   adaptiveMaxBoost: 6,
   adaptiveMinUses: 2,
   adaptiveHalfLifeDays: 30,
+  mcpDiscovery: 'automatic',
+  mcpTrustedServers: [],
+  mcpBlockedServers: [],
   routes: [],
 }
 
@@ -204,6 +234,17 @@ function remoteOwners(name: 'remoteTrustedOwners' | 'remoteBlockedOwners', value
     }
   }
   return [...new Set(owners.map(owner => owner.toLocaleLowerCase('en-US')))]
+    .sort((left, right) => left.localeCompare(right, 'en'))
+}
+
+function mcpServerLabels(name: 'mcpTrustedServers' | 'mcpBlockedServers', values: readonly string[]): readonly string[] {
+  const labels = values.map(value => value.trim()).filter(value => value.length > 0)
+  for (const label of labels) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(label)) {
+      throw new Error(`dsh-skillflux: invalid MCP server label "${label}" in ${name}`)
+    }
+  }
+  return [...new Set(labels.map(label => label.toLocaleLowerCase('en-US')))]
     .sort((left, right) => left.localeCompare(right, 'en'))
 }
 
@@ -392,6 +433,9 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
       0.1,
       3_650,
     ),
+    mcpDiscovery: config.mcpDiscovery ?? DEFAULTS.mcpDiscovery,
+    mcpTrustedServers: mcpServerLabels('mcpTrustedServers', config.mcpTrustedServers ?? DEFAULTS.mcpTrustedServers),
+    mcpBlockedServers: mcpServerLabels('mcpBlockedServers', config.mcpBlockedServers ?? DEFAULTS.mcpBlockedServers),
     routes: config.routes ?? DEFAULTS.routes,
   }
   if (resolved.adaptiveRouting && !resolved.usageTracking) {
@@ -401,6 +445,11 @@ function resolveConfig(config: SkillFluxConfig): ResolvedSkillFluxConfig {
   const conflictingOwner = resolved.remoteTrustedOwners.find(owner => blockedOwners.has(owner))
   if (conflictingOwner !== undefined) {
     throw new Error(`dsh-skillflux: GitHub owner "${conflictingOwner}" cannot be both trusted and blocked`)
+  }
+  const blockedServers = new Set(resolved.mcpBlockedServers)
+  const conflictingServer = resolved.mcpTrustedServers.find(label => blockedServers.has(label))
+  if (conflictingServer !== undefined) {
+    throw new Error(`dsh-skillflux: MCP server "${conflictingServer}" cannot be both trusted and blocked`)
   }
   return resolved
 }
@@ -534,6 +583,9 @@ export class SkillFluxService extends Service {
     adaptiveMaxBoost: z.number().default(DEFAULTS.adaptiveMaxBoost),
     adaptiveMinUses: z.number().default(DEFAULTS.adaptiveMinUses),
     adaptiveHalfLifeDays: z.number().default(DEFAULTS.adaptiveHalfLifeDays),
+    mcpDiscovery: z.union(['automatic', 'off'] as const).default(DEFAULTS.mcpDiscovery),
+    mcpTrustedServers: z.array(z.string()).default([]),
+    mcpBlockedServers: z.array(z.string()).default([]),
     routes: z.array(routeRuleSchema).default([]),
   })
 
@@ -557,6 +609,7 @@ export class SkillFluxService extends Service {
   private readonly turnStates: TurnStateRegistry
   private readonly discovery: DiscoveryCoordinator
   private readonly providers: SkillFluxProviderManager
+  private readonly mcpSources = new Map<string, McpSkillsClient>()
   private readonly trustedBySession = new WeakMap<Session, Set<string>>()
   private readonly cachePruneSessions = new WeakSet<Session>()
 
@@ -709,6 +762,9 @@ export class SkillFluxService extends Service {
   }
 
   private get discoveryHost(): DiscoveryHost {
+    const mcp: McpDiscoveryPort = {
+      listCandidates: (query, signal) => this.listMcpCandidates(query, signal),
+    }
     return {
       runtimeCtx: this.runtimeCtx,
       cache: this.cache,
@@ -716,6 +772,7 @@ export class SkillFluxService extends Service {
       config: this.config,
       embedding: this.embedding,
       usage: this.usage,
+      mcp,
     }
   }
 
@@ -727,6 +784,7 @@ export class SkillFluxService extends Service {
       usage: this.usage,
       trustedBySession: this.trustedBySession,
       cachePruneSessions: this.cachePruneSessions,
+      mcpReader: (label, uri, signal) => this.readMcpResource(label, uri, signal),
       trackUsage: operation => { this.trackUsage(operation) },
       acquireCacheLease: () => this.acquireCacheLease(),
       trackActiveLeaseCleanup: operation => this.trackActiveLeaseCleanup(operation),
@@ -743,8 +801,28 @@ export class SkillFluxService extends Service {
       config: this.config,
       trustedBySession: this.trustedBySession,
       candidate: (agent, candidateId) => this.candidate(agent, candidateId),
-      publishedRemote: (agent, name) => this.publishedRemote(agent, name),
+      publishedCandidate: (agent, name) => this.publishedCandidate(agent, name),
     }
+  }
+
+  /**
+   * Register one MCP Skills source under a host-assigned label. The label is
+   * the origin half of every skill identity; it never comes from the server's
+   * self-reported name. Registering the same label replaces the prior client.
+   */
+  registerMcpSource(label: string, client: McpSkillsClient): void {
+    assertMcpServerLabel(label)
+    this.mcpSources.set(label, client)
+    this.providers.invalidate()
+  }
+
+  unregisterMcpSource(label: string): void {
+    this.mcpSources.delete(label)
+    this.providers.invalidate()
+  }
+
+  mcpSourceLabels(): readonly string[] {
+    return [...this.mcpSources.keys()].sort((left, right) => left.localeCompare(right, 'en'))
   }
 
   async discover(
@@ -956,6 +1034,8 @@ export class SkillFluxService extends Service {
                   qualitySignals: { type: 'array', items: { type: 'string' } },
                   qualityWarnings: { type: 'array', items: { type: 'string' } },
                   path: { type: 'string' },
+                  serverLabel: { type: 'string' },
+                  skillUri: { type: 'string' },
                   score: { type: 'integer', required: true },
                   selection: { type: 'string' },
                   baseScore: { type: 'integer' },
@@ -1003,6 +1083,11 @@ export class SkillFluxService extends Service {
               qualityWarnings: [...candidate.qualityWarnings],
               ...(candidate.path === undefined ? {} : { path: candidate.path }),
             }),
+            ...(candidate.origin !== 'mcp' ? {} : {
+              serverLabel: candidate.serverLabel,
+              skillUri: candidate.skillUri,
+              trustLevel: candidate.trustLevel,
+            }),
             score: candidate.score,
             ...(candidate.selection === undefined ? {} : { selection: candidate.selection }),
             ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
@@ -1018,7 +1103,7 @@ export class SkillFluxService extends Service {
   private createMountTool() {
     return defineTool({
       name: MOUNT_TOOL,
-      description: 'Mount one exact candidate returned by SkillFlux search. Remote installs follow the configured approval policy.',
+      description: 'Mount one exact candidate returned by SkillFlux search. Remote and MCP loads follow the configured approval policy.',
       parameters: {
         candidateId: { type: 'string', required: true, description: 'Opaque candidate id from skillflux_search.' },
       },
@@ -1095,12 +1180,14 @@ export class SkillFluxService extends Service {
       const discoveryCacheStatus = discoveryCache === undefined
         ? 'Remote discovery cache: unavailable.'
         : `Remote discovery cache: ${discoveryCache.enabled ? 'on' : 'off'}; ${discoveryCache.entries}/${this.config.remoteCacheMaxEntries} entries; hits ${discoveryCache.hits}, misses ${discoveryCache.misses}, stale fallbacks ${discoveryCache.staleHits}.`
+      const mcpLabels = this.mcpSourceLabels()
+      const mcpStatus = `MCP sources: ${mcpLabels.length === 0 ? 'none registered' : mcpLabels.join(', ')}; discovery ${this.config.mcpDiscovery}; ${this.config.mcpTrustedServers.length} trusted server(s); ${this.config.mcpBlockedServers.length} blocked server(s).`
       const idlePolicy = this.config.cacheMaxIdleDays === 0 ? 'off' : `${this.config.cacheMaxIdleDays} days`
       const invalidCacheStatus = installedCache.invalidEntries === 0 ? '' : `; invalid entries ${installedCache.invalidEntries} (use cache clean all)`
       const installedCacheStatus = `Installed Skill cache: ${installedCache.entries}/${this.config.cacheMaxEntries} entries, ${installedCache.totalBytes}/${this.config.cacheMaxTotalBytes} bytes; auto prune ${this.config.cacheAutoPrune ? 'on' : 'off'}; idle limit ${idlePolicy}${invalidCacheStatus}.`
       return {
         kind: 'success',
-        text: `${router}\n${telemetry}\n${discovery}\n${discoveryCacheStatus}\n${installedCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
+        text: `${router}\n${telemetry}\n${discovery}\n${discoveryCacheStatus}\n${mcpStatus}\n${installedCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
           : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
       }
@@ -1265,7 +1352,12 @@ export class SkillFluxService extends Service {
       if (!accepted && budgetSkipped) this.markRoutingOutcome(state, candidate.id, 'budget-skipped')
     }
     if (this.config.remoteDiscovery !== 'automatic') {
-      state.published = { candidates: published, complete: true }
+      const mcp = await this.collectMcpCandidates(state, task, turn, signal)
+      const mcpSlots = this.config.maxActiveSkills - state.active.size - published.length
+      const publishableMcp = mcp.candidates
+        .filter(candidate => candidateGovernanceReason(candidate, this.config) === undefined)
+        .slice(0, Math.min(this.config.remoteAutoMountLimit, mcpSlots))
+      state.published = { candidates: [...published, ...publishableMcp], complete: mcp.complete }
       this.providers.invalidate()
       return updateRemoteCandidates(agent, [])
     }
@@ -1290,7 +1382,12 @@ export class SkillFluxService extends Service {
       this.runtimeCtx.logger.warn(`SkillFlux remote discovery skipped: ${errorMessage(error)}`)
       // Keep local candidates visible but mark the observation
       // non-authoritative so the registry retains its last-good catalog.
-      state.published = { candidates: published, complete: false }
+      const mcp = await this.collectMcpCandidates(state, task, turn, signal)
+      const mcpSlots = this.config.maxActiveSkills - state.active.size - published.length
+      const publishableMcp = mcp.candidates
+        .filter(candidate => candidateGovernanceReason(candidate, this.config) === undefined)
+        .slice(0, Math.min(this.config.remoteAutoMountLimit, mcpSlots))
+      state.published = { candidates: [...published, ...publishableMcp], complete: false }
       this.providers.invalidate()
       return updateRemoteCandidates(agent, [])
     }
@@ -1301,8 +1398,9 @@ export class SkillFluxService extends Service {
       else state.lastRouting.push({ ...routingTrace(candidate, turn), outcome: 'budget-skipped' })
     }
     for (const candidate of remote) state.candidates.set(candidate.id, candidate)
-    if (remote.length === 0) {
-      state.published = { candidates: published, complete: remoteComplete }
+    const mcp = await this.collectMcpCandidates(state, task, turn, signal)
+    if (remote.length === 0 && mcp.candidates.length === 0) {
+      state.published = { candidates: published, complete: remoteComplete && mcp.complete }
       this.providers.invalidate()
       return updateRemoteCandidates(agent, [])
     }
@@ -1312,7 +1410,13 @@ export class SkillFluxService extends Service {
     const publishable = remote
       .filter(candidate => candidateGovernanceReason(candidate, this.config) === undefined)
       .slice(0, Math.min(this.config.remoteAutoMountLimit, remainingSlots))
-    state.published = { candidates: [...published, ...publishable], complete: remoteComplete }
+    const publishableMcp = mcp.candidates
+      .filter(candidate => candidateGovernanceReason(candidate, this.config) === undefined)
+      .slice(0, Math.min(this.config.remoteAutoMountLimit, Math.max(0, remainingSlots - publishable.length)))
+    state.published = {
+      candidates: [...published, ...publishable, ...publishableMcp],
+      complete: remoteComplete && mcp.complete,
+    }
     this.providers.invalidate()
     return updateRemoteCandidates(agent, remote.filter(candidate => state.candidates.has(candidate.id)))
   }
@@ -1404,10 +1508,104 @@ export class SkillFluxService extends Service {
     return this.turnStates.candidate(agent, candidateId)
   }
 
-  private publishedRemote(agent: Agent, name: string): SkillFluxCandidate | undefined {
+  private publishedCandidate(agent: Agent, name: string): SkillFluxCandidate | undefined {
     const candidate = this.turnStates.peek(agent)?.published.candidates.find(item => item.name === name)
-    if (candidate === undefined || candidate.origin !== 'remote') return undefined
+    if (candidate === undefined || (candidate.origin !== 'remote' && candidate.origin !== 'mcp')) return undefined
     return candidate
+  }
+
+  private async readMcpResource(label: string, uri: string, signal?: AbortSignal): Promise<Buffer> {
+    const client = this.mcpSources.get(label)
+    if (client === undefined) throw new Error(`MCP source "${label}" is not registered`)
+    return await client.readResource(uri, signal)
+  }
+
+  /**
+   * List every registered MCP source, validate its entries, and build scored
+   * candidates. A failing source is skipped with a warning and marks the
+   * observation non-authoritative; it never fails the whole discovery pass.
+   */
+  private async listMcpCandidates(
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<{ candidates: McpCandidate[]; complete: boolean }> {
+    if (this.config.mcpDiscovery === 'off' || this.mcpSources.size === 0) {
+      return { candidates: [], complete: true }
+    }
+    const labels = this.mcpSourceLabels()
+    const outcomes = await Promise.all(labels.map(async label => {
+      const client = this.mcpSources.get(label)
+      if (client === undefined) return { label, status: 'error' as const }
+      try {
+        const listing = await client.listSkills(signal)
+        signal?.throwIfAborted()
+        return { label, status: 'ok' as const, entries: listing.entries, partial: listing.partial }
+      } catch (error: unknown) {
+        signal?.throwIfAborted()
+        this.runtimeCtx.logger.warn(
+          `SkillFlux MCP source "${label}" discovery failed open: ${errorMessage(error)}`,
+        )
+        return { label, status: 'error' as const }
+      }
+    }))
+    signal?.throwIfAborted()
+    const complete = outcomes.every(outcome => outcome.status === 'ok' && !outcome.partial)
+    const candidates = outcomes.flatMap((outcome): McpCandidate[] => {
+      if (outcome.status !== 'ok') return []
+      return mcpCandidates(outcome.label, outcome.entries, {
+        trustedServers: this.config.mcpTrustedServers,
+      }).flatMap((candidate): McpCandidate[] => {
+        const baseScore = routeScore(query, candidate)
+        if (baseScore < this.config.minRouteScore) return []
+        const scored: McpCandidate = {
+          ...candidate,
+          score: baseScore,
+          selection: 'lexical',
+          baseScore,
+          adaptiveBoost: 0,
+        }
+        if (candidateGovernanceReason(scored, this.config) !== undefined) return []
+        return [scored]
+      })
+    })
+    candidates.sort((left, right) => right.score - left.score
+      || left.name.localeCompare(right.name, 'en')
+      || left.serverLabel.localeCompare(right.serverLabel, 'en'))
+    return { candidates, complete }
+  }
+
+  /**
+   * Fetch MCP candidates for one turn, apply the catalog budget, and register
+   * them for lazy mount. A listing failure keeps local and remote candidates
+   * usable and only marks the published observation non-authoritative.
+   */
+  private async collectMcpCandidates(
+    state: AgentState,
+    task: string,
+    turn: number,
+    signal: AbortSignal,
+  ): Promise<{ candidates: McpCandidate[]; complete: boolean }> {
+    let found: McpCandidate[] = []
+    let complete = true
+    try {
+      const mcp = await this.listMcpCandidates(task, signal)
+      signal.throwIfAborted()
+      this.assertStateCurrent(state, state.generation)
+      found = mcp.candidates
+      complete = mcp.complete
+    } catch (error: unknown) {
+      signal.throwIfAborted()
+      if (error instanceof ExpiredAgentStateError) throw error
+      this.runtimeCtx.logger.warn(`SkillFlux MCP discovery skipped: ${errorMessage(error)}`)
+      complete = false
+    }
+    const accepted: McpCandidate[] = []
+    for (const candidate of found) {
+      if (this.catalogFitsBudget(state, candidate)) accepted.push(candidate)
+      else state.lastRouting.push({ ...routingTrace(candidate, turn), outcome: 'budget-skipped' })
+    }
+    for (const candidate of accepted) state.candidates.set(candidate.id, candidate)
+    return { candidates: accepted, complete }
   }
 
   private async skillDefinition(
@@ -1508,6 +1706,13 @@ export class SkillFluxService extends Service {
           throw new Error(`SkillFlux load denied: ${currentGovernanceReason}`)
         }
         entry = cached
+      } else if (candidate.origin === 'mcp') {
+        entry = await this.cache.installMcp(
+          candidate,
+          (uri, readSignal) => this.readMcpResource(candidate.serverLabel, uri, readSignal),
+          cacheSignal,
+        )
+        cacheSignal?.throwIfAborted()
       } else {
         entry = await this.cache.install(candidate, cacheSignal)
         cacheSignal?.throwIfAborted()
@@ -1515,7 +1720,7 @@ export class SkillFluxService extends Service {
       const definition = await this.cache.load(entry, cacheSignal)
       cacheSignal?.throwIfAborted()
       if (!isModelInvocable(definition)) throw new Error(`skill "${definition.name}" is not model-invocable`)
-      if (candidate.origin === 'remote') {
+      if (candidate.origin === 'remote' || candidate.origin === 'mcp') {
         this.cachePruneSessions.add(agent.session)
         this.scheduleAutoPrune()
         if (this.config.approvalPolicy === 'session') {

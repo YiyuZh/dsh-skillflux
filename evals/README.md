@@ -10,8 +10,11 @@ comparable remote candidates. `remote-governance-cases.json` checks explainable
 evidence levels, low-adoption warnings, and the open/community/corroborated/trusted
 policy boundaries. `remote-cache-cases.json` checks fresh, stale,
 expired, and disabled cache boundaries. `cache-governance-cases.json` checks
-installed-cache age, value, capacity, byte, and active-mount boundaries. None of
-the suites calls an LLM, the network, or a remote Skill registry.
+installed-cache age, value, capacity, byte, and active-mount boundaries.
+`mcp-source-cases.json` checks the MCP Skills extension entry contract: SKILL.md
+URI structure, frontmatter identity, digest and size formats, complete resource
+enumeration, directory containment, and the refusal of `"dynamic"` content.
+None of the suites calls an LLM, the network, or a remote Skill registry.
 
 The corpus covers:
 
@@ -92,6 +95,14 @@ agent-scoped provider registration, the `skill` tool, and turn cleanup with
 fixture discovery/installation. Extra regressions cover shared deadlines,
 cancellation, stale turns, owner policy, and explicit unmounts.
 
+The MCP source corpus contains 12 entry cases spanning minimal valid skills,
+nested paths with supporting files, dynamic-content refusal, name/URI
+mismatches, missing or duplicated SKILL.md entries, path traversal, malformed
+digests, invalid sizes and names, and empty resource sets. It validates the
+entry gate only; `mcp-cache.spec.ts` covers byte-level digest verification and
+`mcp-service.spec.ts` covers the end-to-end registration, discovery, lazy load,
+fail-open, and governance boundaries.
+
 ## 中文说明
 
 `remote-fallback-cases.json` 新增 8 个惰性发布场景，验证元数据发布、`skill` 调用
@@ -110,7 +121,9 @@ cancellation, stale turns, owner policy, and explicit unmounts.
 低采用度告警及四级策略边界；`catalog-budget-cases.json` 验证目录预算边界；
 `remote-cache-cases.json` 验证 fresh、stale、expired 和关闭缓存的边界，
 `cache-governance-cases.json` 验证已安装缓存的闲置、价值、容量、总字节数和活动
-挂载保护边界。这些测评均不访问 LLM、网络或远程 Skill Registry。确定性部分
+挂载保护边界；`mcp-source-cases.json` 验证 MCP Skills 扩展的条目契约（SKILL.md
+URI 结构、frontmatter 一致性、digest/size 格式、资源完整性、目录包含关系以及
+对 `"dynamic"` 内容的拒绝）。这些测评均不访问 LLM、网络或远程 Skill Registry。确定性部分
 重点验证中英文匹配、规则优先级、阈值拒绝、
 Selector 返回数量上限、来源排序、同名去重和短名称边界。
 

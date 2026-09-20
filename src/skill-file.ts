@@ -35,6 +35,11 @@ function frontmatter(raw: string): { data: Record<string, unknown>; body: string
   return { data: parsed as Record<string, unknown>, body: raw.slice(match[0].length).trim() }
 }
 
+/** Parse and return the YAML frontmatter object without applying skill rules. */
+export function parseSkillFrontmatter(raw: string): Record<string, unknown> {
+  return frontmatter(raw).data
+}
+
 export function parseSkillMarkdown(raw: string, directory: string): SkillDefinition {
   const parsed = frontmatter(raw)
   const name = parsed.data.name

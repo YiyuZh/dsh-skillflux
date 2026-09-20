@@ -6,6 +6,7 @@ import type { PreToolDecision } from '@deepseek-ai/dsh-tools'
 import { remoteTrustPolicyAllows } from './remote-governance.js'
 import type {
   CachedCandidate,
+  McpCandidate,
   RemoteCandidate,
   RemoteTrustLevel,
   ResolvedSkillFluxConfig,
@@ -19,8 +20,8 @@ export interface ApprovalHost {
   readonly config: ResolvedSkillFluxConfig
   readonly trustedBySession: WeakMap<Session, Set<string>>
   candidate(agent: Agent, candidateId: string): SkillFluxCandidate | undefined
-  /** The published remote candidate behind a lazy `skill` call, when one exists. */
-  publishedRemote(agent: Agent, name: string): SkillFluxCandidate | undefined
+  /** The published lazy candidate behind a `skill` call, when one exists. */
+  publishedCandidate(agent: Agent, name: string): SkillFluxCandidate | undefined
 }
 
 function repositoryOwner(source: string): string {
@@ -33,9 +34,14 @@ function repositoryOwner(source: string): string {
  * immutable commit and complete installed-directory hash are still known.
  */
 export function currentCandidateTrust(
-  candidate: CachedCandidate | RemoteCandidate,
+  candidate: CachedCandidate | RemoteCandidate | McpCandidate,
   config: ResolvedSkillFluxConfig,
 ): RemoteTrustLevel {
+  if (candidate.origin === 'mcp') {
+    return config.mcpTrustedServers.includes(candidate.serverLabel.toLocaleLowerCase('en-US'))
+      ? 'trusted'
+      : 'community'
+  }
   const owner = repositoryOwner(candidate.source)
   if (config.remoteTrustedOwners.includes(owner)) return 'trusted'
   const sources = new Set(candidate.discoverySources ?? [])
@@ -60,6 +66,17 @@ export function candidateGovernanceReason(
   config: ResolvedSkillFluxConfig,
 ): string | undefined {
   if (candidate.origin === 'registry') return undefined
+  if (candidate.origin === 'mcp') {
+    const label = candidate.serverLabel.toLocaleLowerCase('en-US')
+    if (config.mcpBlockedServers.includes(label)) {
+      return `MCP server "${candidate.serverLabel}" is blocked by mcpBlockedServers`
+    }
+    const trustLevel = currentCandidateTrust(candidate, config)
+    if (!remoteTrustPolicyAllows(trustLevel, config.remoteTrustPolicy)) {
+      return `MCP candidate evidence level "${trustLevel}" does not satisfy remoteTrustPolicy "${config.remoteTrustPolicy}"`
+    }
+    return undefined
+  }
   const owner = repositoryOwner(candidate.source)
   if (config.remoteBlockedOwners.includes(owner)) {
     return `repository owner "${owner}" is blocked by remoteBlockedOwners`
@@ -83,12 +100,15 @@ export function registerApprovalGate(ctx: Context, host: ApprovalHost): void {
       if (candidate === undefined) return { kind: 'deny', reason: 'SkillFlux candidate id is unknown or expired' }
       const governanceReason = candidateGovernanceReason(candidate, host.config)
       if (governanceReason !== undefined) return { kind: 'deny', reason: `SkillFlux mount denied: ${governanceReason}` }
-      if (candidate.origin !== 'remote' || host.config.approvalPolicy === 'automatic') return downstream
+      if ((candidate.origin !== 'remote' && candidate.origin !== 'mcp')
+        || host.config.approvalPolicy === 'automatic') return downstream
       const trusted = host.trustedBySession.get(agent.session)
       if (host.config.approvalPolicy === 'session' && trusted?.has(candidate.source) === true) return downstream
       return {
         kind: 'ask',
-        reason: `Install remote skill ${candidate.skillId} from ${candidate.source} at immutable commit ${candidate.ref}?`,
+        reason: candidate.origin === 'remote'
+          ? `Install remote skill ${candidate.skillId} from ${candidate.source} at immutable commit ${candidate.ref}?`
+          : `Load MCP skill ${candidate.name} from server ${candidate.source} at content-bound digests ${candidate.contentBoundKey.slice(0, 12)}?`,
       }
     }
     if (exec.name !== SKILL_TOOL) return await next()
@@ -98,16 +118,19 @@ export function registerApprovalGate(ctx: Context, host: ApprovalHost): void {
     if (agent === undefined) return downstream
     const name = (exec.arguments as { name?: unknown }).name
     if (typeof name !== 'string' || !isSkillName(name)) return downstream
-    const candidate = host.publishedRemote(agent, name)
+    const candidate = host.publishedCandidate(agent, name)
     if (candidate === undefined) return downstream
     const governanceReason = candidateGovernanceReason(candidate, host.config)
     if (governanceReason !== undefined) return { kind: 'deny', reason: `SkillFlux mount denied: ${governanceReason}` }
-    if (candidate.origin !== 'remote' || host.config.approvalPolicy === 'automatic') return downstream
+    if ((candidate.origin !== 'remote' && candidate.origin !== 'mcp')
+      || host.config.approvalPolicy === 'automatic') return downstream
     const trusted = host.trustedBySession.get(agent.session)
     if (host.config.approvalPolicy === 'session' && trusted?.has(candidate.source) === true) return downstream
     return {
       kind: 'ask',
-      reason: `Install remote skill ${candidate.skillId} from ${candidate.source} at immutable commit ${candidate.ref}?`,
+      reason: candidate.origin === 'remote'
+        ? `Install remote skill ${candidate.skillId} from ${candidate.source} at immutable commit ${candidate.ref}?`
+        : `Load MCP skill ${candidate.name} from server ${candidate.source} at content-bound digests ${candidate.contentBoundKey.slice(0, 12)}?`,
     }
   })
 }

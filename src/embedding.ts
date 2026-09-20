@@ -132,7 +132,7 @@ async function readBoundedJson(response: Response): Promise<unknown> {
 }
 
 function stableCandidateOrder(left: SkillFluxCandidate, right: SkillFluxCandidate): number {
-  const originRank = { registry: 0, cache: 1, remote: 2 } as const
+  const originRank = { registry: 0, cache: 1, remote: 2, mcp: 3 } as const
   if (originRank[left.origin] !== originRank[right.origin]) return originRank[left.origin] - originRank[right.origin]
   return `${left.source}/${left.name}`.localeCompare(`${right.source}/${right.name}`, 'en')
 }

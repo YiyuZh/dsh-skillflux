@@ -11,6 +11,7 @@ import type { UsageStore } from './usage.js'
 import type {
   CacheEntry,
   CachedCandidate,
+  McpCandidate,
   ResolvedSkillFluxConfig,
   SkillFluxCandidate,
 } from './types.js'
@@ -22,13 +23,26 @@ export interface DiscoveryHost {
   readonly config: ResolvedSkillFluxConfig
   readonly embedding: EmbeddingRouter | undefined
   readonly usage: UsageStore | undefined
+  readonly mcp?: McpDiscoveryPort
+}
+
+export interface McpDiscoveryPort {
+  listCandidates(
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<{ candidates: readonly McpCandidate[]; complete: boolean }>
 }
 
 export function governedCacheCandidates(
   entries: readonly CacheEntry[],
   config: ResolvedSkillFluxConfig,
-): CachedCandidate[] {
-  return cacheCandidates(entries).flatMap((candidate): CachedCandidate[] => {
+): Array<CachedCandidate | McpCandidate> {
+  return cacheCandidates(entries).flatMap((candidate): Array<CachedCandidate | McpCandidate> => {
+    if (candidate.origin === 'mcp') {
+      if (candidateGovernanceReason(candidate, config) !== undefined) return []
+      const trustLevel = currentCandidateTrust(candidate, config)
+      return [{ ...candidate, trustLevel }]
+    }
     if (candidate.origin !== 'cache') return []
     if (candidateGovernanceReason(candidate, config) !== undefined) return []
     const trustLevel = currentCandidateTrust(candidate, config)
@@ -80,6 +94,17 @@ export async function retriedSnapshot(
 export class DiscoveryCoordinator {
   constructor(private readonly host: DiscoveryHost) {}
 
+  private async withMcp(
+    query: string,
+    candidates: readonly SkillFluxCandidate[],
+    signal?: AbortSignal,
+  ): Promise<SkillFluxCandidate[]> {
+    if (this.host.mcp === undefined || this.host.config.mcpDiscovery === 'off') return [...candidates]
+    const mcp = await this.host.mcp.listCandidates(query, signal)
+    signal?.throwIfAborted()
+    return dedupeById([...candidates, ...mcp.candidates])
+  }
+
   async discover(
     agent: Agent,
     query: string,
@@ -103,10 +128,13 @@ export class DiscoveryCoordinator {
       options.signal,
     )
     options.signal?.throwIfAborted()
-    if (options.remote !== true || this.host.config.remoteDiscovery === 'off') return selected
+    if (options.remote !== true || this.host.config.remoteDiscovery === 'off') {
+      return await this.withMcp(query, selected, options.signal)
+    }
     const remote = await this.host.remote.search(query, options.signal)
     options.signal?.throwIfAborted()
-    return dedupeById([...selected, ...remote]).slice(0, this.host.config.remoteSearchLimit * 2)
+    const merged = await this.withMcp(query, dedupeById([...selected, ...remote]), options.signal)
+    return merged.slice(0, this.host.config.remoteSearchLimit * 2)
   }
 
   async selectLocalCandidates(

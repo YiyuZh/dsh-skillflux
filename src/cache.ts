@@ -11,7 +11,13 @@ import {
   verifyUniqueRemoteSkill,
   type RemoteCandidateVerifier,
 } from './remote-source.js'
-import type { CacheEntry, CacheManifest, RemoteCandidate } from './types.js'
+import {
+  mcpFrontmatterEqual,
+  mcpRelativePath,
+  type McpResourceReader,
+} from './mcp-source.js'
+import { parseSkillFrontmatter } from './skill-file.js'
+import type { CacheEntry, CacheManifest, McpCandidate, RemoteCandidate } from './types.js'
 import type { SkillDefinition } from '@deepseek-ai/dsh-skill'
 
 const execFileAsync = promisify(execFile)
@@ -32,6 +38,8 @@ const PROCESS_LIVE_LEASE_IDS: Set<string> = existingLiveLeases instanceof Set
 processScope[PROCESS_LIVE_LEASES_KEY] = PROCESS_LIVE_LEASE_IDS
 const ACTIVE_LEASE_HEARTBEAT_MS = 30_000
 const ACTIVE_LEASE_STALE_MS = 24 * 60 * 60_000
+
+export type { McpResourceReader } from './mcp-source.js'
 
 function assertWithin(root: string, target: string): void {
   const normalizedRoot = resolve(root)
@@ -58,10 +66,16 @@ function immutableArchiveUrl(source: string, ref: string): string {
 function validManifest(value: unknown): value is CacheManifest {
   if (typeof value !== 'object' || value === null) return false
   const item = value as Record<string, unknown>
+  const origin = item.origin
+  if (origin !== undefined && origin !== 'github' && origin !== 'mcp') return false
+  const mcpManifest = item.mcp
   return item.version === 1
     && typeof item.cacheId === 'string' && CACHE_ID.test(item.cacheId)
     && typeof item.source === 'string'
-    && typeof item.ref === 'string' && /^[0-9a-f]{40}$/u.test(item.ref)
+    && typeof item.ref === 'string'
+    && (origin === 'mcp'
+      ? /^[0-9a-f]{64}$/u.test(item.ref)
+      : /^[0-9a-f]{40}$/u.test(item.ref))
     && typeof item.skillId === 'string'
     && typeof item.name === 'string'
     && typeof item.description === 'string'
@@ -85,6 +99,26 @@ function validManifest(value: unknown): value is CacheManifest {
     && (item.sourceSkillFileHash === undefined
       || (typeof item.sourceSkillFileHash === 'string' && /^[0-9a-f]{64}$/u.test(item.sourceSkillFileHash)))
     && ((item.sourcePath === undefined) === (item.sourceSkillFileHash === undefined))
+    && (origin === 'mcp'
+      ? typeof mcpManifest === 'object' && mcpManifest !== null
+        && (() => {
+          const record = mcpManifest as Record<string, unknown>
+          return typeof record.serverLabel === 'string'
+            && typeof record.skillUri === 'string'
+            && typeof record.contentBoundKey === 'string'
+            && /^[0-9a-f]{64}$/u.test(record.contentBoundKey)
+            && item.ref === record.contentBoundKey
+            && typeof record.frontmatter === 'object' && record.frontmatter !== null
+            && Array.isArray(record.resources)
+            && record.resources.every(resource => {
+              if (typeof resource !== 'object' || resource === null) return false
+              const entry = resource as Record<string, unknown>
+              return typeof entry.uri === 'string'
+                && typeof entry.digest === 'string' && /^sha256:[0-9a-f]{64}$/u.test(entry.digest)
+                && typeof entry.size === 'number' && Number.isSafeInteger(entry.size) && entry.size >= 0
+            })
+        })()
+      : mcpManifest === undefined)
     && typeof item.installedAt === 'string' && Number.isFinite(Date.parse(item.installedAt))
     && typeof item.fileCount === 'number'
     && Number.isSafeInteger(item.fileCount) && item.fileCount >= 1
@@ -92,6 +126,39 @@ function validManifest(value: unknown): value is CacheManifest {
     && Number.isSafeInteger(item.totalBytes) && item.totalBytes >= 0
     && typeof item.contentHash === 'string' && /^[0-9a-f]{64}$/u.test(item.contentHash)
     && (item.whenToUse === undefined || typeof item.whenToUse === 'string')
+}
+
+function mcpCacheId(candidate: Pick<McpCandidate, 'serverLabel' | 'skillUri' | 'contentBoundKey'>): string {
+  return createHash('sha256')
+    .update(JSON.stringify([candidate.serverLabel, candidate.skillUri, candidate.contentBoundKey]))
+    .digest('hex')
+    .slice(0, 24)
+}
+
+async function verifyMcpManifestResources(
+  entry: CacheEntry,
+  signal?: AbortSignal,
+): Promise<void> {
+  const mcp = entry.manifest.mcp
+  if (mcp === undefined) return
+  for (const resource of mcp.resources) {
+    signal?.throwIfAborted()
+    const relativePath = mcpRelativePath(mcp.skillUri, resource.uri)
+    if (relativePath === undefined) {
+      throw new Error(`MCP cached skill contains a resource outside its directory: "${resource.uri}"`)
+    }
+    const target = join(entry.directory, ...relativePath.split('/'))
+    assertWithin(entry.directory, target)
+    const bytes = await readFile(target)
+    signal?.throwIfAborted()
+    if (bytes.length !== resource.size) {
+      throw new Error(`MCP cached resource size changed for "${resource.uri}"`)
+    }
+    const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+    if (digest !== resource.digest) {
+      throw new Error(`MCP cached resource digest mismatch for "${resource.uri}"`)
+    }
+  }
 }
 
 function skillsCliPath(): string {
@@ -199,6 +266,9 @@ export class SkillCache {
   }
 
   async load(entry: CacheEntry, signal?: AbortSignal): Promise<SkillDefinition> {
+    if (entry.manifest.origin === 'mcp') {
+      await verifyMcpManifestResources(entry, signal)
+    }
     const inspected = await inspectSkillDirectory(entry.directory, {
       maxFiles: this.options.maxFiles,
       maxBytes: this.options.maxBytes,
@@ -210,6 +280,127 @@ export class SkillCache {
       throw new Error('cached skill contents no longer match their manifest')
     }
     return inspected.definition
+  }
+
+  /**
+   * Download, digest-verify, and materialize an MCP-served skill bound to its
+   * content set. The cache id encodes the host-assigned server label, the
+   * SKILL.md URI, and the content-bound key, so a changed `resources` set
+   * lands at a fresh directory and never overwrites an approved snapshot.
+   */
+  async installMcp(
+    candidate: McpCandidate,
+    readResource: McpResourceReader,
+    signal?: AbortSignal,
+  ): Promise<CacheEntry> {
+    const deadline = AbortSignal.timeout(this.options.installTimeoutMs)
+    const operationSignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline])
+    operationSignal.throwIfAborted()
+    const id = mcpCacheId(candidate)
+    const existing = await this.get(id)
+    operationSignal.throwIfAborted()
+    if (existing !== undefined) return existing
+    const staging = join(this.stagingRoot, randomUUID())
+    const workspace = join(staging, 'workspace')
+    const downloaded = join(workspace, 'skill')
+    const destination = join(this.entriesRoot, id)
+    assertWithin(this.root, staging)
+    assertWithin(this.root, destination)
+    await mkdir(workspace, { recursive: true })
+    try {
+      if (candidate.resources.length === 0 || candidate.resources.length > this.options.maxFiles) {
+        throw new Error(`MCP skill exceeds the ${this.options.maxFiles}-file installation limit`)
+      }
+      let totalBytes = 0
+      for (const resource of [...candidate.resources]
+        .sort((left, right) => left.uri.localeCompare(right.uri, 'en'))) {
+        operationSignal.throwIfAborted()
+        const relativePath = mcpRelativePath(candidate.skillUri, resource.uri)
+        if (relativePath === undefined) {
+          throw new Error(`MCP resource uri "${resource.uri}" is outside its skill directory`)
+        }
+        const bytes = await withAbort(readResource(resource.uri, operationSignal), operationSignal)
+        operationSignal.throwIfAborted()
+        if (bytes.length !== resource.size) {
+          throw new Error(`MCP resource size changed for "${resource.uri}"`)
+        }
+        const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+        if (digest !== resource.digest) {
+          throw new Error(`MCP resource digest mismatch for "${resource.uri}"`)
+        }
+        totalBytes += bytes.length
+        if (totalBytes > this.options.maxBytes) {
+          throw new Error(`MCP skill exceeds the ${this.options.maxBytes}-byte installation limit`)
+        }
+        const target = join(downloaded, ...relativePath.split('/'))
+        assertWithin(downloaded, target)
+        await mkdir(resolve(target, '..'), { recursive: true })
+        await writeFile(target, bytes, { flag: 'wx', mode: 0o600 })
+      }
+      operationSignal.throwIfAborted()
+      const skillBytes = await readFile(join(downloaded, 'SKILL.md'))
+      operationSignal.throwIfAborted()
+      let parsedFrontmatter: Record<string, unknown>
+      try {
+        parsedFrontmatter = parseSkillFrontmatter(
+          new TextDecoder('utf-8', { fatal: true }).decode(skillBytes),
+        )
+      } catch {
+        throw new Error('MCP skill SKILL.md has no parseable YAML frontmatter')
+      }
+      if (!mcpFrontmatterEqual(parsedFrontmatter, candidate.frontmatter)) {
+        throw new Error('MCP skill frontmatter does not match its skills/get entry')
+      }
+      const inspected = await inspectSkillDirectory(downloaded, {
+        maxFiles: this.options.maxFiles,
+        maxBytes: this.options.maxBytes,
+      }, operationSignal)
+      operationSignal.throwIfAborted()
+      if (inspected.definition.name !== candidate.frontmatter.name) {
+        throw new Error(`MCP skill name "${inspected.definition.name}" does not match its entry`)
+      }
+      const manifest: CacheManifest = {
+        version: 1,
+        origin: 'mcp',
+        cacheId: id,
+        source: candidate.serverLabel,
+        ref: candidate.contentBoundKey,
+        skillId: candidate.frontmatter.name,
+        name: inspected.definition.name,
+        description: inspected.definition.description,
+        ...(inspected.definition.whenToUse === undefined ? {} : { whenToUse: inspected.definition.whenToUse }),
+        trustLevel: candidate.trustLevel,
+        installedAt: new Date().toISOString(),
+        fileCount: inspected.fileCount,
+        totalBytes: inspected.totalBytes,
+        contentHash: inspected.contentHash,
+        mcp: {
+          serverLabel: candidate.serverLabel,
+          skillUri: candidate.skillUri,
+          contentBoundKey: candidate.contentBoundKey,
+          frontmatter: candidate.frontmatter,
+          resources: candidate.resources,
+        },
+      }
+      operationSignal.throwIfAborted()
+      await writeFile(join(downloaded, MANIFEST_NAME), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+      operationSignal.throwIfAborted()
+      await mkdir(this.entriesRoot, { recursive: true })
+      await this.options.beforeInstallCommit?.()
+      operationSignal.throwIfAborted()
+      try {
+        await rename(downloaded, destination)
+        operationSignal.throwIfAborted()
+      } catch (error: unknown) {
+        const raced = await this.get(id)
+        operationSignal.throwIfAborted()
+        if (raced !== undefined) return raced
+        throw error
+      }
+      return { manifest, directory: destination }
+    } finally {
+      await rm(staging, { recursive: true, force: true }).catch(() => undefined)
+    }
   }
 
   async install(candidate: RemoteCandidate, signal?: AbortSignal): Promise<CacheEntry> {
