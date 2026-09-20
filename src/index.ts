@@ -14,10 +14,11 @@ import {
   renderSkillContent,
   type SkillDefinition,
   type SkillInvocationSource,
+  type SkillSummary,
 } from '@deepseek-ai/dsh-skill'
 import { defineTool, type ValueSchemaSpec } from '@deepseek-ai/dsh-tools'
 import { activateCandidate, usageIdentity, type ActivationHost, type CacheProcessLockRelease } from './activation.js'
-import { MOUNT_TOOL, registerApprovalGate, type ApprovalHost } from './approval.js'
+import { MOUNT_TOOL, candidateGovernanceReason, registerApprovalGate, type ApprovalHost } from './approval.js'
 import { SkillCache, type CacheInventoryStats } from './cache.js'
 import type { CachePrunePlan } from './cache-governance.js'
 import { estimateCatalogTokens, updateCatalog, updateRemoteCandidates } from './catalog.js'
@@ -29,9 +30,10 @@ import {
   type DiscoveryHost,
 } from './discovery.js'
 import { EmbeddingRouter } from './embedding.js'
+import { SKILLFLUX_PROVIDER, SkillFluxProviderManager } from './provider.js'
 import { RemoteDiscoveryClient } from './remote.js'
 import { RemoteDiscoveryCache } from './remote-cache.js'
-import { registryCandidates } from './router.js'
+import { cacheCandidates, registryCandidates } from './router.js'
 import { ExpiredAgentStateError, TurnStateRegistry, skillLookup, type AgentState } from './state.js'
 import { UsageStore } from './usage.js'
 import type {
@@ -537,6 +539,7 @@ export class SkillFluxService extends Service {
   private autoPruneRequested = false
   private readonly turnStates: TurnStateRegistry
   private readonly discovery: DiscoveryCoordinator
+  private readonly providers: SkillFluxProviderManager
   private readonly trustedBySession = new WeakMap<Session, Set<string>>()
   private readonly cachePruneSessions = new WeakSet<Session>()
 
@@ -590,6 +593,10 @@ export class SkillFluxService extends Service {
         })
       : undefined
     this.discovery = new DiscoveryCoordinator(this.discoveryHost)
+    this.providers = new SkillFluxProviderManager(agent => ({
+      catalog: () => this.turnStates.peek(agent)?.published ?? { candidates: [], complete: true },
+      load: (candidates, signal) => this.loadProviderBody(agent, candidates, signal),
+    }), message => { ctx.logger.warn(message) })
 
     const skillTool = this.createSkillTool()
     ctx.tools.register(skillTool)
@@ -611,10 +618,17 @@ export class SkillFluxService extends Service {
       const active = [...state.active.values()]
         .map(item => item.definition)
         .filter(isModelInvocable)
-        .slice(0, this.config.maxActiveSkills)
+      const published = state.published.candidates.map(candidate => ({
+        name: candidate.name,
+        description: candidate.description,
+        invocation: { modelInvocable: true, userInvocable: false },
+        source: SKILLFLUX_PROVIDER,
+        provider: SKILLFLUX_PROVIDER,
+      }))
+      const skills: SkillSummary[] = [...active, ...published].slice(0, this.config.maxActiveSkills)
       return {
         kind: 'enter',
-        messages: updateCatalog(agent, decision.messages, active, this.config.catalogDescriptionMaxLength),
+        messages: updateCatalog(agent, decision.messages, skills, this.config.catalogDescriptionMaxLength),
       }
     })
     ctx.on('agent/pre-step', async ({ agent, messages, turn, step, signal }, next): Promise<PreStepDecision> => {
@@ -698,6 +712,7 @@ export class SkillFluxService extends Service {
       config: this.config,
       trustedBySession: this.trustedBySession,
       candidate: (agent, candidateId) => this.candidate(agent, candidateId),
+      publishedRemote: (agent, name) => this.publishedRemote(agent, name),
     }
   }
 
@@ -764,10 +779,21 @@ export class SkillFluxService extends Service {
 
   catalogStats(agent: Agent): CatalogStats {
     const mounted = this.mounted(agent)
+    const state = this.turnStates.peek(agent)
+    const skills: SkillSummary[] = [
+      ...mounted.map(item => item.definition),
+      ...(state?.published.candidates.map(candidate => ({
+        name: candidate.name,
+        description: candidate.description,
+        invocation: { modelInvocable: true, userInvocable: false },
+        source: SKILLFLUX_PROVIDER,
+        provider: SKILLFLUX_PROVIDER,
+      })) ?? []),
+    ]
     return {
-      mountedSkills: mounted.length,
+      mountedSkills: skills.length,
       estimatedTokens: estimateCatalogTokens(
-        mounted.map(item => item.definition),
+        skills,
         this.config.catalogDescriptionMaxLength,
       ),
       ...(this.config.catalogTokenBudget === 0 ? {} : { budget: this.config.catalogTokenBudget }),
@@ -838,11 +864,12 @@ export class SkillFluxService extends Service {
         if (!isSkillName(args.name)) throw new Error(`invalid skill name "${args.name}"`)
         const agent = exec.agent
         if (agent === undefined) throw new Error('skill calls require an agent')
+        const definition = await this.skillDefinition(agent, args.name, exec.signal)
+        if (definition === undefined) throw new Error(`skill "${args.name}" is not mounted for this turn`)
+        if (!isModelInvocable(definition)) throw new Error(`skill "${args.name}" is not model-invocable`)
         const active = this.turnStates.active(agent, args.name)
-        if (active === undefined) throw new Error(`skill "${args.name}" is not mounted for this turn`)
-        if (!isModelInvocable(active.definition)) throw new Error(`skill "${args.name}" is not model-invocable`)
-        this.trackUsage(this.usage?.recordUse(usageIdentity(active)))
-        return skillResult(active.definition)
+        if (active !== undefined) this.trackUsage(this.usage?.recordUse(usageIdentity(active)))
+        return skillResult(definition)
       },
       presentCall: args => ({ card: 'generic', title: `Load skill ${args.name}`, kind: 'read', rawInput: args.name }),
     })
@@ -1153,36 +1180,52 @@ export class SkillFluxService extends Service {
     signal.throwIfAborted()
     this.assertStateCurrent(state, generation)
     state.lastRouting = selected.map(candidate => routingTrace(candidate, turn))
+    const published: SkillFluxCandidate[] = []
     for (const candidate of selected) {
-      if (state.active.size >= this.config.maxActiveSkills) break
-      let mounted = false
+      if (state.active.size + published.length >= this.config.maxActiveSkills) break
+      let accepted = false
       let budgetSkipped = false
       for (const fallback of fallbacksByName.get(candidate.name) ?? []) {
-        try {
-          await this.mountCandidate(state, {
-            ...fallback,
-            ...(candidate.selection === undefined ? {} : { selection: candidate.selection }),
-            ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
-            ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
-            score: candidate.score,
-          }, signal, generation)
-          mounted = true
-          break
-        } catch (error: unknown) {
-          signal.throwIfAborted()
-          if (error instanceof ExpiredAgentStateError) throw error
-          if (error instanceof CatalogBudgetExceededError) {
-            budgetSkipped = true
-          } else {
-            this.runtimeCtx.logger.warn(
-              `SkillFlux skipped candidate ${fallback.name} from ${fallback.source}: ${errorMessage(error)}`,
-            )
+        const normalized: SkillFluxCandidate = {
+          ...fallback,
+          ...(candidate.selection === undefined ? {} : { selection: candidate.selection }),
+          ...(candidate.baseScore === undefined ? {} : { baseScore: candidate.baseScore }),
+          ...(candidate.adaptiveBoost === undefined ? {} : { adaptiveBoost: candidate.adaptiveBoost }),
+          score: candidate.score,
+        }
+        if (normalized.origin === 'registry') {
+          try {
+            await this.mountCandidate(state, normalized, signal, generation)
+            accepted = true
+            break
+          } catch (error: unknown) {
+            signal.throwIfAborted()
+            if (error instanceof ExpiredAgentStateError) throw error
+            if (error instanceof CatalogBudgetExceededError) {
+              budgetSkipped = true
+            } else {
+              this.runtimeCtx.logger.warn(
+                `SkillFlux skipped candidate ${fallback.name} from ${fallback.source}: ${errorMessage(error)}`,
+              )
+            }
           }
+        } else {
+          // Cache and remote candidates stay metadata-only: the provider
+          // downloads, verifies, and loads the body lazily in get().
+          if (state.active.size + published.length >= this.config.maxActiveSkills) break
+          if (!this.catalogFitsBudget(state, normalized)) {
+            budgetSkipped = true
+            continue
+          }
+          published.push(normalized)
+          accepted = true
         }
       }
-      if (!mounted && budgetSkipped) this.markRoutingOutcome(state, candidate.id, 'budget-skipped')
+      if (!accepted && budgetSkipped) this.markRoutingOutcome(state, candidate.id, 'budget-skipped')
     }
-    if (state.active.size > 0 || this.config.remoteDiscovery !== 'automatic') {
+    state.published = { candidates: published, complete: true }
+    this.providers.invalidate(agent)
+    if (state.active.size > 0 || published.length > 0 || this.config.remoteDiscovery !== 'automatic') {
       return updateRemoteCandidates(agent, [])
     }
     let discoveredRemote: RemoteCandidate[]
@@ -1194,6 +1237,10 @@ export class SkillFluxService extends Service {
       signal.throwIfAborted()
       if (error instanceof ExpiredAgentStateError) throw error
       this.runtimeCtx.logger.warn(`SkillFlux remote discovery skipped: ${errorMessage(error)}`)
+      // Incomplete observation: keep the last-good catalog contract by
+      // publishing an empty but non-authoritative provider observation.
+      state.published = { candidates: [], complete: false }
+      this.providers.invalidate(agent)
       return updateRemoteCandidates(agent, [])
     }
     const remote: RemoteCandidate[] = []
@@ -1202,42 +1249,17 @@ export class SkillFluxService extends Service {
       else state.lastRouting.push({ ...routingTrace(candidate, turn), outcome: 'budget-skipped' })
     }
     for (const candidate of remote) state.candidates.set(candidate.id, candidate)
-    if (remote.length === 0) return updateRemoteCandidates(agent, [])
-    if (this.config.approvalPolicy === 'automatic') {
-      // Share one deadline across candidates so fallback cannot multiply the
-      // install budget. Await rollback/lock cleanup before trying another.
-      const deadline = AbortSignal.timeout(this.config.installTimeoutMs)
-      const mountSignal = AbortSignal.any([signal, deadline])
-      const mountEpochs = new Map(remote.map(candidate => [candidate.name, state.mountEpochs.get(candidate.name) ?? 0]))
-      for (const candidate of remote.slice(0, this.config.remoteAutoMountLimit)) {
-        const mountEpoch = mountEpochs.get(candidate.name)!
-        signal.throwIfAborted()
-        this.assertMountCurrent(state, generation, candidate.name, mountEpoch)
-        if (deadline.aborted) break
-        try {
-          await this.mountCandidate(state, candidate, mountSignal, generation, mountEpoch)
-          state.candidates.clear()
-          return updateRemoteCandidates(agent, [])
-        } catch (error: unknown) {
-          signal.throwIfAborted()
-          this.assertMountCurrent(state, generation, candidate.name, mountEpoch)
-          if (error instanceof ExpiredAgentStateError) throw error
-          const outcome = error instanceof CatalogBudgetExceededError
-            ? 'budget-skipped'
-            : deadline.aborted || (error instanceof Error && error.name === 'TimeoutError')
-              ? 'mount-timeout'
-              : 'mount-failed'
-          state.lastRouting.push({ ...routingTrace(candidate, turn), outcome })
-          // Do not immediately offer an already-failed candidate back to the
-          // model. A new explicit search may retry it; no persistent ban.
-          state.candidates.delete(candidate.id)
-          this.runtimeCtx.logger.warn(
-            `SkillFlux automatic remote mount ${outcome} for ${candidate.name} from ${candidate.source}: ${errorMessage(error)}`,
-          )
-          if (deadline.aborted) break
-        }
-      }
+    if (remote.length === 0) {
+      state.published = { candidates: [], complete: true }
+      this.providers.invalidate(agent)
+      return updateRemoteCandidates(agent, [])
     }
+    // Publish remote metadata for lazy activation; approval happens when the
+    // model actually calls `skill`, just before the provider downloads.
+    // Blocked or under-trust candidates stay out of the model-facing catalog.
+    const publishable = remote.filter(candidate => candidateGovernanceReason(candidate, this.config) === undefined)
+    state.published = { candidates: publishable.slice(0, this.config.remoteAutoMountLimit), complete: true }
+    this.providers.invalidate(agent)
     return updateRemoteCandidates(agent, remote.filter(candidate => state.candidates.has(candidate.id)))
   }
 
@@ -1264,7 +1286,7 @@ export class SkillFluxService extends Service {
   ): void {
     if (this.catalogFitsBudget(state, skill)) return
     const estimatedTokens = estimateCatalogTokens(
-      [...[...state.active.values()].map(item => item.definition), skill],
+      [...this.catalogSkills(state), skill],
       this.config.catalogDescriptionMaxLength,
     )
     throw new CatalogBudgetExceededError(skill.name, estimatedTokens, this.config.catalogTokenBudget)
@@ -1276,9 +1298,16 @@ export class SkillFluxService extends Service {
   ): boolean {
     if (this.config.catalogTokenBudget === 0 || state.active.has(skill.name)) return true
     return estimateCatalogTokens(
-      [...[...state.active.values()].map(item => item.definition), skill],
+      [...this.catalogSkills(state), skill],
       this.config.catalogDescriptionMaxLength,
     ) <= this.config.catalogTokenBudget
+  }
+
+  private catalogSkills(state: AgentState): Pick<SkillSummary, 'name' | 'description'>[] {
+    return [
+      ...[...state.active.values()].map(item => item.definition),
+      ...state.published.candidates.map(candidate => ({ name: candidate.name, description: candidate.description })),
+    ]
   }
 
   private assertStateCurrent(state: AgentState, generation: number): void {
@@ -1290,7 +1319,9 @@ export class SkillFluxService extends Service {
   }
 
   private beginTurn(agent: Agent, turn: number): AgentState {
-    return this.turnStates.beginTurn(agent, turn)
+    const state = this.turnStates.beginTurn(agent, turn)
+    this.providers.register(agent)
+    return state
   }
 
   private state(agent: Agent): AgentState {
@@ -1299,6 +1330,7 @@ export class SkillFluxService extends Service {
 
   private cleanupState(state: AgentState, forget: boolean): void {
     this.turnStates.cleanupState(state, forget)
+    this.providers.dispose(state.agent)
   }
 
   private rememberRouting(state: AgentState, mounted: MountedSkill): void {
@@ -1309,8 +1341,144 @@ export class SkillFluxService extends Service {
     this.turnStates.markRoutingOutcome(state, candidateId, outcome)
   }
 
+  private recordRoutingOutcome(state: AgentState, candidate: SkillFluxCandidate, outcome: RoutingTrace['outcome']): void {
+    const trace: RoutingTrace = { ...routingTrace(candidate, state.turn), outcome }
+    const index = state.lastRouting.findIndex(item => item.candidateId === candidate.id)
+    if (index === -1) state.lastRouting.push(trace)
+    else state.lastRouting[index] = trace
+  }
+
   private candidate(agent: Agent, candidateId: string): SkillFluxCandidate | undefined {
     return this.turnStates.candidate(agent, candidateId)
+  }
+
+  private publishedRemote(agent: Agent, name: string): SkillFluxCandidate | undefined {
+    const candidate = this.turnStates.peek(agent)?.published.candidates.find(item => item.name === name)
+    if (candidate === undefined || candidate.origin !== 'remote') return undefined
+    return candidate
+  }
+
+  private async skillDefinition(
+    agent: Agent,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<SkillDefinition | undefined> {
+    const mounted = this.turnStates.active(agent, name)
+    if (mounted !== undefined) return mounted.definition
+    const published = this.turnStates.peek(agent)?.published.candidates.find(item => item.name === name)
+    if (published === undefined) return undefined
+    // Load through the agent-scoped provider so the lazy download,
+    // verification, and load run without a same-name runtime entry shadowing
+    // the provider candidate inside the shared registry.
+    return await this.providers.load(agent, name, signal)
+  }
+
+  private async loadProviderBody(
+    agent: Agent,
+    candidates: readonly SkillFluxCandidate[],
+    signal?: AbortSignal,
+  ): Promise<SkillDefinition> {
+    const state = this.turnStates.peek(agent)
+    if (state === undefined) throw new Error('SkillFlux turn state is gone')
+    const generation = state.generation
+    // Share one deadline across the chain so fallback cannot multiply the
+    // install budget. Await rollback/lock cleanup before trying another.
+    const deadline = AbortSignal.timeout(this.config.installTimeoutMs)
+    const loadSignal = signal === undefined
+      ? deadline
+      : AbortSignal.any([signal, deadline])
+    let lastError: unknown
+    for (const candidate of candidates) {
+      signal?.throwIfAborted()
+      this.assertStateCurrent(state, generation)
+      const mountEpoch = state.mountEpochs.get(candidate.name) ?? 0
+      this.assertMountCurrent(state, generation, candidate.name, mountEpoch)
+      if (deadline.aborted) break
+      try {
+        const definition = await this.loadOne(agent, candidate, loadSignal)
+        this.assertStateCurrent(state, generation)
+        this.assertMountCurrent(state, generation, candidate.name, mountEpoch)
+        state.candidates.clear()
+        this.recordRoutingOutcome(state, candidate, 'loaded')
+        return definition
+      } catch (error: unknown) {
+        signal?.throwIfAborted()
+        if (error instanceof ExpiredAgentStateError) throw error
+        // An explicit unmount or turn cleanup during the attempt invalidates
+        // every remaining fallback before any outcome is recorded.
+        this.assertMountCurrent(state, generation, candidate.name, mountEpoch)
+        if (deadline.aborted || (error instanceof Error && error.name === 'TimeoutError')) {
+          lastError = error
+          state.candidates.delete(candidate.id)
+          this.recordRoutingOutcome(state, candidate, 'mount-timeout')
+          break
+        }
+        const outcome = error instanceof CatalogBudgetExceededError ? 'budget-skipped' : 'mount-failed'
+        this.recordRoutingOutcome(state, candidate, outcome)
+        // Do not immediately offer an already-failed candidate back to the
+        // model. A new explicit search may retry it; no persistent ban.
+        state.candidates.delete(candidate.id)
+        this.runtimeCtx.logger.warn(
+          `SkillFlux lazy load ${outcome} for ${candidate.name} from ${candidate.source}: ${errorMessage(error)}`,
+        )
+        lastError = error
+      }
+    }
+    throw lastError ?? new Error('SkillFlux lazy load expired before any candidate was attempted')
+  }
+
+  private async loadOne(
+    agent: Agent,
+    candidate: SkillFluxCandidate,
+    signal?: AbortSignal,
+  ): Promise<SkillDefinition> {
+    if (candidate.origin === 'registry') {
+      throw new Error(`registry skill "${candidate.name}" must be mounted eagerly`)
+    }
+    const governanceReason = candidateGovernanceReason(candidate, this.config)
+    if (governanceReason !== undefined) throw new Error(`SkillFlux load denied: ${governanceReason}`)
+    const releaseLease = await this.acquireCacheLease()
+    const cacheSignal = releaseLease.signal === undefined
+      ? signal
+      : signal === undefined
+        ? releaseLease.signal
+        : AbortSignal.any([signal, releaseLease.signal])
+    try {
+      let entry: CacheEntry
+      if (candidate.origin === 'cache') {
+        const cached = await this.cache.get(candidate.cacheId)
+        cacheSignal?.throwIfAborted()
+        if (cached === undefined) throw new Error(`cache entry "${candidate.cacheId}" no longer exists`)
+        const currentCachedCandidate = cacheCandidates([cached])[0]
+        if (currentCachedCandidate === undefined) throw new Error(`cache entry "${candidate.cacheId}" is invalid`)
+        const currentGovernanceReason = candidateGovernanceReason(currentCachedCandidate, this.config)
+        if (currentGovernanceReason !== undefined) {
+          throw new Error(`SkillFlux load denied: ${currentGovernanceReason}`)
+        }
+        entry = cached
+      } else {
+        entry = await this.cache.install(candidate, cacheSignal)
+        cacheSignal?.throwIfAborted()
+      }
+      const definition = await this.cache.load(entry, cacheSignal)
+      cacheSignal?.throwIfAborted()
+      if (!isModelInvocable(definition)) throw new Error(`skill "${definition.name}" is not model-invocable`)
+      if (candidate.origin === 'remote') {
+        this.cachePruneSessions.add(agent.session)
+        this.scheduleAutoPrune()
+        if (this.config.approvalPolicy === 'session') {
+          let trusted = this.trustedBySession.get(agent.session)
+          if (trusted === undefined) {
+            trusted = new Set()
+            this.trustedBySession.set(agent.session, trusted)
+          }
+          trusted.add(candidate.source)
+        }
+      }
+      return definition
+    } finally {
+      await releaseLease()
+    }
   }
 
   private trackUsage(operation: Promise<void> | undefined): void {

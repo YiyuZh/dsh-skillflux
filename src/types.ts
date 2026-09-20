@@ -214,6 +214,13 @@ export interface RemoteQualityBreakdown {
 
 export type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate
 
+/** Per-turn provider catalog: metadata-only candidates plus discovery completeness. */
+export interface SkillFluxCatalog {
+  readonly candidates: readonly SkillFluxCandidate[]
+  /** Whether the current discovery is authoritative and may be cached. */
+  readonly complete: boolean
+}
+
 export interface MountedSkill {
   readonly candidateId: string
   readonly name: string
@@ -234,7 +241,7 @@ export interface RoutingTrace {
   readonly origin: CandidateOrigin
   readonly source: string
   readonly selection: CandidateSelection
-  readonly outcome: 'selected' | 'mounted' | 'budget-skipped' | 'mount-failed' | 'mount-timeout'
+  readonly outcome: 'selected' | 'mounted' | 'loaded' | 'budget-skipped' | 'mount-failed' | 'mount-timeout'
   readonly score: number
   readonly baseScore?: number
   readonly adaptiveBoost?: number

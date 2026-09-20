@@ -1,6 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
+import { isSkillName } from '@deepseek-ai/dsh-skill'
 import type { PreToolDecision } from '@deepseek-ai/dsh-tools'
 import { remoteTrustPolicyAllows } from './remote-governance.js'
 import type {
@@ -12,11 +13,14 @@ import type {
 } from './types.js'
 
 export const MOUNT_TOOL = 'skillflux_mount'
+const SKILL_TOOL = 'skill'
 
 export interface ApprovalHost {
   readonly config: ResolvedSkillFluxConfig
   readonly trustedBySession: WeakMap<Session, Set<string>>
   candidate(agent: Agent, candidateId: string): SkillFluxCandidate | undefined
+  /** The published remote candidate behind a lazy `skill` call, when one exists. */
+  publishedRemote(agent: Agent, name: string): SkillFluxCandidate | undefined
 }
 
 function repositoryOwner(source: string): string {
@@ -69,14 +73,33 @@ export function candidateGovernanceReason(
 
 export function registerApprovalGate(ctx: Context, host: ApprovalHost): void {
   ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
-    if (exec.name !== MOUNT_TOOL) return await next()
+    if (exec.name === MOUNT_TOOL) {
+      const downstream = await next()
+      if (downstream.kind !== 'allow') return downstream
+      const agent = exec.agent
+      const id = (exec.arguments as { candidateId?: unknown }).candidateId
+      if (agent === undefined || typeof id !== 'string') return { kind: 'deny', reason: 'invalid SkillFlux mount request' }
+      const candidate = host.candidate(agent, id)
+      if (candidate === undefined) return { kind: 'deny', reason: 'SkillFlux candidate id is unknown or expired' }
+      const governanceReason = candidateGovernanceReason(candidate, host.config)
+      if (governanceReason !== undefined) return { kind: 'deny', reason: `SkillFlux mount denied: ${governanceReason}` }
+      if (candidate.origin !== 'remote' || host.config.approvalPolicy === 'automatic') return downstream
+      const trusted = host.trustedBySession.get(agent.session)
+      if (host.config.approvalPolicy === 'session' && trusted?.has(candidate.source) === true) return downstream
+      return {
+        kind: 'ask',
+        reason: `Install remote skill ${candidate.skillId} from ${candidate.source} at immutable commit ${candidate.ref}?`,
+      }
+    }
+    if (exec.name !== SKILL_TOOL) return await next()
     const downstream = await next()
     if (downstream.kind !== 'allow') return downstream
     const agent = exec.agent
-    const id = (exec.arguments as { candidateId?: unknown }).candidateId
-    if (agent === undefined || typeof id !== 'string') return { kind: 'deny', reason: 'invalid SkillFlux mount request' }
-    const candidate = host.candidate(agent, id)
-    if (candidate === undefined) return { kind: 'deny', reason: 'SkillFlux candidate id is unknown or expired' }
+    if (agent === undefined) return downstream
+    const name = (exec.arguments as { name?: unknown }).name
+    if (typeof name !== 'string' || !isSkillName(name)) return downstream
+    const candidate = host.publishedRemote(agent, name)
+    if (candidate === undefined) return downstream
     const governanceReason = candidateGovernanceReason(candidate, host.config)
     if (governanceReason !== undefined) return { kind: 'deny', reason: `SkillFlux mount denied: ${governanceReason}` }
     if (candidate.origin !== 'remote' || host.config.approvalPolicy === 'automatic') return downstream

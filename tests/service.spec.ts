@@ -258,9 +258,19 @@ describe('SkillFlux service', () => {
       source: { kind: 'user' },
     })
     await propose(communityRestart, restartAgent, [restartUser])
-    expect(communityRestart.skillFlux.mounted(restartAgent)).toMatchObject([
+    expect(communityRestart.skillFlux.mounted(restartAgent)).toEqual([])
+    const restartInternals = communityRestart.skillFlux as unknown as {
+      state: (agent: Agent) => { published: { candidates: readonly SkillFluxCandidate[] } }
+    }
+    expect(restartInternals.state(restartAgent).published.candidates).toMatchObject([
       { name: 'policy-skill', origin: 'cache', source },
     ])
+    const loaded = await communityRestart.tools.execute({
+      callId: CallId('lazy-policy-skill'), name: 'skill', arguments: { name: 'policy-skill' },
+      agent: restartAgent, signal: new AbortController().signal,
+    })
+    expect(loaded.isError).toBe(false)
+    expect((loaded.content[0] as { text?: string }).text).toContain('Verified open-policy installation.')
   })
 
   it('releases the cache process lock after remote source verification times out', async () => {
@@ -886,15 +896,19 @@ describe('SkillFlux service', () => {
     const decision = await propose(context, agent, [user])
     expect(decision.kind).toBe('enter')
     if (decision.kind !== 'enter') return
-    expect(context.skillFlux.mounted(agent)).toMatchObject([
-      { name: 'pdf-reader', origin: 'cache', source: 'cached/repo' },
-    ])
+    expect(context.skillFlux.mounted(agent)).toEqual([])
     const catalog = decision.messages.find(message => message.source.kind === 'skill-catalog')
     expect(catalog).toBeDefined()
     if (catalog === undefined) return
     expect((catalog.source as { entries?: unknown }).entries).toEqual([
       { name: 'pdf-reader', description: 'Read and analyze PDF documents' },
     ])
+    const loaded = await context.tools.execute({
+      callId: CallId('lazy-cached-pdf-reader'), name: 'skill', arguments: { name: 'pdf-reader' },
+      agent, signal: new AbortController().signal,
+    })
+    expect(loaded.isError).toBe(false)
+    expect((loaded.content[0] as { text?: string }).text).toContain('Cached PDF instructions.')
 
     const explicit = createUserMessage({
       content: [{ type: 'text', text: 'Use /pdf-reader now' }],
@@ -1021,7 +1035,18 @@ describe('SkillFlux service', () => {
     const agent = fakeAgent(context)
     const user = createUserMessage({ content: [{ type: 'text', text: 'Handle PDF documents' }], source: { kind: 'user' } })
     await propose(context, agent, [user])
-    expect(context.skillFlux.mounted(agent).map(skill => `${skill.name}:${skill.source}`)).toEqual(['pdf-cache:old/repo'])
+    const internals = context.skillFlux as unknown as {
+      state: (target: Agent) => { published: { candidates: readonly SkillFluxCandidate[] } }
+    }
+    expect(internals.state(agent).published.candidates.map(skill => `${skill.name}:${skill.source}`))
+      .toEqual(['pdf-cache:new/repo', 'pdf-cache:old/repo'])
+    expect(context.skillFlux.mounted(agent)).toEqual([])
+    const loaded = await context.tools.execute({
+      callId: CallId('lazy-pdf-cache'), name: 'skill', arguments: { name: 'pdf-cache' },
+      agent, signal: new AbortController().signal,
+    })
+    expect(loaded.isError).toBe(false)
+    expect((loaded.content[0] as { text?: string }).text).toContain('Good cached instructions.')
   })
 
   it('rejects incomplete discovery before publishing partial candidates', async () => {

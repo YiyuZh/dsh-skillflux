@@ -1,6 +1,6 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
-import type { MountedSkill, RoutingTrace, SkillFluxCandidate } from './types.js'
+import type { MountedSkill, RoutingTrace, SkillFluxCandidate, SkillFluxCatalog } from './types.js'
 
 export interface AgentState {
   readonly agent: Agent
@@ -10,6 +10,7 @@ export interface AgentState {
   readonly active: Map<string, MountedSkill>
   readonly disposers: Map<string, () => void>
   readonly candidates: Map<string, SkillFluxCandidate>
+  published: SkillFluxCatalog
   lastRouting: RoutingTrace[]
 }
 
@@ -46,6 +47,7 @@ export class TurnStateRegistry {
         active: new Map(),
         disposers: new Map(),
         candidates: new Map(),
+        published: { candidates: [], complete: true },
         lastRouting: [],
       }
       this.stateByAgent.set(agent, state)
@@ -80,6 +82,7 @@ export class TurnStateRegistry {
       this.cleanupState(state, false)
       state.turn = turn
       state.candidates.clear()
+      state.published = { candidates: [], complete: true }
       state.lastRouting = []
     }
     return state
@@ -97,6 +100,7 @@ export class TurnStateRegistry {
     state.disposers.clear()
     state.active.clear()
     state.mountEpochs.clear()
+    state.published = { candidates: [], complete: true }
     if (forget) {
       state.candidates.clear()
       this.states.delete(state)
