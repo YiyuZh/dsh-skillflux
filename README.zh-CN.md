@@ -60,19 +60,22 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 
 ```text
 用户任务
-  -> 有序规则 + 确定性词法 Router
-  -> 可选的有界使用历史排序
-  -> 可选的 embedding 语义补位
-  -> 本地 Registry + 持久缓存 + 在线多源发现
+  -> 有序规则 + 确定性词法 Router（中英文）
+  -> 可选的有界使用历史排序与 embedding 语义补位
+  -> 本地 Registry + 持久缓存 + 自适应在线发现
   -> 相关性优先的质量排序 + 30 天活跃度信号
-  -> 在 Skill 数量和可选目录 token 预算内选择并挂载
-  -> Agent 调用已挂载的 Skill
-  -> turn/end 自动卸载
+  -> 通过 Skill Provider 发布 1..maxActiveSkills 个元数据摘要
+  -> Registry 技能即时挂载；缓存与远程正文保持惰性
+  -> Agent 对确切名称调用 `skill` 工具
+  -> Provider 按需下载、校验并加载正文
+  -> turn/end 释放短名单与 Provider 目录
   -> 按闲置时间、容量和实际使用价值保留或清理下载文件
 ```
 
-每个挂载只属于接收任务的 Agent。卸载会阻止它继续出现在后续目录，但不会删除
-缓存文件，也无法删除已经写入 session history 的文本。
+模型可见目录只含摘要。缓存或远程正文只有在模型真正调用 `skill` 时才下载、
+按不可变 commit 做 SHA-256 校验并加载；Registry 技能因正文已在本地而即时挂载。
+每个已发布候选只属于接收任务的 Agent；回合结束释放不会删除缓存文件，也无法
+删除已经写入 session history 的文本。
 
 ## 功能
 
@@ -88,6 +91,12 @@ dsh plugin --profile web add github:YiyuZh/dsh-skillflux#<commit-sha>
 - 根据任务相关性、市场安装量、仓库活跃度、stars、forks、license、内容来源及
   owner 策略重新排序，并为每个结果输出可解释的证据等级和告警。
 - 将远程候选固定到不可变的 GitHub commit SHA。
+- 通过单个 host 级 Skill Provider 按 Agent 解析目录：只发布元数据摘要，缓存
+  与远程正文在模型调用 `skill` 时才惰性下载。
+- 自适应联网：本地高置信短名单填满全部目录槽位时跳过远程请求；本地命中不足
+  时自动联网补齐剩余槽位。
+- 跟踪各来源健康状态：连续失败进入冷却期并自动跳过，降级发现发布非权威观测
+  以保留 last-good 目录。
 - 通过当前 Agent 的 `ctx.skills` scope 注册缓存 Skill。
 - 每次加载前使用 SHA-256 manifest 校验缓存内容。
 - 自动清理闲置和低价值的已安装 Skill 缓存，同时保护活动挂载和正在加载的条目。
@@ -109,9 +118,10 @@ SkillFlux 按以下顺序处理任务：
    时间衰减的使用历史分。规则始终优先，历史不会让无关候选越过相关性阈值。
 6. 在 `hybrid` 模式下，仅当规则和词法结果未填满目录时才使用 embedding；语义
    结果不会替换前面已经命中的规则或词法结果。
-7. 依次挂载选中名称，直到达到 `maxActiveSkills`。启用
+7. 依次发布选中名称，直到达到 `maxActiveSkills`。Registry 名称即时挂载；缓存
+   与远程名称只发布摘要，正文在模型调用 `skill` 时惰性加载。启用
    `catalogTokenBudget` 后，如果某候选会使目录提示估算值超过预算，则跳过该候选；
-   如果候选无法加载，继续按候选池顺序尝试同名 fallback。
+   惰性加载失败时，在同一个安装截止时间内按候选池顺序尝试同名 fallback。
 
 词法评分如下：
 
@@ -202,6 +212,19 @@ dsh web
 `$DSH_HOME/storages/skillflux/remote-discovery.json`，默认最多 100 条，并有
 4 MiB 硬限制。设置 `remoteCacheTtlMs: 0` 可完全关闭。
 
+### 自适应在线发现
+
+`remoteDiscovery: automatic` 时，SkillFlux 仅在需要时才联网。本地高置信短名单
+填满全部目录槽位时会完全跳过远程请求；本地路由仍有空缺或一无所获时，再从
+skills.sh 与 GitHub 搜索补齐剩余槽位（受 `maxActiveSkills` 与
+`remoteAutoMountLimit` 约束）。
+
+每个来源都有健康状态。连续失败达到 `remoteHealthFailureThreshold` 后，该来源
+进入 `remoteHealthCooldownMs` 冷却期并被跳过，因此故障会降级为“健康来源 + 发现
+缓存”，而不是每回合重试。成功调用会清空失败记录。发现降级或回退到 stale 缓存
+候选时，发布目录被标记为非权威观测：注册表保留 last-good 目录，同时仍可用的
+候选继续可见。`/skillflux status` 会按来源报告失败次数与降级状态。
+
 ### 已安装 Skill 缓存治理
 
 下载后的 Skill 单独保存在 `$DSH_HOME/cache/skillflux`。每当远程 Skill 成功挂载，
@@ -233,8 +256,8 @@ SkillFlux 支持以下插件配置：
 ```yaml
 maxActiveSkills: 3
 minRouteScore: 8
-approvalPolicy: always       # always | session | automatic
-remoteDiscovery: automatic   # automatic | on-demand | off
+approvalPolicy: always       # always | session | automatic；约束惰性远程激活与显式挂载
+remoteDiscovery: automatic   # automatic（自适应）| on-demand | off
 remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
 remoteAutoMountLimit: 3      # 惰性激活发布的远程候选上限；设为 1 可关闭候选回退
@@ -457,6 +480,11 @@ catalogTokenBudget: 512
 Skill 本质上仍是交给 Agent 的外部指令，可能包含恶意内容。审批是信任决策，
 不是沙箱。建议保留 DSH 权限、沙箱和工具审批。
 
+审批同样保护惰性激活。已发布的远程候选在模型调用 `skill` 之前不会下载任何
+内容；配置的审批策略会在该边界、下载发生之前生效。没有可用审批通道时按
+fail-closed 拒绝，而不是未经同意安装。被屏蔽或证据不足的 owner 不会进入发布
+目录。
+
 ## 测评
 
 无需 API Key 或网络即可运行版本化路由测评：
@@ -465,12 +493,13 @@ Skill 本质上仍是交给 Agent 的外部指令，可能包含恶意内容。�
 corepack pnpm eval
 ```
 
-测评包含 36 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
+测评包含 40 个词法场景、4 个自适应安全场景、8 个与 Provider 无关的语义向量
 场景、7 个目录预算场景、8 个远程质量两两对比场景、8 个远程证据治理场景、
-7 个远程缓存策略场景和 7 个已安装缓存治理场景，
+7 个远程缓存策略场景、8 个惰性远程回退场景、7 个已安装缓存治理场景和
+7 个 Provider 原生惰性运行时场景，
 覆盖英文、中文、文本归一化、规则优先级、阈值、容量限制、同分排序、同名去重、
 语义 Top-K、上下文预算、freshness、可信度、采用度、缓存过期、价值淘汰、
-活动挂载保护和负例拒绝。
+活动挂载保护、惰性下载、审批、并发隔离、取消传播与负例拒绝。
 
 | 指标 | 当前基线 |
 | --- | ---: |
@@ -490,9 +519,29 @@ corepack pnpm eval
 embedding 模型、第三方 Skill 质量或在线模型最终回答质量。测评格式和限制见
 [测评集说明](evals/README.md)。
 
+## 从 v0.2 迁移
+
+v0.3 将 SkillFlux 变为 Provider 原生惰性运行时。大部分配置保持不变，差异在
+行为层面：
+
+- 自动路由不再预下载远程候选，而是发布元数据摘要；正文在模型调用 `skill`
+  时才下载、校验并加载。`remoteAutoMountLimit` 现在限制“为惰性激活发布的
+  远程候选数量”（设为 1 可关闭同名回退），而不是预安装数量。
+- Registry 技能仍然即时挂载；缓存与远程技能以摘要形式出现在目录中并按需加载。
+- 审批同样作用于惰性激活：`always` 或 `session` 策略下，远程候选首次 `skill`
+  调用会在下载前询问。
+- 远程发现改为自适应：本地高置信短名单直接跳过联网，本地部分命中自动补齐
+  剩余槽位，故障来源进入冷却而非每回合重试；降级或 stale 发现发布非权威观测，
+  使 last-good 目录在故障期间存活。
+- 路由痕迹新增 `loaded` 结果，表示惰性加载成功。
+- bundle patch 会禁用官方 DSH `tool-skill` 消费者，改用 SkillFlux 自己的过滤
+  目录。
+
 ## 已知限制
 
 - Hybrid 效果取决于配置的 embedding 模型，SkillFlux 不负责下载或管理模型。
+- SkillFlux 注册的是单个 host 级 Provider：作用域 Agent 上下文不暴露
+  `ctx.skills`，因此按 Agent 解析的目录通过注册表传入的 lookup scope 路由。
 - 语义补位最多处理当前 Registry/缓存顺序中的 `embeddingCandidateLimit` 个本地
   候选。
 - 目录 token 数是可移植估算值，不是当前聊天模型 tokenizer 的精确计数；它不
