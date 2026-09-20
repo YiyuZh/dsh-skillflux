@@ -1716,6 +1716,7 @@ export class SkillFluxService extends Service {
 
   private cleanupSession(session: Session): void {
     this.turnStates.cleanupSession(session)
+    this.providers.invalidate()
     this.scheduleSessionCachePrune(session)
   }
 

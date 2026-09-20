@@ -115,6 +115,9 @@ Installed cache governance changes should update
 [`evals/cache-governance-cases.json`](evals/cache-governance-cases.json).
 Automatic remote mount changes should update
 [`evals/remote-fallback-cases.json`](evals/remote-fallback-cases.json).
+Provider lifecycle, lazy-download, approval, concurrency, or turn-release
+changes should extend
+[`tests/provider-eval.spec.ts`](tests/provider-eval.spec.ts).
 PRs should pass typecheck,
 lint, tests, the routing evaluation, build, and package-content validation. Do
 not commit credentials, local DSH profiles, cache entries, or `.qartez` indexes.

@@ -99,6 +99,10 @@ cancellation, stale turns, owner policy, and explicit unmounts.
 使用真实缓存目录、Agent 级 Provider 注册、Skill 工具及回合清理。额外回归用例覆盖
 共享超时、取消、过期回合、owner 策略与显式卸载。
 
+`provider-eval.spec.ts` 覆盖 Provider 原生惰性运行时的端到端语义：延迟到 `skill`
+调用才下载、单次激活内只校验一次、并发 Agent 的目录隔离、`always` 审批 fail-closed、
+会话级信任、同名回退链恢复损坏候选、调用取消传播，以及回合结束释放 Provider 目录。
+
 `routing-cases.json` 是词法与自适应 Router 的人工确定性测评集；
 `semantic-routing-cases.json` 使用版本化合成向量验证 embedding 排序契约；
 `remote-quality-cases.json` 验证相关性优先、采用度、仓库信号、可信 owner
