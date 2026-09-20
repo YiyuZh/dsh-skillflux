@@ -32,6 +32,7 @@
     "test:discovery-live": "pnpm build && node scripts/discovery-smoke.mjs",
     "test:embedding-live": "pnpm build && node scripts/embedding-smoke.mjs",
     "test:cache-governance-live": "pnpm build && node scripts/cache-governance-smoke.mjs",
+    "test:mcp-live": "pnpm build && node scripts/mcp-smoke.mjs",
     "test:coverage": "vitest run --coverage",
     "check": "pnpm typecheck && pnpm lint && pnpm test && pnpm build",
     "prepack": "pnpm build",

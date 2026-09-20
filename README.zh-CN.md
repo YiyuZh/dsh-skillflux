@@ -438,11 +438,18 @@ SEP-2640）发布的技能。与传输无关的 `McpSkillsClient` 会在任意�
 标签，该标签是每个技能身份中的来源半边：
 
 ```ts
-import { McpSkillsClient, McpTransport } from 'dsh-skillflux'
+import { McpSkillsClient, McpStdioTransport } from 'dsh-skillflux'
 
-const transport: McpTransport = { request: (method, params) => rpc(method, params) }
+// 随包的零依赖 stdio 传输通过 LSP 风格的 Content-Length 帧 JSON-RPC
+// 与子进程 MCP 服务器通信。
+const transport = new McpStdioTransport({ command: 'node', args: ['server.mjs'] })
 ctx.skillFlux.registerMcpSource('docs-server', new McpSkillsClient(transport))
 ```
+
+SSE 与 Streamable HTTP 传输仍由接入方提供：实现 `McpTransport` 的
+`request(method, params)` 后传给 `McpSkillsClient` 即可。`pnpm test:mcp-live`
+会针对随包的一致性服务器验证 stdio 传输，并包含篡改 digest 的 fail-closed
+场景。
 
 列表与远程候选走相同的信任与审批边界。每个条目都按扩展契约校验，`resources`
 为 `"dynamic"` 的技能因无法内容绑定而被拒绝；审批绑定到排序后的
@@ -595,7 +602,8 @@ v0.4 新增两个可选子系统，现有配置与行为全部保持兼容：
   传入与传输无关的 `McpSkillsClient`，即可承载通过 MCP Skills 扩展发布的
   技能。条目先通过校验，内容按其 `[uri, digest, size]` 集合绑定，并沿用与
   远程候选相同的审批与信任策略。新增配置键：`mcpDiscovery`、
-  `mcpTrustedServers`、`mcpBlockedServers`。stdio/SSE 传输仍由接入方提供。
+  `mcpTrustedServers`、`mcpBlockedServers`。stdio 传输已随包提供；
+  SSE/HTTP 传输仍由接入方提供。
 - Token 遥测。宿主挂载 DSH token-meter 服务后，使用统计会新增每个 Skill 的
   目录占用与加载正文 token 计数以及估算器标记，并显示在 `/skillflux status`
   与 `/skillflux usage` 中。旧的 usage 文档可直接加载；只存储 token 计数。
@@ -607,9 +615,8 @@ v0.4 新增两个可选子系统，现有配置与行为全部保持兼容：
   `ctx.skills`，因此按 Agent 解析的目录通过注册表传入的 lookup scope 路由。
 - 语义补位最多处理当前 Registry/缓存顺序中的 `embeddingCandidateLimit` 个本地
   候选。
-- MCP 加载目前内置与传输无关的 JSON-RPC 客户端和进程内测试传输；stdio/SSE
-  适配器暂由接入方提供，`resources` 为 `"dynamic"` 的技能因无法内容绑定而被
-  拒绝。
+- MCP 加载内置与传输无关的 JSON-RPC 客户端和随包 stdio 传输；SSE/HTTP 适配器
+  暂由接入方提供，`resources` 为 `"dynamic"` 的技能因无法内容绑定而被拒绝。
 - 目录 token 数是可移植估算值，不是当前聊天模型 tokenizer 的精确计数；它不
   包含已加载的 Skill 正文、工具 schema 或其他 session history。
 - 没有 `GITHUB_TOKEN` 或 `GH_TOKEN` 时无法使用 GitHub Code Search，但

@@ -514,11 +514,19 @@ any injected transport; the host assigns each source a stable label, which is
 the origin half of every skill identity:
 
 ```ts
-import { McpSkillsClient, McpTransport } from 'dsh-skillflux'
+import { McpSkillsClient, McpStdioTransport } from 'dsh-skillflux'
 
-const transport: McpTransport = { request: (method, params) => rpc(method, params) }
+// The bundled zero-dependency stdio transport speaks LSP-style
+// Content-Length framed JSON-RPC to a child MCP server process.
+const transport = new McpStdioTransport({ command: 'node', args: ['server.mjs'] })
 ctx.skillFlux.registerMcpSource('docs-server', new McpSkillsClient(transport))
 ```
+
+SSE and Streamable HTTP transports remain consumer-provided: implement the
+small `McpTransport` interface (`request(method, params)`) and pass it to
+`McpSkillsClient`. `pnpm test:mcp-live` exercises the bundled stdio transport
+against a checked-in conformance server, including a tampered-digest
+fail-closed run.
 
 Listings flow through the same trust and approval boundaries as remote
 candidates. Every entry is validated against the extension contract, a skill
@@ -705,8 +713,8 @@ over unchanged:
   the MCP Skills extension. Entries are validated, content-bound by their
   `[uri, digest, size]` set, and gated by the same approval and trust policy
   as remote candidates. New configuration keys: `mcpDiscovery`,
-  `mcpTrustedServers`, `mcpBlockedServers`. Stdio/SSE transports are still
-  consumer-provided.
+  `mcpTrustedServers`, `mcpBlockedServers`. The stdio transport is bundled;
+  SSE/HTTP transports remain consumer-provided.
 - Token telemetry. When the host mounts the DSH token-meter service, usage
   records gain per-skill catalog-footprint and loaded-body token counts plus
   the estimator marker, surfaced by `/skillflux status` and
@@ -722,10 +730,9 @@ over unchanged:
   passed by the registry.
 - Semantic fallback considers at most `embeddingCandidateLimit` local
   candidates in current Registry/cache order.
-- MCP loading ships the transport-agnostic JSON-RPC client and the in-process
-  test transport. Stdio/SSE adapters are consumer-provided for now, and skills
-  whose `resources` is `"dynamic"` are refused because they cannot be
-  content-bound.
+- MCP loading ships the transport-agnostic JSON-RPC client and a bundled stdio
+  transport. SSE/HTTP adapters are consumer-provided for now, and skills whose
+  `resources` is `"dynamic"` are refused because they cannot be content-bound.
 - Catalog token counts are portable estimates, not exact counts from the
   configured chat model. They exclude loaded Skill bodies, tool schemas, and
   other session history.
