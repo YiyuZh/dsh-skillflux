@@ -192,6 +192,12 @@ interface RemoteQualityBreakdown {
   readonly total: number;
 }
 type SkillFluxCandidate = RegistryCandidate | CachedCandidate | RemoteCandidate;
+/** Per-turn provider catalog: metadata-only candidates plus discovery completeness. */
+interface SkillFluxCatalog {
+  readonly candidates: readonly SkillFluxCandidate[];
+  /** Whether the current discovery is authoritative and may be cached. */
+  readonly complete: boolean;
+}
 interface MountedSkill {
   readonly candidateId: string;
   readonly name: string;
@@ -211,7 +217,7 @@ interface RoutingTrace {
   readonly origin: CandidateOrigin;
   readonly source: string;
   readonly selection: CandidateSelection;
-  readonly outcome: 'selected' | 'mounted' | 'budget-skipped' | 'mount-failed' | 'mount-timeout';
+  readonly outcome: 'selected' | 'mounted' | 'loaded' | 'budget-skipped' | 'mount-failed' | 'mount-timeout';
   readonly score: number;
   readonly baseScore?: number;
   readonly adaptiveBoost?: number;
@@ -632,6 +638,7 @@ declare class SkillFluxService extends Service {
   private autoPruneRequested;
   private readonly turnStates;
   private readonly discovery;
+  private readonly providers;
   private readonly trustedBySession;
   private readonly cachePruneSessions;
   constructor(ctx: Context, config?: SkillFluxConfig);
@@ -670,6 +677,7 @@ declare class SkillFluxService extends Service {
   private assertCapacity;
   private assertCatalogBudget;
   private catalogFitsBudget;
+  private catalogSkills;
   private assertStateCurrent;
   private assertMountCurrent;
   private beginTurn;
@@ -677,7 +685,12 @@ declare class SkillFluxService extends Service {
   private cleanupState;
   private rememberRouting;
   private markRoutingOutcome;
+  private recordRoutingOutcome;
   private candidate;
+  private publishedRemote;
+  private skillDefinition;
+  private loadProviderBody;
+  private loadOne;
   private trackUsage;
   private activeCacheIds;
   private acquireCacheLease;
@@ -694,5 +707,5 @@ declare class SkillFluxService extends Service {
   private scheduleSessionCachePrune;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, routeScore, selectCandidates, tokenize, verifyUniqueRemoteSkill };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, name, normalizeText, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, routeScore, selectCandidates, tokenize, verifyUniqueRemoteSkill };
 //# sourceMappingURL=index.d.ts.map

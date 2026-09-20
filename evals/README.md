@@ -83,18 +83,21 @@ This corpus measures deterministic router behavior. It doesn't measure the
 quality of third-party Skill instructions or the final answer from an online
 model. Those require a separate, credential-backed end-to-end run.
 
-`remote-fallback-cases.json` adds 8 runtime scenarios covering first-success
-termination, source/installer failures, the default attempt cap, single-attempt
-mode, exhaustion, and both manual approval policies. Its integration runner
-uses real cache files, registration, the `skill` tool, and turn cleanup with
+`remote-fallback-cases.json` adds 8 runtime scenarios for the lazy
+provider-native path: metadata-only publication, first-success termination,
+source/installer fallback during the `skill` call, the default attempt cap,
+single-attempt mode, exhaustion, incomplete discovery observations, and both
+manual approval policies. Its integration runner uses real cache files, the
+agent-scoped provider registration, the `skill` tool, and turn cleanup with
 fixture discovery/installation. Extra regressions cover shared deadlines,
-cancellation, stale turns, owner policy, and post-install catalog budgets.
+cancellation, stale turns, owner policy, and explicit unmounts.
 
 ## 中文说明
 
-`remote-fallback-cases.json` 新增 8 个自动挂载场景，验证失败回退、次数上限、审批
-模式、成功停止与失败提示清理；集成测试使用真实缓存目录、Skill 工具及回合清理。
-额外回归用例覆盖共享超时、取消、过期回合、owner 策略和安装后的目录预算。
+`remote-fallback-cases.json` 新增 8 个惰性发布场景，验证元数据发布、`skill` 调用
+时的失败回退、次数上限、审批模式、成功停止、失败提示清理与不完整观测；集成测试
+使用真实缓存目录、Agent 级 Provider 注册、Skill 工具及回合清理。额外回归用例覆盖
+共享超时、取消、过期回合、owner 策略与显式卸载。
 
 `routing-cases.json` 是词法与自适应 Router 的人工确定性测评集；
 `semantic-routing-cases.json` 使用版本化合成向量验证 embedding 排序契约；

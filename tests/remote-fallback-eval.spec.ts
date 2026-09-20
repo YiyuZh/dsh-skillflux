@@ -12,9 +12,9 @@ import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import SkillFluxService, { estimateCatalogTokens, SkillCache, type RemoteCandidateVerifier, type SkillFluxConfig } from '../src/index.js'
+import SkillFluxService, { SkillCache, type RemoteCandidateVerifier, type SkillFluxConfig } from '../src/index.js'
 import { candidateId } from '../src/router.js'
-import type { ApprovalPolicy, RemoteCandidate, SkillFluxCandidate } from '../src/types.js'
+import type { ApprovalPolicy, RemoteCandidate, SkillFluxCandidate, SkillFluxCatalog } from '../src/types.js'
 
 type Result = 'ok' | 'verify-fail' | 'install-fail'
 interface FallbackCase {
@@ -22,9 +22,10 @@ interface FallbackCase {
   policy: ApprovalPolicy
   limit?: number
   results: Result[]
+  published: number[]
   attempts: number[]
   outcomes: string[]
-  mounted: number[]
+  loaded: number[]
   remaining: number[]
 }
 const corpus = JSON.parse(await readFile(new URL('../evals/remote-fallback-cases.json', import.meta.url), 'utf8')) as {
@@ -82,7 +83,7 @@ async function fixture(results: Result[], config: SkillFluxConfig = {}) {
   const internals = context.skillFlux as unknown as {
     cache: SkillCache
     remote: { search: (query: string, signal?: AbortSignal) => Promise<RemoteCandidate[]> }
-    state: (agent: Agent) => { candidates: Map<string, SkillFluxCandidate> }
+    state: (agent: Agent) => { candidates: Map<string, SkillFluxCandidate>; published: SkillFluxCatalog }
   }
   const attempts: number[] = []
   let installing = -1
@@ -109,21 +110,28 @@ async function fixture(results: Result[], config: SkillFluxConfig = {}) {
     'agent/pre-step', { messages, turn: 1, step: 1, signal },
     () => Promise.resolve({ kind: 'enter' as const, messages }),
   )
+  const callSkill = (name = 'pdf-reader', signal = new AbortController().signal) => context.tools.execute({
+    callId: CallId(`lazy-load-${name}`),
+    name: 'skill',
+    arguments: { name },
+    agent,
+    signal,
+  })
   const endTurn = () => context.emit(scopeTarget(session, undefined), 'session/event', session, {
     type: 'turn/end', seq: 1, time: 1, data: { turn: 1, reason: { kind: 'completed' } },
   })
-  return { context, agent, candidates, attempts, internals, verify, markdown, propose, endTurn }
+  return { context, agent, candidates, attempts, internals, verify, markdown, propose, callSkill, endTurn }
 }
 
 describe('automatic remote fallback evaluation', () => {
   it('has valid and uniquely identified corpus cases', () => {
-    expect(corpus.version).toBe(1)
+    expect(corpus.version).toBe(2)
     expect(corpus.cases.length).toBeGreaterThanOrEqual(8)
     expect(new Set(corpus.cases.map(item => item.id)).size).toBe(corpus.cases.length)
     for (const item of corpus.cases) {
       expect(['always', 'session', 'automatic']).toContain(item.policy)
       for (const result of item.results) expect(['ok', 'verify-fail', 'install-fail']).toContain(result)
-      for (const index of [...item.attempts, ...item.mounted, ...item.remaining]) {
+      for (const index of [...item.published, ...item.attempts, ...item.loaded, ...item.remaining]) {
         expect(Number.isInteger(index) && index >= 0 && index < item.results.length).toBe(true)
       }
     }
@@ -136,23 +144,29 @@ describe('automatic remote fallback evaluation', () => {
     })
     const result = await f.propose()
     expect(result.kind).toBe('enter')
-    expect(f.attempts).toEqual(testCase.attempts)
-    expect(f.context.skillFlux.lastRouting(f.agent).map(trace => trace.outcome)).toEqual(testCase.outcomes)
-    expect(f.context.skillFlux.mounted(f.agent).map(item => item.candidateId))
-      .toEqual(testCase.mounted.map(index => f.candidates[index]!.id))
+    expect(f.attempts).toEqual([])
+    expect(f.context.skillFlux.mounted(f.agent)).toEqual([])
+    expect(f.internals.state(f.agent).published.candidates.map(candidate => candidate.id))
+      .toEqual(testCase.published.map(index => f.candidates[index]!.id))
     expect([...f.internals.state(f.agent).candidates.keys()])
-      .toEqual(testCase.remaining.map(index => f.candidates[index]!.id))
+      .toEqual(f.candidates.map(candidate => candidate.id))
     if (result.kind === 'enter') {
       const text = JSON.stringify(result.messages)
-      for (const index of testCase.attempts) expect(text).not.toContain(f.candidates[index]!.id)
-      for (const index of testCase.remaining) expect(text).toContain(f.candidates[index]!.id)
+      for (const candidate of f.candidates) expect(text).toContain(candidate.id)
+      if (testCase.published.length > 0) expect(text).toContain('pdf-reader')
     }
-    if (testCase.mounted.length > 0) {
-      const skill = await f.context.tools.execute({
-        callId: CallId('read-mounted-pdf-skill'), name: 'skill', arguments: { name: 'pdf-reader' },
-        agent: f.agent, signal: new AbortController().signal,
-      })
-      expect(JSON.stringify(skill)).toContain(f.candidates[testCase.mounted[0]!]!.source)
+    if (testCase.attempts.length > 0) {
+      const loaded = await f.callSkill()
+      expect(f.attempts).toEqual(testCase.attempts)
+      expect(f.context.skillFlux.lastRouting(f.agent).map(trace => trace.outcome)).toEqual(testCase.outcomes)
+      expect([...f.internals.state(f.agent).candidates.keys()])
+        .toEqual(testCase.remaining.map(index => f.candidates[index]!.id))
+      if (testCase.loaded.length > 0) {
+        expect(loaded.isError).toBe(false)
+        expect(JSON.stringify(loaded)).toContain(f.candidates[testCase.loaded[0]!]!.source)
+      } else {
+        expect(loaded.isError).toBe(true)
+      }
       f.endTurn()
       expect(f.context.skillFlux.mounted(f.agent)).toEqual([])
       expect((await f.agent.ctx.skills.snapshot()).skills).toEqual([])
@@ -167,10 +181,21 @@ describe('automatic remote fallback evaluation', () => {
     }
   })
 
+  it('publishes an incomplete observation when remote discovery fails', async () => {
+    const f = await fixture(['ok'])
+    vi.spyOn(f.internals.remote, 'search').mockRejectedValueOnce(new Error('search backend down'))
+    const result = await f.propose()
+    expect(result.kind).toBe('enter')
+    expect(f.internals.state(f.agent).published).toMatchObject({ candidates: [], complete: false })
+    const snapshot = await f.agent.ctx.skills.snapshot({ scope: f.agent, cwd: f.agent.session.header.cwd })
+    expect(snapshot.complete).toBe(false)
+  })
+
   it('allows an explicit new search to retry a failed candidate without silently mounting another', async () => {
     const f = await fixture(['ok', 'ok'], { remoteAutoMountLimit: 1 })
     f.verify.mockRejectedValueOnce(new Error('temporary source failure'))
     await f.propose()
+    await expect(f.callSkill()).resolves.toMatchObject({ isError: true })
     await expect(f.context.skillFlux.mount(f.agent, f.candidates[0]!.id)).rejects.toThrow('unknown or expired')
     await f.context.tools.execute({
       callId: CallId('retry-remote-search'), name: 'skillflux_search', arguments: { query: 'PDF', remote: true },
@@ -185,17 +210,11 @@ describe('automatic remote fallback evaluation', () => {
     const f = await fixture(['ok', 'ok'], { remoteBlockedOwners: ['blocked'] })
     f.candidates[0] = { ...f.candidates[0]!, source: 'blocked/repo' }
     await f.propose()
+    expect(f.internals.state(f.agent).published.candidates.map(item => item.id)).toEqual([f.candidates[1]!.id])
+    const loaded = await f.callSkill()
     expect(f.attempts).toEqual([1])
-    expect(f.context.skillFlux.lastRouting(f.agent).map(item => item.outcome)).toEqual(['mount-failed', 'mounted'])
-  })
-
-  it('tries the next candidate if installed metadata exceeds the catalog budget', async () => {
-    const budget = Math.max(64, estimateCatalogTokens([{ name: 'pdf-reader', description: 'Read PDF tables' }], 160))
-    const f = await fixture(['ok', 'ok'], { catalogTokenBudget: budget })
-    f.markdown[0] = `---\nname: pdf-reader\ndescription: ${'long metadata '.repeat(100)}\n---\nPDF instructions\n`
-    await f.propose()
-    expect(f.attempts).toEqual([0, 1])
-    expect(f.context.skillFlux.lastRouting(f.agent).map(item => item.outcome)).toEqual(['budget-skipped', 'mounted'])
+    expect(loaded.isError).toBe(false)
+    expect(f.context.skillFlux.lastRouting(f.agent).map(item => item.outcome)).toEqual(['loaded'])
   })
 
   it('propagates explicit cancellation without falling back', async () => {
@@ -205,7 +224,10 @@ describe('automatic remote fallback evaluation', () => {
       controller.abort(new Error('user cancelled'))
       throw controller.signal.reason
     })
-    await expect(f.propose(controller.signal)).rejects.toThrow('user cancelled')
+    await f.propose()
+    const cancelled = await f.callSkill('pdf-reader', controller.signal)
+    expect(cancelled.isError).toBe(true)
+    expect(cancelled.error?.message).toContain('user cancelled')
     expect(f.verify).toHaveBeenCalledTimes(1)
     expect(f.context.skillFlux.mounted(f.agent)).toEqual([])
   })
@@ -217,6 +239,9 @@ describe('automatic remote fallback evaluation', () => {
       throw new Error('archive failed after turn end')
     })
     await f.propose()
+    const stale = await f.callSkill()
+    expect(stale.isError).toBe(true)
+    expect(stale.error?.message).toContain('SkillFlux mount expired')
     expect(f.verify).toHaveBeenCalledTimes(1)
     expect(f.context.skillFlux.mounted(f.agent)).toEqual([])
     expect(f.context.skillFlux.lastRouting(f.agent)).toEqual([])
@@ -233,6 +258,9 @@ describe('automatic remote fallback evaluation', () => {
       return await new Promise(() => undefined)
     })
     await f.propose()
+    const timedOut = await f.callSkill()
+    expect(timedOut.isError).toBe(true)
+    expect(timedOut.error?.message).toContain('shared install deadline expired')
     expect(f.verify).toHaveBeenCalledTimes(2)
     expect(f.context.skillFlux.lastRouting(f.agent).map(item => item.outcome)).toEqual(['mount-failed', 'mount-timeout'])
     expect([...f.internals.state(f.agent).candidates.keys()]).toEqual([f.candidates[2]!.id])
@@ -247,6 +275,9 @@ describe('automatic remote fallback evaluation', () => {
       throw new Error('source failed after named unmount')
     })
     await f.propose()
+    const unmounted = await f.callSkill()
+    expect(unmounted.isError).toBe(true)
+    expect(unmounted.error?.message).toContain('SkillFlux mount expired')
     expect(f.verify).toHaveBeenCalledTimes(1)
     expect(f.context.skillFlux.mounted(f.agent)).toEqual([])
     expect(f.context.skillFlux.lastRouting(f.agent)).toEqual([])
@@ -264,6 +295,9 @@ describe('automatic remote fallback evaluation', () => {
       throw new Error('first candidate failed after future candidate was unmounted')
     })
     await f.propose()
+    const respected = await f.callSkill('pdf-reader')
+    expect(respected.isError).toBe(true)
+    expect(respected.error?.message).toContain('first candidate failed after future candidate was unmounted')
     expect(f.verify).toHaveBeenCalledTimes(1)
     expect(f.context.skillFlux.mounted(f.agent)).toEqual([])
     expect(f.context.skillFlux.lastRouting(f.agent).map(item => item.outcome)).toEqual(['mount-failed'])
