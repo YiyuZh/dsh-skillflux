@@ -237,7 +237,7 @@ approvalPolicy: always       # always | session | automatic
 remoteDiscovery: automatic   # automatic | on-demand | off
 remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
-remoteAutoMountLimit: 3      # 仅 automatic 审批；设为 1 可关闭候选回退
+remoteAutoMountLimit: 3      # 惰性激活发布的远程候选上限；设为 1 可关闭候选回退
 remoteSearchTimeoutMs: 30000
 remoteMinQualityScore: 35     # 0-100
 remoteMinStars: 0
@@ -248,6 +248,8 @@ remoteBlockedOwners: []
 remoteCacheTtlMs: 300000                  # 0 表示关闭
 remoteCacheStaleIfErrorMs: 86400000       # TTL 后的额外 stale 窗口
 remoteCacheMaxEntries: 100
+remoteHealthFailureThreshold: 3           # 连续失败多少次后降级该来源
+remoteHealthCooldownMs: 60000             # 降级来源的跳过窗口
 cacheAutoPrune: true
 cacheMaxEntries: 100
 cacheMaxTotalBytes: 536870912              # 已安装 Skill 合计 512 MiB

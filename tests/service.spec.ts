@@ -1049,10 +1049,10 @@ describe('SkillFlux service', () => {
     expect((loaded.content[0] as { text?: string }).text).toContain('Good cached instructions.')
   })
 
-  it('rejects incomplete discovery before publishing partial candidates', async () => {
-    const context = await setup({ routes: [] })
+  it('fails open on incomplete discovery using partial candidates', async () => {
+    const context = await setup({ routes: [{ matchAny: ['partial'], skills: ['partial-skill'] }] })
     const agent = fakeAgent(context)
-    vi.spyOn(context.skills, 'snapshot').mockResolvedValueOnce({
+    vi.spyOn(context.skills, 'snapshot').mockResolvedValue({
       complete: false,
       skills: [{
         name: 'partial-skill',
@@ -1064,8 +1064,91 @@ describe('SkillFlux service', () => {
     })
     const cache = (context.skillFlux as unknown as { cache: { list: ReturnType<typeof vi.fn> } }).cache
     cache.list = vi.fn(async () => [])
-    await expect(context.skillFlux.discover(agent, 'partial-skill')).rejects.toThrow('discovery is incomplete')
-    expect(cache.list).not.toHaveBeenCalled()
+    const candidates = await context.skillFlux.discover(agent, 'partial-skill')
+    expect(candidates).toMatchObject([{ name: 'partial-skill', origin: 'registry' }])
+    expect(cache.list).toHaveBeenCalled()
+  })
+
+  it('retries a transiently incomplete snapshot before settling on partial candidates', async () => {
+    const context = await setup({ routes: [{ matchAny: ['retried'], skills: ['retried-skill'] }] })
+    const agent = fakeAgent(context)
+    const summary = {
+      name: 'retried-skill',
+      description: 'Transient partial result',
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'partial-provider',
+      provider: 'partial-provider',
+    }
+    const snapshot = vi.spyOn(context.skills, 'snapshot')
+    snapshot.mockResolvedValueOnce({ complete: false, skills: [summary] })
+    snapshot.mockResolvedValueOnce({ complete: true, skills: [summary] })
+    const candidates = await context.skillFlux.discover(agent, 'retried-skill')
+    expect(snapshot).toHaveBeenCalledTimes(2)
+    expect(candidates).toMatchObject([{ name: 'retried-skill', origin: 'registry' }])
+  })
+
+  it('skips remote discovery when a confident local shortlist fills every slot', async () => {
+    const context = await setup({
+      routes: [{ matchAny: ['pdf'], skills: ['skill-1', 'skill-2', 'skill-3'] }],
+      maxActiveSkills: 3,
+      remoteDiscovery: 'automatic',
+    })
+    for (const name of ['skill-1', 'skill-2', 'skill-3']) {
+      context.skills.register({ name, description: `${name} capability`, source: 'runtime', content: `${name} instructions` })
+    }
+    const remote = (context.skillFlux as unknown as {
+      remote: { searchWithStatus: () => Promise<{ candidates: RemoteCandidate[]; complete: boolean }> }
+    }).remote
+    const search = vi.spyOn(remote, 'searchWithStatus')
+    const agent = fakeAgent(context)
+    const user = createUserMessage({ content: [{ type: 'text', text: 'Process this PDF document' }], source: { kind: 'user' } })
+    await propose(context, agent, [user])
+    expect(search).not.toHaveBeenCalled()
+    expect(context.skillFlux.mounted(agent).map(skill => skill.name)).toEqual(['skill-1', 'skill-2', 'skill-3'])
+  })
+
+  it('fills remaining slots from remote when local confidence is partial', async () => {
+    const context = await setup({
+      routes: [{ matchAny: ['pdf'], skills: ['local-skill'] }],
+      maxActiveSkills: 3,
+      remoteDiscovery: 'automatic',
+    })
+    context.skills.register({
+      name: 'local-skill',
+      description: 'Local PDF handling',
+      source: 'runtime',
+      content: 'Local PDF instructions.',
+    })
+    const remoteCandidate: RemoteCandidate = {
+      id: candidateId('remote', 'owner/remote', '4'.repeat(40), 'remote-skill'),
+      origin: 'remote', name: 'remote-skill', skillId: 'remote-skill',
+      description: 'Remote PDF enrichment', source: 'owner/remote', ref: '4'.repeat(40),
+      score: 70, installs: 0, discoverySources: ['github'], qualityScore: 70,
+      relevanceScore: 100, stars: 10, forks: 0, recentlyActive: true,
+      trustedSource: false, trustLevel: 'community',
+      qualityBreakdown: { relevance: 55, adoption: 0, repository: 5, freshness: 6, trust: 0, provenance: 4, total: 70 },
+      qualitySignals: ['content-pinned'], qualityWarnings: [],
+    }
+    const remote = (context.skillFlux as unknown as {
+      remote: { searchWithStatus: () => Promise<{ candidates: RemoteCandidate[]; complete: boolean }> }
+    }).remote
+    const search = vi.spyOn(remote, 'searchWithStatus').mockResolvedValue({ candidates: [remoteCandidate], complete: true })
+    const agent = fakeAgent(context)
+    const user = createUserMessage({ content: [{ type: 'text', text: 'Process this PDF document' }], source: { kind: 'user' } })
+    const decision = await propose(context, agent, [user])
+    expect(search).toHaveBeenCalledTimes(1)
+    expect(context.skillFlux.mounted(agent).map(skill => skill.name)).toEqual(['local-skill'])
+    const internals = context.skillFlux as unknown as {
+      state: (target: Agent) => { published: { candidates: readonly SkillFluxCandidate[] } }
+    }
+    expect(internals.state(agent).published.candidates.map(skill => skill.name)).toEqual(['remote-skill'])
+    expect(decision.kind).toBe('enter')
+    if (decision.kind !== 'enter') return
+    const catalog = decision.messages.find(message => message.source.kind === 'skill-catalog')
+    expect(catalog).toBeDefined()
+    if (catalog === undefined) return
+    expect((catalog.source as { entries?: { name: string }[] }).entries?.map(entry => entry.name))
+      .toEqual(['local-skill', 'remote-skill'])
   })
 
   it('does not publish a mount after its agent state is disposed', async () => {

@@ -82,7 +82,10 @@ async function fixture(results: Result[], config: SkillFluxConfig = {}) {
   const markdown = candidates.map(candidate => `---\nname: pdf-reader\ndescription: ${candidate.description}\n---\nRead tables with ${candidate.source}.\n`)
   const internals = context.skillFlux as unknown as {
     cache: SkillCache
-    remote: { search: (query: string, signal?: AbortSignal) => Promise<RemoteCandidate[]> }
+    remote: {
+      search: (query: string, signal?: AbortSignal) => Promise<RemoteCandidate[]>
+      searchWithStatus: (query: string, signal?: AbortSignal) => Promise<{ candidates: RemoteCandidate[]; complete: boolean }>
+    }
     state: (agent: Agent) => { candidates: Map<string, SkillFluxCandidate>; published: SkillFluxCatalog }
   }
   const attempts: number[] = []
@@ -104,7 +107,7 @@ async function fixture(results: Result[], config: SkillFluxConfig = {}) {
       await writeFile(join(directory, 'SKILL.md'), markdown[installing]!)
     },
   })
-  vi.spyOn(internals.remote, 'search').mockResolvedValue(candidates)
+  vi.spyOn(internals.remote, 'searchWithStatus').mockResolvedValue({ candidates, complete: true })
   const messages = [createUserMessage({ content: [{ type: 'text', text: 'Read the tables in this PDF' }], source: { kind: 'user' } })]
   const propose = (signal = new AbortController().signal) => agentEvents(context, agent).waterfall(
     'agent/pre-step', { messages, turn: 1, step: 1, signal },
@@ -183,7 +186,7 @@ describe('automatic remote fallback evaluation', () => {
 
   it('publishes an incomplete observation when remote discovery fails', async () => {
     const f = await fixture(['ok'])
-    vi.spyOn(f.internals.remote, 'search').mockRejectedValueOnce(new Error('search backend down'))
+    vi.mocked(f.internals.remote.searchWithStatus).mockRejectedValueOnce(new Error('search backend down'))
     const result = await f.propose()
     expect(result.kind).toBe('enter')
     expect(f.internals.state(f.agent).published).toMatchObject({ candidates: [], complete: false })

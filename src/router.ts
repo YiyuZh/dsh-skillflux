@@ -52,6 +52,19 @@ function containsNamePhrase(query: string, phrase: string): boolean {
   return new RegExp(`(?:^|[^\\p{L}\\p{N}])${escapeRegExp(phrase)}(?=$|[^\\p{L}\\p{N}])`, 'u').test(query)
 }
 
+/**
+ * Chinese has no word boundaries, so bigram overlap alone under-scores a
+ * short query whose terms appear verbatim inside a longer description. A
+ * literal CJK fragment in the description is a strong relevance signal.
+ */
+function cjkSubstringBonus(queryTokens: ReadonlySet<string>, text: string): number {
+  let bonus = 0
+  for (const token of queryTokens) {
+    if (/^[\p{Script=Han}]{2,}$/u.test(token) && text.includes(token)) bonus += 10
+  }
+  return bonus
+}
+
 export function routeScore(
   query: string,
   candidate: { readonly name: string; readonly description: string; readonly whenToUse?: string },
@@ -62,8 +75,12 @@ export function routeScore(
   let score = containsNamePhrase(normalizedQuery, exactName) || containsNamePhrase(normalizedQuery, skillPhrase) ? 100 : 0
   const queryTokens = tokenize(query)
   score += overlap(queryTokens, tokenize(candidate.name.replaceAll('-', ' '))) * 20
-  if (candidate.whenToUse !== undefined) score += overlap(queryTokens, tokenize(candidate.whenToUse)) * 8
+  if (candidate.whenToUse !== undefined) {
+    score += overlap(queryTokens, tokenize(candidate.whenToUse)) * 8
+    score += cjkSubstringBonus(queryTokens, candidate.whenToUse)
+  }
   score += overlap(queryTokens, tokenize(candidate.description)) * 3
+  score += cjkSubstringBonus(queryTokens, candidate.description)
   return score
 }
 

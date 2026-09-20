@@ -51,6 +51,10 @@ export interface SkillFluxConfig {
   readonly remoteCacheTtlMs?: number
   readonly remoteCacheStaleIfErrorMs?: number
   readonly remoteCacheMaxEntries?: number
+  /** Consecutive provider failures that trigger a cooldown. */
+  readonly remoteHealthFailureThreshold?: number
+  /** How long a repeatedly failing source stays skipped. */
+  readonly remoteHealthCooldownMs?: number
   readonly cacheAutoPrune?: boolean
   readonly cacheMaxEntries?: number
   readonly cacheMaxTotalBytes?: number
@@ -97,6 +101,8 @@ export interface ResolvedSkillFluxConfig {
   readonly remoteCacheTtlMs: number
   readonly remoteCacheStaleIfErrorMs: number
   readonly remoteCacheMaxEntries: number
+  readonly remoteHealthFailureThreshold: number
+  readonly remoteHealthCooldownMs: number
   readonly cacheAutoPrune: boolean
   readonly cacheMaxEntries: number
   readonly cacheMaxTotalBytes: number
@@ -219,6 +225,12 @@ export interface SkillFluxCatalog {
   readonly candidates: readonly SkillFluxCandidate[]
   /** Whether the current discovery is authoritative and may be cached. */
   readonly complete: boolean
+}
+
+export interface RemoteSourceHealth {
+  readonly provider: RemoteDiscoveryProvider
+  readonly consecutiveFailures: number
+  readonly cooldownUntil?: number
 }
 
 export interface MountedSkill {

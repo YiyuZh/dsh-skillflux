@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { UserMessage } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, UserMessage } from '@deepseek-ai/dsh-session'
 import { escapeText, type SkillSummary } from '@deepseek-ai/dsh-skill'
 import type { RemoteCandidate } from './types.js'
 
@@ -36,6 +36,30 @@ export interface SkillFluxCandidatesSource {
 
 type RemoteEntries = SkillFluxCandidatesSource['entries']
 type CatalogItem = Pick<SkillSummary, 'name' | 'description'>
+
+/**
+ * Session log access compatible with both the 0.1.1 array shape (`events`)
+ * and the 0.1.6 accessor shape (`seq` + `eventAt`). The harness moved the
+ * event log behind accessors in 0.1.6; catalog history reads must not depend
+ * on either concrete storage form.
+ */
+interface SessionEventLog {
+  readonly events?: readonly SessionEvent[]
+  readonly seq?: number
+  eventAt?: (seq: number) => SessionEvent | undefined
+}
+
+function sessionLength(agent: Agent): number {
+  const session = agent.session as unknown as SessionEventLog
+  if (typeof session.seq === 'number') return session.seq
+  return session.events?.length ?? 0
+}
+
+function sessionEventAt(agent: Agent, index: number): SessionEvent | undefined {
+  const session = agent.session as unknown as SessionEventLog
+  if (typeof session.eventAt === 'function') return session.eventAt(index)
+  return session.events?.[index]
+}
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -182,8 +206,8 @@ function remoteDigest(entries: RemoteEntries): string {
 function history(agent: Agent): { published: boolean; visibleDigest?: string } {
   const visible = new Set(agent.session.surface.nodes)
   let published = false
-  for (let index = agent.session.events.length - 1; index >= 0; index -= 1) {
-    const event = agent.session.events[index]
+  for (let index = sessionLength(agent) - 1; index >= 0; index -= 1) {
+    const event = sessionEventAt(agent, index)
     if (event === undefined || event.type !== 'user/message' || event.data.source.kind !== 'skill-catalog') continue
     const entries = readEntries(event.data.source)
     if (entries === undefined) continue
@@ -196,8 +220,8 @@ function history(agent: Agent): { published: boolean; visibleDigest?: string } {
 function remoteHistory(agent: Agent): { published: boolean; visibleDigest?: string } {
   const visible = new Set(agent.session.surface.nodes)
   let published = false
-  for (let index = agent.session.events.length - 1; index >= 0; index -= 1) {
-    const event = agent.session.events[index]
+  for (let index = sessionLength(agent) - 1; index >= 0; index -= 1) {
+    const event = sessionEventAt(agent, index)
     if (event === undefined || event.type !== 'user/message' || event.data.source.kind !== 'skillflux-candidates') continue
     // Older SkillFlux versions published a narrower entry shape. It cannot
     // produce the current digest, but it still needs an explicit replacement

@@ -48,6 +48,22 @@ function agentWithRemoteHistory(entries: readonly RemoteCandidate[][]): Agent {
   } as unknown as Agent
 }
 
+function agentWithAccessorHistory(entries: readonly RemoteCandidate[][]): Agent {
+  const events = entries.map((items, index) => {
+    const message = remoteCandidateMessage({
+      session: { events: [], surface: { nodes: [] } },
+    } as unknown as Agent, items)
+    return { type: 'user/message' as const, seq: index + 1, time: index + 1, data: message }
+  })
+  return {
+    session: {
+      seq: events.length + 1,
+      eventAt: (index: number) => events[index - 1],
+      surface: { nodes: events.length === 0 ? [] : [events.length] },
+    },
+  } as unknown as Agent
+}
+
 describe('remote candidate catalog', () => {
   it('publishes one empty replacement for candidates from an earlier turn', () => {
     const agent = agentWithRemoteHistory([[candidate]])
@@ -58,6 +74,14 @@ describe('remote candidate catalog', () => {
     expect(cleared).toBeDefined()
     if (cleared === undefined) return
     expect((cleared.content[0] as { text?: string }).text).toContain('Do not use candidate ids from an earlier turn')
+  })
+
+  it('reads catalog history through the 0.1.6 session accessors', () => {
+    const agent = agentWithAccessorHistory([[candidate]])
+    const cleared = updateRemoteCandidates(agent, [])
+    expect(cleared?.source).toMatchObject({
+      kind: 'skillflux-candidates', update: true, entries: [],
+    })
   })
 
   it('does not repeat an already-visible empty replacement', () => {
