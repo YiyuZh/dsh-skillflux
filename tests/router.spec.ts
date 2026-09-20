@@ -124,4 +124,20 @@ describe('router', () => {
     })
     expect(selected).toMatchObject([{ name: 'routed', selection: 'rule', adaptiveBoost: 0 }])
   })
+
+  it('scores short CJK queries that appear verbatim inside Chinese descriptions', () => {
+    const score = routeScore('汇总 sales.csv', {
+      name: 'invoice-helper',
+      description: '汇总销售 CSV 中每个产品的销量与收入，输出产品级合计和总计',
+    })
+    expect(score).toBeGreaterThanOrEqual(8)
+  })
+
+  it('keeps unrelated short queries below the relevance threshold', () => {
+    const score = routeScore('图片裁剪', {
+      name: 'invoice-helper',
+      description: '汇总销售 CSV 中每个产品的销量与收入，输出产品级合计和总计',
+    })
+    expect(score).toBeLessThan(8)
+  })
 })

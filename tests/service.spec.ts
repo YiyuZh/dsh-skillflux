@@ -1049,10 +1049,10 @@ describe('SkillFlux service', () => {
     expect((loaded.content[0] as { text?: string }).text).toContain('Good cached instructions.')
   })
 
-  it('rejects incomplete discovery before publishing partial candidates', async () => {
-    const context = await setup({ routes: [] })
+  it('fails open on incomplete discovery using partial candidates', async () => {
+    const context = await setup({ routes: [{ matchAny: ['partial'], skills: ['partial-skill'] }] })
     const agent = fakeAgent(context)
-    vi.spyOn(context.skills, 'snapshot').mockResolvedValueOnce({
+    vi.spyOn(context.skills, 'snapshot').mockResolvedValue({
       complete: false,
       skills: [{
         name: 'partial-skill',
@@ -1064,8 +1064,27 @@ describe('SkillFlux service', () => {
     })
     const cache = (context.skillFlux as unknown as { cache: { list: ReturnType<typeof vi.fn> } }).cache
     cache.list = vi.fn(async () => [])
-    await expect(context.skillFlux.discover(agent, 'partial-skill')).rejects.toThrow('discovery is incomplete')
-    expect(cache.list).not.toHaveBeenCalled()
+    const candidates = await context.skillFlux.discover(agent, 'partial-skill')
+    expect(candidates).toMatchObject([{ name: 'partial-skill', origin: 'registry' }])
+    expect(cache.list).toHaveBeenCalled()
+  })
+
+  it('retries a transiently incomplete snapshot before settling on partial candidates', async () => {
+    const context = await setup({ routes: [{ matchAny: ['retried'], skills: ['retried-skill'] }] })
+    const agent = fakeAgent(context)
+    const summary = {
+      name: 'retried-skill',
+      description: 'Transient partial result',
+      invocation: { modelInvocable: true, userInvocable: true },
+      source: 'partial-provider',
+      provider: 'partial-provider',
+    }
+    const snapshot = vi.spyOn(context.skills, 'snapshot')
+    snapshot.mockResolvedValueOnce({ complete: false, skills: [summary] })
+    snapshot.mockResolvedValueOnce({ complete: true, skills: [summary] })
+    const candidates = await context.skillFlux.discover(agent, 'retried-skill')
+    expect(snapshot).toHaveBeenCalledTimes(2)
+    expect(candidates).toMatchObject([{ name: 'retried-skill', origin: 'registry' }])
   })
 
   it('skips remote discovery when a confident local shortlist fills every slot', async () => {

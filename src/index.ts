@@ -27,6 +27,7 @@ import {
   automaticDiscoveryQuery,
   dedupeByName,
   governedCacheCandidates,
+  retriedSnapshot,
   type DiscoveryHost,
 } from './discovery.js'
 import { EmbeddingRouter } from './embedding.js'
@@ -1187,10 +1188,13 @@ export class SkillFluxService extends Service {
   ): Promise<UserMessage | undefined> {
     const state = this.beginTurn(agent, turn)
     const generation = state.generation
-    const snapshot = await this.runtimeCtx.skills.snapshot(skillLookup(agent, signal))
+    const snapshot = await retriedSnapshot(
+      this.runtimeCtx.skills,
+      skillLookup(agent, signal),
+      message => { this.runtimeCtx.logger.warn(message) },
+    )
     signal.throwIfAborted()
     this.assertStateCurrent(state, generation)
-    if (!snapshot.complete) return updateRemoteCandidates(agent, [])
     const cached = await this.cache.list()
     signal.throwIfAborted()
     this.assertStateCurrent(state, generation)
