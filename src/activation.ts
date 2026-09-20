@@ -143,7 +143,7 @@ export async function activateCandidate(
     }
     let dispose: () => void
     try {
-      dispose = state.agent.ctx.skills.register({
+      dispose = host.runtimeCtx.skills.register({
         name: definition.name,
         description: definition.description,
         ...(definition.whenToUse === undefined ? {} : { whenToUse: definition.whenToUse }),

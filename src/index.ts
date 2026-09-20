@@ -611,10 +611,15 @@ export class SkillFluxService extends Service {
         })
       : undefined
     this.discovery = new DiscoveryCoordinator(this.discoveryHost)
-    this.providers = new SkillFluxProviderManager(agent => ({
-      catalog: () => this.turnStates.peek(agent)?.published ?? { candidates: [], complete: true },
-      load: (candidates, signal) => this.loadProviderBody(agent, candidates, signal),
-    }), message => { ctx.logger.warn(message) })
+    this.providers = new SkillFluxProviderManager({
+      catalog: scope => {
+        const agent = scope as Agent | undefined
+        if (agent === undefined) return { candidates: [], complete: true }
+        return this.turnStates.peek(agent)?.published ?? { candidates: [], complete: true }
+      },
+      load: (agent, candidates, signal) => this.loadProviderBody(agent, candidates, signal),
+    }, message => { ctx.logger.warn(message) })
+    this.providers.install(ctx.skills)
 
     const skillTool = this.createSkillTool()
     ctx.tools.register(skillTool)
@@ -643,7 +648,14 @@ export class SkillFluxService extends Service {
         source: SKILLFLUX_PROVIDER,
         provider: SKILLFLUX_PROVIDER,
       }))
-      const skills: SkillSummary[] = [...active, ...published].slice(0, this.config.maxActiveSkills)
+      const skills: SkillSummary[] = []
+      const seenNames = new Set<string>()
+      for (const skill of [...active, ...published]) {
+        if (seenNames.has(skill.name)) continue
+        seenNames.add(skill.name)
+        skills.push(skill)
+        if (skills.length >= this.config.maxActiveSkills) break
+      }
       return {
         kind: 'enter',
         messages: updateCatalog(agent, decision.messages, skills, this.config.catalogDescriptionMaxLength),
@@ -1250,14 +1262,14 @@ export class SkillFluxService extends Service {
     }
     if (this.config.remoteDiscovery !== 'automatic') {
       state.published = { candidates: published, complete: true }
-      this.providers.invalidate(agent)
+      this.providers.invalidate()
       return updateRemoteCandidates(agent, [])
     }
     const localFilled = state.active.size + published.length >= this.config.maxActiveSkills
     if (localFilled) {
       // A confident local shortlist fills every slot; skip pointless traffic.
       state.published = { candidates: published, complete: true }
-      this.providers.invalidate(agent)
+      this.providers.invalidate()
       return updateRemoteCandidates(agent, [])
     }
     let remoteCandidates: RemoteCandidate[] = []
@@ -1275,7 +1287,7 @@ export class SkillFluxService extends Service {
       // Keep local candidates visible but mark the observation
       // non-authoritative so the registry retains its last-good catalog.
       state.published = { candidates: published, complete: false }
-      this.providers.invalidate(agent)
+      this.providers.invalidate()
       return updateRemoteCandidates(agent, [])
     }
     const remainingSlots = this.config.maxActiveSkills - state.active.size - published.length
@@ -1287,7 +1299,7 @@ export class SkillFluxService extends Service {
     for (const candidate of remote) state.candidates.set(candidate.id, candidate)
     if (remote.length === 0) {
       state.published = { candidates: published, complete: remoteComplete }
-      this.providers.invalidate(agent)
+      this.providers.invalidate()
       return updateRemoteCandidates(agent, [])
     }
     // Publish remote metadata for lazy activation; approval happens when the
@@ -1297,7 +1309,7 @@ export class SkillFluxService extends Service {
       .filter(candidate => candidateGovernanceReason(candidate, this.config) === undefined)
       .slice(0, Math.min(this.config.remoteAutoMountLimit, remainingSlots))
     state.published = { candidates: [...published, ...publishable], complete: remoteComplete }
-    this.providers.invalidate(agent)
+    this.providers.invalidate()
     return updateRemoteCandidates(agent, remote.filter(candidate => state.candidates.has(candidate.id)))
   }
 
@@ -1357,9 +1369,7 @@ export class SkillFluxService extends Service {
   }
 
   private beginTurn(agent: Agent, turn: number): AgentState {
-    const state = this.turnStates.beginTurn(agent, turn)
-    this.providers.register(agent)
-    return state
+    return this.turnStates.beginTurn(agent, turn)
   }
 
   private state(agent: Agent): AgentState {
@@ -1368,7 +1378,7 @@ export class SkillFluxService extends Service {
 
   private cleanupState(state: AgentState, forget: boolean): void {
     this.turnStates.cleanupState(state, forget)
-    this.providers.dispose(state.agent)
+    this.providers.invalidate()
   }
 
   private rememberRouting(state: AgentState, mounted: MountedSkill): void {
@@ -1747,3 +1757,4 @@ function errorMessage(error: unknown): string {
 }
 
 export default SkillFluxService
+

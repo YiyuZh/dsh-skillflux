@@ -2,12 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { Inbox, type Agent } from '@deepseek-ai/dsh-agent'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import SkillRegistry, { type SkillCandidate, type SkillDefinition, type SkillProviderObservation } from '@deepseek-ai/dsh-skill'
+import SkillRegistry, { type SkillCandidate, type SkillDefinition, type SkillLookupOptions, type SkillProviderObservation } from '@deepseek-ai/dsh-skill'
 import {
   SkillFluxProvider,
   SkillFluxProviderManager,
   SKILLFLUX_PROVIDER,
   SKILLFLUX_PROVIDER_RANK,
+  type SkillProviderRegistry,
 } from '../src/provider.js'
 import { candidateId } from '../src/router.js'
 import type { SkillFluxCandidate, SkillFluxCatalog } from '../src/types.js'
@@ -76,8 +77,13 @@ function fakeAgent(context: Context): Agent {
   } satisfies Agent
 }
 
+function scoped(agent: Agent): SkillLookupOptions {
+  return { scope: agent } as unknown as SkillLookupOptions
+}
+
 describe('SkillFluxProvider', () => {
   it('lists metadata-only summaries with an immutable locator and an incomplete observation contract', async () => {
+    const agent = fakeAgent(new Context())
     const catalog: SkillFluxCatalog = {
       candidates: [remote('pdf-reader', 'owner/a'), remote('pdf-reader', 'owner/b')],
       complete: false,
@@ -86,7 +92,7 @@ describe('SkillFluxProvider', () => {
       catalog: () => catalog,
       load: async () => definition('pdf-reader'),
     })
-    const observation = await provider.list({}) as SkillProviderObservation
+    const observation = await provider.list(scoped(agent)) as SkillProviderObservation
     expect(observation.complete).toBe(false)
     expect(observation.candidates).toHaveLength(1)
     const candidate = observation.candidates[0]!
@@ -100,26 +106,28 @@ describe('SkillFluxProvider', () => {
   })
 
   it('loads through the same-name fallback chain and rejects foreign or stale locators', async () => {
+    const agent = fakeAgent(new Context())
     const catalog: SkillFluxCatalog = {
       candidates: [remote('pdf-reader', 'owner/a'), remote('pdf-reader', 'owner/b')],
       complete: true,
     }
-    const load = vi.fn(async (chain: readonly SkillFluxCandidate[]) => definition(chain[0]!.name))
+    const load = vi.fn(async (_agent: Agent, chain: readonly SkillFluxCandidate[]) => definition(chain[0]!.name))
     const provider = new SkillFluxProvider({ signal: new AbortController().signal, invalidate: () => undefined }, {
       catalog: () => catalog,
       load,
     })
-    const listed = await provider.list({}) as readonly SkillCandidate[]
+    const listed = await provider.list(scoped(agent)) as readonly SkillCandidate[]
     const winner = listed[0]!
-    const loaded = await provider.get(winner, {})
+    const loaded = await provider.get(winner, scoped(agent))
     expect(loaded?.content).toBe('pdf-reader body')
     expect(load).toHaveBeenCalledTimes(1)
-    expect(load.mock.calls[0]![0]).toHaveLength(2)
+    expect(load.mock.calls[0]![0]).toBe(agent)
+    expect(load.mock.calls[0]![1]).toHaveLength(2)
 
     const foreign = { ...winner, provider: 'other' }
-    await expect(provider.get(foreign, {})).rejects.toThrow('candidate owned by')
+    await expect(provider.get(foreign, scoped(agent))).rejects.toThrow('candidate owned by')
     const stale = { ...winner, locator: { brand: 'unknown' } }
-    await expect(provider.get(stale, {})).rejects.toThrow('locator is unknown or expired')
+    await expect(provider.get(stale, scoped(agent))).rejects.toThrow('locator is unknown or expired')
   })
 
   it('honours the caller and registration signals', async () => {
@@ -134,45 +142,51 @@ describe('SkillFluxProvider', () => {
 })
 
 describe('SkillFluxProviderManager', () => {
-  it('registers an agent-scoped provider, resolves lazy loads, invalidates, and disposes', async () => {
-    const context = await setupRegistry()
-    const agent = fakeAgent(context)
-    const candidate = remote('pdf-reader', 'owner/repo')
-    let catalogCandidates: SkillFluxCandidate[] = [candidate]
-    const warn = vi.fn()
-    const load = vi.fn(async () => definition('pdf-reader'))
-    const manager = new SkillFluxProviderManager(
-      _agent => ({ catalog: () => ({ candidates: catalogCandidates, complete: true }), load }),
-      warn,
-    )
-    expect(manager.register(agent)).toBe(true)
-
-    const snapshot = await context.skills.snapshot({ scope: agent, cwd: '/workspace' })
-    expect(snapshot.complete).toBe(true)
-    expect(snapshot.skills.map(skill => skill.name)).toEqual(['pdf-reader'])
-
-    const loaded = await manager.load(agent, 'pdf-reader')
-    expect(loaded?.content).toBe('pdf-reader body')
-    expect(load).toHaveBeenCalledWith([candidate], undefined)
-
-    catalogCandidates = []
-    manager.invalidate(agent)
-    expect((await context.skills.snapshot({ scope: agent })).skills).toEqual([])
-
-    manager.dispose(agent)
-    expect(warn).not.toHaveBeenCalled()
-    expect((await context.skills.snapshot({ scope: agent })).skills).toEqual([])
-  })
-
-  it('fails open on duplicate registration in one layer', async () => {
+  it('registers one host-level provider and isolates catalogs by agent scope', async () => {
     const context = await setupRegistry()
     const first = fakeAgent(context)
     const second = fakeAgent(context)
+    const candidate = remote('pdf-reader', 'owner/repo')
+    const catalogs = new Map<Agent, SkillFluxCatalog>([
+      [first, { candidates: [candidate], complete: true }],
+      [second, { candidates: [], complete: true }],
+    ])
     const warn = vi.fn()
-    const manager = new SkillFluxProviderManager(() => ({ catalog: () => ({ candidates: [], complete: true }), load: async () => definition('x') }), warn)
-    expect(manager.register(first)).toBe(true)
-    expect(manager.register(second)).toBe(false)
-    expect(warn).toHaveBeenCalledTimes(1)
+    const load = vi.fn(async (_agent: Agent, _chain: readonly SkillFluxCandidate[]) => definition('pdf-reader'))
+    const manager = new SkillFluxProviderManager({
+      catalog: scope => catalogs.get(scope as Agent) ?? { candidates: [], complete: true },
+      load,
+    }, warn)
+    expect(manager.install(context.skills)).toBe(true)
+
+    const firstSnapshot = await context.skills.snapshot({ scope: first, cwd: '/workspace' })
+    expect(firstSnapshot.complete).toBe(true)
+    expect(firstSnapshot.skills.map(skill => skill.name)).toEqual(['pdf-reader'])
+    const secondSnapshot = await context.skills.snapshot({ scope: second, cwd: '/workspace' })
+    expect(secondSnapshot.skills).toEqual([])
+
+    const loaded = await manager.load(first, 'pdf-reader')
+    expect(loaded?.content).toBe('pdf-reader body')
+    expect(load).toHaveBeenCalledWith(first, [candidate], undefined)
+
+    catalogs.set(first, { candidates: [], complete: true })
+    manager.invalidate()
+    expect((await context.skills.snapshot({ scope: first })).skills).toEqual([])
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('installs once and fails open when the registry rejects registration', async () => {
+    const warn = vi.fn()
+    const manager = new SkillFluxProviderManager({
+      catalog: () => ({ candidates: [], complete: true }),
+      load: async () => definition('x'),
+    }, warn)
+    const rejecting: SkillProviderRegistry = {
+      registerProvider: () => { throw new Error('provider name already registered') },
+    }
+    expect(manager.install(rejecting)).toBe(false)
     expect(String(warn.mock.calls[0]![0])).toContain('registration failed open')
+    expect(manager.install(rejecting)).toBe(false)
+    expect(warn).toHaveBeenCalledTimes(2)
   })
 })
