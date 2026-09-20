@@ -123,3 +123,20 @@ lint, tests, the routing evaluation, build, and package-content validation. Do
 not commit credentials, local DSH profiles, cache entries, or `.qartez` indexes.
 
 DeepSeek Harness is currently a developer preview. If an upstream RC changes public APIs, describe the compatibility impact and update peer/dev dependency ranges deliberately.
+
+## Release checklist
+
+Before tagging a release, confirm every item:
+
+- `corepack pnpm check` passes (typecheck, lint, tests, build).
+- `corepack pnpm eval` passes with the checked-in corpora.
+- `corepack pnpm pack --dry-run` lists exactly the intended package files.
+- For discovery changes, `corepack pnpm test:discovery-live` succeeds with
+  `GITHUB_TOKEN`/`GH_TOKEN`; for runtime changes,
+  `corepack pnpm test:runtime-live` exercises the real lazy path end to end.
+- `README.md` and `README.zh-CN.md` match the shipped behavior and the
+  configuration catalog; `evals/README.md` describes every evaluation corpus.
+- The peer-dependency range is verified against the DeepSeek Harness line
+  targeted by the release.
+- `git status` is clean and the release commit is tagged with the
+  `package.json` version.

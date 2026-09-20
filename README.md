@@ -62,20 +62,35 @@ the official `skill` Registry and `skill-filesystem` provider active.
 
 ```text
 User task
-  -> ordered rules + deterministic lexical router
-  -> optional bounded usage-based tie-breaking
-  -> optional embedding fallback for unfilled slots
-  -> local Registry + persistent cache + online multi-source discovery
+  -> ordered rules + deterministic lexical router (English and Chinese)
+  -> optional usage-based tie-breaking and embedding fallback
+  -> local Registry + persistent cache + adaptive online discovery
   -> relevance-first quality ranking with 30-day activity signals
-  -> select and mount within the skill-count and optional catalog-token budgets
-  -> Agent calls a mounted Skill
-  -> unmount at turn/end
+  -> publish 1..maxActiveSkills metadata summaries through a Skill provider
+  -> Registry skills mount eagerly; cached and remote bodies stay lazy
+  -> Agent calls the `skill` tool for the exact listed name
+  -> the provider downloads, verifies, and loads that body on demand
+  -> turn/end releases the shortlist and provider catalog
   -> retain or prune downloaded files by age, size, and observed value
 ```
 
-A mount is scoped to the receiving Agent. Unmounting removes the runtime
-registration from future catalogs; it doesn't delete cached files or text
-already stored in session history.
+```mermaid
+flowchart LR
+  TASK["User task"] --> ROUTE["Route + discover<br/>(rules, lexical, adaptive online)"]
+  ROUTE --> PUB["Publish metadata catalog<br/>(name + description only)"]
+  PUB --> MODEL["Model sees available_skills"]
+  MODEL -->|"calls skill &lt;name&gt;"| GET["Provider.get():<br/>download / verify / load"]
+  GET --> BODY["Full SKILL.md body"]
+  BODY --> ACT["Model follows the instructions"]
+  ACT --> END["turn/end: release catalog"]
+```
+
+The model-facing catalog carries summaries only. A cached or remote body is
+downloaded, SHA-256 verified against its immutable commit, and loaded only
+when the model actually calls `skill`. Registry skills mount eagerly because
+their bodies are already local. Every published candidate is scoped to the
+receiving Agent; releasing a turn removes it from future catalogs without
+deleting cached files or text already stored in session history.
 
 ## Capabilities
 
@@ -94,8 +109,16 @@ already stored in session history.
   activity, stars, forks, license metadata, content provenance, and configured
   owner policy. Every result carries an explainable evidence level and warnings.
 - Resolve remote candidates to immutable GitHub commit SHAs.
-- Register cached Skills through the current Agent's `ctx.skills` scope.
+- Publish metadata-only summaries through one host-level Skill provider whose
+  candidates resolve per Agent; cached and remote bodies load lazily on the
+  `skill` call.
 - Verify cached content with a SHA-256 manifest before every load.
+- Adapt online discovery to local confidence: a confident local shortlist
+  fills every catalog slot without network traffic, while partial local hits
+  automatically fill the remaining slots from skills.sh and GitHub.
+- Track per-source health with consecutive-failure cooldowns so a failing
+  provider is skipped instead of retried every turn, and keep last-good
+  catalogs through non-authoritative observations when discovery degrades.
 - Automatically prune idle and low-value installed Skill cache entries while
   protecting active and in-flight mounts.
 - Support per-remote-mount, per-repository/session, and automatic approval
@@ -121,10 +144,12 @@ SkillFlux routes a task in this order:
    and history cannot make an irrelevant candidate cross the threshold.
 6. In `hybrid` mode, use embeddings only when rules and lexical matching leave
    catalog slots unfilled. Semantic results never displace those earlier matches.
-7. Mount the selected names until `maxActiveSkills` is reached. When
-   `catalogTokenBudget` is enabled, skip a candidate that would make the
-   estimated catalog prompt exceed that budget. If a candidate can't load,
-   try its same-name fallbacks in candidate-pool order.
+7. Publish the selected names until `maxActiveSkills` is reached. Registry
+   names mount eagerly; cached and remote names stay metadata-only and their
+   bodies load lazily when the model calls `skill`. When `catalogTokenBudget`
+   is enabled, skip a candidate that would make the estimated catalog prompt
+   exceed that budget. A lazy load that fails tries its same-name fallbacks in
+   candidate-pool order under one shared install deadline.
 
 The lexical score is:
 
@@ -231,6 +256,24 @@ The cache is stored atomically at
 `$DSH_HOME/storages/skillflux/remote-discovery.json`, limited to 100 entries by
 default, and hard-capped at 4 MiB. Set `remoteCacheTtlMs: 0` to disable it.
 
+### Adaptive online discovery
+
+With `remoteDiscovery: automatic`, SkillFlux only goes online when it needs
+to. A confident local shortlist that fills every catalog slot skips remote
+traffic entirely. When local routing leaves slots unfilled or finds nothing,
+SkillFlux searches skills.sh and GitHub to fill the remaining slots up to
+`maxActiveSkills` and `remoteAutoMountLimit`.
+
+Each provider carries health state. After
+`remoteHealthFailureThreshold` consecutive failures a source enters a
+`remoteHealthCooldownMs` cooldown and is skipped, so an outage degrades to the
+healthy sources plus the discovery cache instead of being retried on every
+turn. A successful call clears the source's failure history. When discovery
+degrades or falls back to stale cached candidates, the published catalog is
+marked non-authoritative; the registry keeps its last-good catalog while the
+still-usable candidates remain visible. `/skillflux status` reports failure
+counts and degraded state per provider.
+
 ### Installed Skill cache governance
 
 Downloaded Skills live separately under `$DSH_HOME/cache/skillflux`. After a
@@ -269,8 +312,8 @@ SkillFlux accepts these plugin options:
 ```yaml
 maxActiveSkills: 3
 minRouteScore: 8
-approvalPolicy: always       # always | session | automatic
-remoteDiscovery: automatic   # automatic | on-demand | off
+approvalPolicy: always       # always | session | automatic; gates lazy remote activation and explicit mounts
+remoteDiscovery: automatic   # automatic (adaptive) | on-demand | off
 remoteProviders: [skills.sh, github]
 remoteSearchLimit: 5
 remoteAutoMountLimit: 3      # max remote candidates published for lazy activation; 1 disables fallback
@@ -525,6 +568,12 @@ Skills are external instructions and can be malicious. Approval is a trust
 decision, not a sandbox. Keep DSH permissions, sandboxing, and tool approvals
 enabled.
 
+Approval also guards lazy activation. A published remote candidate downloads
+nothing until the model calls `skill`; the same configured policy is applied at
+that boundary, immediately before download. When no approval channel is
+available, the call fails closed rather than installing without consent.
+Blocked or under-threshold owners never reach the published catalog.
+
 ## Evaluation
 
 Run the versioned routing corpus without an API key or network access:
@@ -533,10 +582,11 @@ Run the versioned routing corpus without an API key or network access:
 corepack pnpm eval
 ```
 
-The suite contains 36 lexical cases, 4 adaptive safety cases, 8
+The suite contains 40 lexical cases, 4 adaptive safety cases, 8
 provider-independent semantic-vector cases, 7 catalog-budget cases, 8
 remote-quality pairwise cases, 8 remote evidence-governance cases, 7 remote-cache
-policy cases, and 7 installed-cache governance cases covering English, Chinese,
+policy cases, 8 lazy remote-fallback cases, 7 installed-cache governance cases,
+and 7 provider-native lazy-runtime cases covering English, Chinese,
 normalization, rules, thresholds, capacity, ranking, content deduplication,
 semantic top-k, context budgets, freshness, evidence policy, adoption, cache
 expiry, value-aware eviction, active-mount protection, and negative rejection.
@@ -561,10 +611,36 @@ do not measure a particular embedding model, third-party Skill quality, or the
 final answer from an online model. Read the
 [evaluation corpus guide](evals/README.md) for the case format and limitations.
 
+## Migrating from v0.2
+
+v0.3 turns SkillFlux into a provider-native lazy runtime. Most configuration
+carries over unchanged; the differences are behavioral:
+
+- Automatic routing no longer downloads remote candidates. It publishes
+  metadata summaries; the body downloads, verifies, and loads only when the
+  model calls `skill`. `remoteAutoMountLimit` now bounds how many remote
+  candidates are published for lazy activation (1 disables same-name
+  fallback) rather than how many are installed eagerly.
+- Registry skills still mount eagerly. Cached and remote skills appear in the
+  catalog as summaries and load on demand.
+- Approval applies at lazy activation too. Under `always` or `session`, the
+  first `skill` call for a remote candidate asks before downloading.
+- Remote discovery is adaptive: a confident local shortlist skips the
+  network, partial local hits fill the remaining slots, and failing sources
+  cool down instead of being retried every turn. Degraded or stale discovery
+  publishes a non-authoritative observation so last-good catalogs survive
+  outages.
+- Routing traces gain a `loaded` outcome for successful lazy loads.
+- The official DSH `tool-skill` consumer is disabled by the bundle patch in
+  favor of SkillFlux's filtered catalog.
+
 ## Known limitations
 
 - Hybrid quality depends on the configured embedding model. SkillFlux does not
   download or manage that model.
+- SkillFlux registers one host-level provider: a scoped agent context does not
+  expose `ctx.skills`, so per-agent catalogs resolve through the lookup scope
+  passed by the registry.
 - Semantic fallback considers at most `embeddingCandidateLimit` local
   candidates in current Registry/cache order.
 - Catalog token counts are portable estimates, not exact counts from the
