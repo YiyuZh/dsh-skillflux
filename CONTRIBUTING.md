@@ -118,6 +118,10 @@ Automatic remote mount changes should update
 MCP Skills source changes (entry validation, digest/size verification, name
 disambiguation, or content-bound governance) should update
 [`evals/mcp-source-cases.json`](evals/mcp-source-cases.json).
+MCP transport changes should update
+[`tests/mcp-transport.spec.ts`](tests/mcp-transport.spec.ts) and the
+[`scripts/mcp-skills-server.mjs`](scripts/mcp-skills-server.mjs) conformance
+fixture.
 Provider lifecycle, lazy-download, approval, concurrency, or turn-release
 changes should extend
 [`tests/provider-eval.spec.ts`](tests/provider-eval.spec.ts).
@@ -137,6 +141,9 @@ Before tagging a release, confirm every item:
 - For discovery changes, `corepack pnpm test:discovery-live` succeeds with
   `GITHUB_TOKEN`/`GH_TOKEN`; for runtime changes,
   `corepack pnpm test:runtime-live` exercises the real lazy path end to end.
+- For MCP source or transport changes, `corepack pnpm test:mcp-live` exercises
+  the bundled stdio transport against the checked-in conformance server,
+  including the tampered-digest fail-closed run.
 - `README.md` and `README.zh-CN.md` match the shipped behavior and the
   configuration catalog; `evals/README.md` describes every evaluation corpus.
 - The peer-dependency range is verified against the DeepSeek Harness line

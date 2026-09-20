@@ -1,6 +1,7 @@
 import { Context, Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { SkillDefinition, SkillSummary } from "@deepseek-ai/dsh-skill";
+import { ChildProcess, SpawnOptions } from "node:child_process";
 import { Agent } from "@deepseek-ai/dsh-agent";
 import "@deepseek-ai/dsh-session";
 //#region src/types.d.ts
@@ -793,6 +794,49 @@ declare class UsageStore {
   private currentTime;
 }
 //#endregion
+//#region src/mcp-transport.d.ts
+interface McpStdioTransportOptions {
+  /** Executable to launch (defaults to the current Node executable). */
+  readonly command?: string;
+  /** Arguments for the child process. */
+  readonly args?: readonly string[];
+  readonly cwd?: string;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly requestTimeoutMs?: number;
+  /** Refuse any response frame larger than this byte count. */
+  readonly maxFrameBytes?: number;
+  readonly log?: (message: string) => void;
+  /** Test seam; defaults to node:child_process spawn. */
+  readonly spawnImpl?: (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+}
+/**
+ * Zero-dependency stdio transport for the MCP Skills extension, speaking the
+ * LSP-style Content-Length framed JSON-RPC that MCP stdio servers use. The
+ * child process is spawned lazily on the first request and torn down by
+ * `close()`. Frames, ids, timeouts, and error codes are bounded and validated.
+ */
+declare class McpStdioTransport implements McpTransport {
+  private readonly command;
+  private readonly args;
+  private readonly options;
+  private readonly timeoutMs;
+  private readonly maxFrameBytes;
+  private readonly log;
+  private readonly spawnImpl;
+  private child;
+  private buffer;
+  private nextId;
+  private readonly pending;
+  private exited;
+  constructor(options?: McpStdioTransportOptions);
+  request(method: string, params?: unknown): Promise<unknown>;
+  close(): void;
+  private ensureChild;
+  private rejectAll;
+  private drain;
+  private settle;
+}
+//#endregion
 //#region src/token-meter.d.ts
 interface TokenMeterMeasurement {
   readonly totalTokens: number;
@@ -959,5 +1003,5 @@ declare class SkillFluxService extends Service {
   private scheduleSessionCachePrune;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, MCP_MAX_LIST_PAGES, MCP_MAX_RESOURCES_PER_SKILL, MCP_MAX_SKILL_BYTES, MCP_SKILLS_EXTENSION, type McpCandidate, type McpCandidateOptions, type McpDiscovery, McpError, type McpResourceReader, type McpSkillEntry, type McpSkillFrontmatter, type McpSkillListing, type McpSkillResource, McpSkillsClient, type McpTransport, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, type TokenEstimate, type TokenEstimatorKind, type TokenMeterLike, type TokenMeterMeasurement, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, assertMcpServerLabel, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogEntries, estimateCatalogTokens, estimateTextTokens, estimateWithMeter, inspectSkillDirectory, isLoopbackProxyFailure, mcpCandidates, mcpContentBoundKey, mcpFrontmatterEqual, mcpRelativePath, mcpSkillRoot, name, normalizeText, parseMcpSkillResource, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, resolveTokenMeter, routeScore, selectCandidates, tokenize, validateMcpSkillEntry, verifyUniqueRemoteSkill };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, MCP_MAX_LIST_PAGES, MCP_MAX_RESOURCES_PER_SKILL, MCP_MAX_SKILL_BYTES, MCP_SKILLS_EXTENSION, type McpCandidate, type McpCandidateOptions, type McpDiscovery, McpError, type McpResourceReader, type McpSkillEntry, type McpSkillFrontmatter, type McpSkillListing, type McpSkillResource, McpSkillsClient, McpStdioTransport, type McpStdioTransportOptions, type McpTransport, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, type TokenEstimate, type TokenEstimatorKind, type TokenMeterLike, type TokenMeterMeasurement, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, assertMcpServerLabel, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogEntries, estimateCatalogTokens, estimateTextTokens, estimateWithMeter, inspectSkillDirectory, isLoopbackProxyFailure, mcpCandidates, mcpContentBoundKey, mcpFrontmatterEqual, mcpRelativePath, mcpSkillRoot, name, normalizeText, parseMcpSkillResource, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, resolveTokenMeter, routeScore, selectCandidates, tokenize, validateMcpSkillEntry, verifyUniqueRemoteSkill };
 //# sourceMappingURL=index.d.ts.map

@@ -126,6 +126,10 @@ export {
   type McpTransport,
 } from './mcp-source.js'
 export {
+  McpStdioTransport,
+  type McpStdioTransportOptions,
+} from './mcp-transport.js'
+export {
   estimateCatalogEntries,
   estimateWithMeter,
   resolveTokenMeter,
