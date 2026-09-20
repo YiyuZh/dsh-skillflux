@@ -368,6 +368,8 @@ interface CacheUsageEvidence {
   readonly uses: number;
   readonly lastMountedAt?: number;
   readonly lastUsedAt?: number;
+  /** Sum of recorded loaded-body token estimates for this cache version. */
+  readonly totalLoadedBodyTokens?: number;
 }
 interface CachePrunePolicy {
   readonly maxEntries: number;

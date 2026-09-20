@@ -452,8 +452,11 @@ Per-skill token counts are appended to the usage records and shown by
 `/skillflux status` and `/skillflux usage`: the catalog footprint at the last
 mount, the loaded-body tokens at the last load, and their running total, plus
 which estimator produced them. Only token counts are persisted; task text,
-Skill instructions, and resources never reach `usage.json`. Token telemetry is
-observability only and never changes routing, approval, or pruning decisions.
+Skill instructions, and resources never reach `usage.json`. When two installed
+cache versions are otherwise identical on recency, uses, and mounts, pruning
+evicts the higher running body-token version first; the ordering is
+deterministic and absent evidence leaves the historical order unchanged.
+Token telemetry never changes routing or approval decisions.
 
 ### Catalog context budget
 
