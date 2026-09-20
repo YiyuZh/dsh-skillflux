@@ -361,13 +361,26 @@ adaptiveHalfLifeDays: 30
 记录通过原子替换写入 `$DSH_HOME/storages/skillflux/usage.json`（通常是
 `~/.dsh/storages/skillflux/usage.json`），并受 `usageMaxEntries` 限制。
 文件还有 2 MiB 的硬上限；达到任一上限时优先淘汰最近最少使用的记录。
-SkillFlux 只保存 candidate ID、Skill 名称、来源类型、来源、计数和时间戳；不会
-保存任务文本、Skill 指令或资源。
+SkillFlux 只保存 candidate ID、Skill 名称、来源类型、来源、计数、token 计数和
+时间戳；不会保存任务文本、Skill 指令或资源。
 
 加分不超过 `adaptiveMaxBoost`，至少成功加载 `adaptiveMinUses` 次后才生效，
 连续 `adaptiveHalfLifeDays` 未使用时减半。统计读写失败只会回退到普通路由，
 不会中断 Agent。设置 `usageTracking: false` 可关闭持久化，此时
 `adaptiveRouting` 也必须保持关闭。
+
+### Token 遥测
+
+当宿主挂载了 DSH 的 token-meter 服务时，SkillFlux 会用原生估算器为目录条目
+和每次加载的 SKILL.md 正文计价；服务缺失时回退到目录预算使用的同一套可移植
+估算（`ceil(UTF-8 字节数 / 3)`）。该集成不新增任何包依赖：可选的
+`ctx.tokenMeter` 服务在运行时解析，任何失败都会静默降级为可移植估算。
+
+每个 Skill 的 token 计数会追加到使用统计，并显示在 `/skillflux status` 和
+`/skillflux usage` 中：最近一次挂载的目录占用、最近一次加载的正文 token 及
+累计值，以及产生这些数字的估算器。持久化只包含 token 计数；任务文本、Skill
+指令和资源绝不会写入 `usage.json`。Token 遥测只用于观测，不会改变路由、
+审批或缓存裁剪决策。
 
 ### 目录上下文预算
 

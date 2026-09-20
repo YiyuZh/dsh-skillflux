@@ -16,6 +16,7 @@ type RouterMode = 'lexical' | 'hybrid';
 type EmbeddingProvider = 'ollama' | 'openai-compatible';
 type McpDiscovery = 'automatic' | 'off';
 type CandidateSelection = 'rule' | 'lexical' | 'embedding' | 'remote-quality' | 'manual';
+type TokenEstimatorKind = 'token-meter' | 'portable';
 interface RouteRule {
   matchAll?: string[];
   matchAny?: string[];
@@ -301,6 +302,15 @@ interface SkillUsageRecord extends SkillUsageIdentity {
   readonly uses: number;
   readonly lastMountedAt?: number;
   readonly lastUsedAt?: number;
+  /** Estimated catalog footprint tokens at the most recent mount. */
+  readonly catalogFootprintTokens?: number;
+  /** Estimated tokens of the SKILL.md body at the most recent load. */
+  readonly loadedBodyTokens?: number;
+  /** Sum of every recorded loaded-body estimate. */
+  readonly totalLoadedBodyTokens?: number;
+  readonly lastLoadedAt?: number;
+  /** Estimator that produced the token fields: native token-meter or portable. */
+  readonly tokenEstimator?: TokenEstimatorKind;
 }
 interface CacheManifest {
   readonly version: 1;
@@ -751,6 +761,11 @@ interface AdaptiveUsageOptions {
   readonly minUses: number;
   readonly halfLifeDays: number;
 }
+interface SkillUsageTelemetry {
+  readonly loadedBodyTokens?: number;
+  readonly catalogFootprintTokens?: number;
+  readonly estimator?: TokenEstimatorKind;
+}
 declare class UsageStore {
   private readonly options;
   private readonly now;
@@ -758,6 +773,11 @@ declare class UsageStore {
   constructor(options: UsageStoreOptions);
   recordMount(identity: SkillUsageIdentity): Promise<void>;
   recordUse(identity: SkillUsageIdentity): Promise<void>;
+  /**
+   * Merge bounded token telemetry into a usage record. Only token counts are
+   * stored; skill bodies and task text never reach the usage document.
+   */
+  recordTelemetry(identity: SkillUsageIdentity, telemetry: SkillUsageTelemetry): Promise<void>;
   list(limit?: number): Promise<SkillUsageRecord[]>;
   cacheEvidence(): Promise<CacheUsageEvidence[]>;
   boosts(candidates: readonly SkillFluxCandidate[], options: AdaptiveUsageOptions): Promise<ReadonlyMap<string, number>>;
@@ -772,6 +792,51 @@ declare class UsageStore {
   private warn;
   private currentTime;
 }
+//#endregion
+//#region src/token-meter.d.ts
+interface TokenMeterMeasurement {
+  readonly totalTokens: number;
+  readonly surfaceTokens: number;
+  readonly surfaceDeltaTokens: number;
+  readonly baseline: {
+    readonly kind: 'none' | 'estimated' | 'usage';
+    readonly tokens: number;
+    readonly usage?: unknown;
+  };
+  readonly nodes: readonly {
+    readonly seq: unknown;
+    readonly tokens: number;
+    readonly heuristicTokens: number;
+  }[];
+}
+/**
+ * Structural face of the optional `@deepseek-ai/dsh-token-meter` service. The
+ * package is intentionally not a dependency; the Cordis service is resolved at
+ * runtime and never required.
+ */
+interface TokenMeterLike {
+  estimateMessage(message: unknown): number;
+  measure?(session: unknown, requestHeader?: unknown): TokenMeterMeasurement;
+}
+interface TokenEstimate {
+  readonly tokens: number;
+  readonly estimator: TokenEstimatorKind;
+}
+/**
+ * Resolve the optional token-meter service. Missing, untyped, or throwing
+ * lookups resolve to undefined so every consumer can fall back safely.
+ */
+declare function resolveTokenMeter(ctx: Context): TokenMeterLike | undefined;
+/** Price one plain-text segment with the meter, falling back portably. */
+declare function estimateWithMeter(meter: TokenMeterLike | undefined, text: string): TokenEstimate;
+/**
+ * Sum the per-entry rendered catalog lines. The estimator is native only when
+ * every line was priced by the meter; any fallback downgrades the label.
+ */
+declare function estimateCatalogEntries(meter: TokenMeterLike | undefined, skills: readonly {
+  readonly name: string;
+  readonly description: string;
+}[], maxLength: number): TokenEstimate;
 //#endregion
 //#region src/index.d.ts
 declare const name = "skillflux";
@@ -809,6 +874,7 @@ declare class SkillFluxService extends Service {
   constructor(ctx: Context, config?: SkillFluxConfig);
   private get discoveryHost();
   private get activationHost();
+  private recordMountTelemetry;
   private get approvalHost();
   /**
    * Register one MCP Skills source under a host-assigned label. The label is
@@ -893,5 +959,5 @@ declare class SkillFluxService extends Service {
   private scheduleSessionCachePrune;
 }
 //#endregion
-export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, MCP_MAX_LIST_PAGES, MCP_MAX_RESOURCES_PER_SKILL, MCP_MAX_SKILL_BYTES, MCP_SKILLS_EXTENSION, type McpCandidate, type McpCandidateOptions, type McpDiscovery, McpError, type McpResourceReader, type McpSkillEntry, type McpSkillFrontmatter, type McpSkillListing, type McpSkillResource, McpSkillsClient, type McpTransport, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, assertMcpServerLabel, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogTokens, estimateTextTokens, inspectSkillDirectory, isLoopbackProxyFailure, mcpCandidates, mcpContentBoundKey, mcpFrontmatterEqual, mcpRelativePath, mcpSkillRoot, name, normalizeText, parseMcpSkillResource, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, routeScore, selectCandidates, tokenize, validateMcpSkillEntry, verifyUniqueRemoteSkill };
+export { type AdaptiveUsageOptions, type ApprovalPolicy, type CacheEntry, type CacheInventoryStats, type CacheManifest, type CachePruneDecision, type CachePrunePlan, type CachePrunePolicy, type CachePruneReason, type CacheUsageEvidence, type CachedCandidate, type CandidateOrigin, type CandidateRoutingMetadata, type CandidateSelection, type CatalogStats, type EmbeddingProvider, EmbeddingRouter, type EmbeddingRouterOptions, type EmbeddingRouterStats, MCP_MAX_LIST_PAGES, MCP_MAX_RESOURCES_PER_SKILL, MCP_MAX_SKILL_BYTES, MCP_SKILLS_EXTENSION, type McpCandidate, type McpCandidateOptions, type McpDiscovery, McpError, type McpResourceReader, type McpSkillEntry, type McpSkillFrontmatter, type McpSkillListing, type McpSkillResource, McpSkillsClient, type McpTransport, type MountedSkill, type RegistryCandidate, type RemoteCandidate, type RemoteCandidateVerifier, type RemoteDiscovery, RemoteDiscoveryCache, type RemoteDiscoveryCacheHit, type RemoteDiscoveryCacheOptions, type RemoteDiscoveryCacheState, type RemoteDiscoveryCacheStats, RemoteDiscoveryClient, type RemoteDiscoveryOptions, type RemoteDiscoveryProvider, type RemoteEvidenceInput, type RemoteQualityBreakdown, type RemoteQualityEvidence, type RemoteQualityInput, type RemoteQualitySignal, type RemoteQualityWarning, type RemoteSourceHealth, type RemoteTrustLevel, type RemoteTrustPolicy, type ResolvedSkillFluxConfig, type RouteRule, type RouterMode, type RoutingTrace, SkillCache, type SkillFluxCandidate, type SkillFluxCatalog, type SkillFluxConfig, SkillFluxService, SkillFluxService as default, type SkillUsageIdentity, type SkillUsageRecord, type TokenEstimate, type TokenEstimatorKind, type TokenMeterLike, type TokenMeterMeasurement, UsageStore, type UsageStoreOptions, type VerifiedRemoteSkill, assertMcpServerLabel, compareRemoteCandidates, compareRemoteTrust, deduplicateRemoteCandidates, estimateCatalogEntries, estimateCatalogTokens, estimateTextTokens, estimateWithMeter, inspectSkillDirectory, isLoopbackProxyFailure, mcpCandidates, mcpContentBoundKey, mcpFrontmatterEqual, mcpRelativePath, mcpSkillRoot, name, normalizeText, parseMcpSkillResource, parseSkillMarkdown, planCachePrune, remoteDiscoveryCacheState, remoteQualityEvidence, remoteQualityScore, remoteTrustPolicyAllows, resolveTokenMeter, routeScore, selectCandidates, tokenize, validateMcpSkillEntry, verifyUniqueRemoteSkill };
 //# sourceMappingURL=index.d.ts.map

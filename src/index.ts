@@ -42,6 +42,11 @@ import { RemoteDiscoveryClient } from './remote.js'
 import { RemoteDiscoveryCache } from './remote-cache.js'
 import { cacheCandidates, registryCandidates, routeScore } from './router.js'
 import { ExpiredAgentStateError, TurnStateRegistry, skillLookup, type AgentState } from './state.js'
+import {
+  estimateCatalogEntries,
+  estimateWithMeter,
+  resolveTokenMeter,
+} from './token-meter.js'
 import { UsageStore } from './usage.js'
 import type {
   CacheEntry,
@@ -120,6 +125,14 @@ export {
   type McpSkillListing,
   type McpTransport,
 } from './mcp-source.js'
+export {
+  estimateCatalogEntries,
+  estimateWithMeter,
+  resolveTokenMeter,
+  type TokenEstimate,
+  type TokenMeterLike,
+  type TokenMeterMeasurement,
+} from './token-meter.js'
 
 export const name = 'skillflux'
 const OLLAMA_EMBEDDING_ENDPOINT = 'http://127.0.0.1:11434/api/embed'
@@ -792,8 +805,25 @@ export class SkillFluxService extends Service {
       assertCatalogBudget: (state, skill) => { this.assertCatalogBudget(state, skill) },
       assertMountCurrent: (state, generation, name, mountEpoch) => { this.assertMountCurrent(state, generation, name, mountEpoch) },
       rememberRouting: (state, mounted) => { this.rememberRouting(state, mounted) },
+      recordMountTelemetry: (state, mounted) => { this.recordMountTelemetry(state, mounted) },
       scheduleAutoPrune: () => { this.scheduleAutoPrune() },
     }
+  }
+
+  private recordMountTelemetry(state: AgentState, mounted: MountedSkill): void {
+    if (this.usage === undefined) return
+    const meter = resolveTokenMeter(this.runtimeCtx)
+    const body = estimateWithMeter(meter, mounted.definition.content)
+    const catalog = estimateCatalogEntries(
+      meter,
+      this.catalogSkills(state),
+      this.config.catalogDescriptionMaxLength,
+    )
+    this.trackUsage(this.usage.recordTelemetry(usageIdentity(mounted), {
+      loadedBodyTokens: body.tokens,
+      catalogFootprintTokens: catalog.tokens,
+      estimator: body.estimator,
+    }))
   }
 
   private get approvalHost(): ApprovalHost {
@@ -1166,6 +1196,7 @@ export class SkillFluxService extends Service {
         ? 'Router: lexical.'
         : `Router: hybrid (${this.config.embeddingProvider}, ${this.config.embeddingModel}); embedding requests ${stats?.requests ?? 0}, cache ${stats?.cacheEntries ?? 0}/${this.config.embeddingCacheSize}.`
       const telemetry = `Usage tracking: ${this.config.usageTracking ? 'on' : 'off'}; adaptive routing: ${this.config.adaptiveRouting ? 'on' : 'off'}.`
+      const tokenTelemetry = `Token telemetry: ${resolveTokenMeter(this.runtimeCtx) === undefined ? 'portable fallback' : 'native token-meter'}.`
       const catalogBudget = catalog.budget === undefined ? 'off' : String(catalog.budget)
       const sourceHealth = this.remote.remoteSourceHealth()
       const discovery = `Remote discovery: ${this.config.remoteDiscovery}; providers ${this.config.remoteProviders
@@ -1187,7 +1218,7 @@ export class SkillFluxService extends Service {
       const installedCacheStatus = `Installed Skill cache: ${installedCache.entries}/${this.config.cacheMaxEntries} entries, ${installedCache.totalBytes}/${this.config.cacheMaxTotalBytes} bytes; auto prune ${this.config.cacheAutoPrune ? 'on' : 'off'}; idle limit ${idlePolicy}${invalidCacheStatus}.`
       return {
         kind: 'success',
-        text: `${router}\n${telemetry}\n${discovery}\n${discoveryCacheStatus}\n${mcpStatus}\n${installedCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
+        text: `${router}\n${telemetry}\n${tokenTelemetry}\n${discovery}\n${discoveryCacheStatus}\n${mcpStatus}\n${installedCacheStatus}\nCatalog: ${catalog.mountedSkills} mounted, ~${catalog.estimatedTokens} estimated tokens; budget ${catalogBudget}.\n${mounted.length === 0
           ? 'SkillFlux: no skills are mounted for the current turn.'
           : `SkillFlux mounted:\n${mounted.map(item => `- ${item.name} (${item.origin}, ${item.source})`).join('\n')}`}`,
       }
@@ -1214,7 +1245,9 @@ export class SkillFluxService extends Service {
           : records.length === 0
             ? 'SkillFlux has no usage statistics yet.'
             : `SkillFlux usage (top ${records.length}):\n${records.map(record =>
-                `- ${record.name} (${record.origin}, ${record.source}): uses ${record.uses}, mounts ${record.mounts}, last used ${formatTimestamp(record.lastUsedAt)}`)
+                `- ${record.name} (${record.origin}, ${record.source}): uses ${record.uses}, mounts ${record.mounts}, last used ${formatTimestamp(record.lastUsedAt)}${record.totalLoadedBodyTokens === undefined
+                  ? ''
+                  : `, body tokens ${record.totalLoadedBodyTokens} (${record.tokenEstimator ?? 'portable'})`}`)
               .join('\n')}`,
       }
     }
@@ -1720,6 +1753,29 @@ export class SkillFluxService extends Service {
       const definition = await this.cache.load(entry, cacheSignal)
       cacheSignal?.throwIfAborted()
       if (!isModelInvocable(definition)) throw new Error(`skill "${definition.name}" is not model-invocable`)
+      if (this.usage !== undefined) {
+        const meter = resolveTokenMeter(this.runtimeCtx)
+        const body = estimateWithMeter(meter, definition.content)
+        const stateForCatalog = this.turnStates.peek(agent)
+        const catalog = estimateCatalogEntries(
+          meter,
+          stateForCatalog === undefined
+            ? [{ name: definition.name, description: definition.description }]
+            : this.catalogSkills(stateForCatalog),
+          this.config.catalogDescriptionMaxLength,
+        )
+        this.trackUsage(this.usage.recordTelemetry({
+          candidateId: candidate.id,
+          name: definition.name,
+          origin: candidate.origin,
+          source: candidate.source,
+          ...(entry.manifest.cacheId === undefined ? {} : { cacheId: entry.manifest.cacheId }),
+        }, {
+          loadedBodyTokens: body.tokens,
+          catalogFootprintTokens: catalog.tokens,
+          estimator: body.estimator,
+        }))
+      }
       if (candidate.origin === 'remote' || candidate.origin === 'mcp') {
         this.cachePruneSessions.add(agent.session)
         this.scheduleAutoPrune()

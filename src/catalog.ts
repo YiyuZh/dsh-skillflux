@@ -73,6 +73,14 @@ function description(value: string, maxLength: number): string {
   return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 3)}...`
 }
 
+/** The exact `- \`name\`: description` line rendered for one catalog entry. */
+export function catalogEntryLine(
+  entry: Pick<SkillSummary, 'name' | 'description'>,
+  maxLength: number,
+): string {
+  return `- \`${entry.name}\`: ${escapeText(description(entry.description, maxLength))}`
+}
+
 function sourceEntries(skills: readonly CatalogItem[], maxLength: number): SkillCatalogSource['entries'] {
   return skills.map(skill => ({ name: skill.name, description: description(skill.description, maxLength) }))
 }
